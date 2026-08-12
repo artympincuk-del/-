@@ -1,12 +1,12 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-# Telegram Stars (XTR) packages. "stars" is charged to the user, "chips" is
-# credited to their in-game balance on successful payment.
+# Telegram Stars (XTR) packages. "stars" is charged to the user, "messages" is
+# credited to their bonus quota on successful payment.
 PACKAGES = [
-    {"chips": 500, "stars": 50},
-    {"chips": 1200, "stars": 100},
-    {"chips": 3000, "stars": 200},
-    {"chips": 8000, "stars": 400},
+    {"messages": 50, "stars": 50},
+    {"messages": 150, "stars": 120},
+    {"messages": 400, "stars": 280},
+    {"messages": 1000, "stars": 600},
 ]
 
 
@@ -16,7 +16,7 @@ def packages_keyboard() -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{pkg['chips']} фишек — {pkg['stars']} ⭐",
+                    text=f"{pkg['messages']} сообщений — {pkg['stars']} ⭐",
                     callback_data=f"buy:{i}",
                 )
             ]
