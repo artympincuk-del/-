@@ -16,7 +16,7 @@ from bot.payments import PACKAGES, packages_keyboard
 
 router = Router()
 
-MODEL_NAMES = {"fast": "⚡ Быстрая (Haiku)", "premium": "💎 Премиум (Sonnet)"}
+MODEL_NAMES = {"fast": "⚡ Быстрая (Llama 3.1 8B)", "premium": "💎 Премиум (Llama 3.3 70B)"}
 
 
 def model_keyboard(current: str) -> InlineKeyboardMarkup:
@@ -35,7 +35,7 @@ def model_keyboard(current: str) -> InlineKeyboardMarkup:
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "🤖 <b>Привет! Я AI-ассистент на базе Claude.</b>\n\n"
+        "🤖 <b>Привет! Я AI-ассистент на базе Llama (Groq).</b>\n\n"
         f"Бесплатно: <b>{DAILY_FREE_MESSAGES}</b> сообщений в день (сброс в 00:00).\n"
         "Дальше — докупка сообщений за Telegram Stars.\n\n"
         "Команды:\n"
@@ -52,9 +52,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 async def cmd_help(message: Message) -> None:
     await message.answer(
         "🤖 <b>Как это работает</b>\n\n"
-        f"• Быстрая модель (Claude Haiku): {DAILY_FREE_MESSAGES} бесплатных сообщений в день, "
+        f"• Быстрая модель (Llama 3.1 8B): {DAILY_FREE_MESSAGES} бесплатных сообщений в день, "
         "дальше — из докупленного пакета.\n"
-        f"• Премиум модель (Claude Sonnet): точнее и умнее, но без бесплатного лимита — "
+        f"• Премиум модель (Llama 3.3 70B): точнее и умнее, но без бесплатного лимита — "
         f"каждое сообщение списывает {PREMIUM_CREDIT_COST} сообщений из докупленного пакета.\n\n"
         "Переключить модель: /model\n"
         "Купить сообщения: /buy\n"
@@ -170,7 +170,7 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
     await message.bot.send_chat_action(message.chat.id, "typing")
 
     try:
-        reply_text = await ai.ask_claude(history, message.text, model)
+        reply_text = await ai.ask_ai(history, message.text, model)
     except ai.AIError:
         await message.answer("Не удалось получить ответ от Claude. Попробуйте ещё раз.")
         return

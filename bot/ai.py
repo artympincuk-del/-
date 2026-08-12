@@ -1,6 +1,6 @@
-import anthropic
+import groq
 
-from bot.config import ANTHROPIC_API_KEY
+from bot.config import GROQ_API_KEY
 
 SYSTEM_PROMPT = (
     "Ты дружелюбный и полезный AI-ассистент внутри Telegram-бота. "
@@ -9,29 +9,30 @@ SYSTEM_PROMPT = (
     "уместное для Telegram (без сложных таблиц)."
 )
 
-_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+_client = groq.AsyncGroq(api_key=GROQ_API_KEY)
 
 
 class AIError(Exception):
     pass
 
 
-async def ask_claude(history: list[dict], user_text: str, model: str) -> str:
-    messages = history + [{"role": "user", "content": user_text}]
+async def ask_ai(history: list[dict], user_text: str, model: str) -> str:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [
+        {"role": "user", "content": user_text}
+    ]
     try:
-        response = await _client.messages.create(
+        response = await _client.chat.completions.create(
             model=model,
             max_tokens=1024,
-            system=SYSTEM_PROMPT,
             messages=messages,
         )
-    except anthropic.APIStatusError as e:
-        raise AIError(f"Claude API error: {e.status_code}") from e
-    except anthropic.APIConnectionError as e:
-        raise AIError("Claude API connection error") from e
+    except groq.APIStatusError as e:
+        raise AIError(f"Groq API error: {e.status_code}") from e
+    except groq.APIConnectionError as e:
+        raise AIError("Groq API connection error") from e
 
-    if response.stop_reason == "refusal":
+    choice = response.choices[0]
+    if choice.finish_reason == "content_filter":
         return "Не могу ответить на этот запрос."
 
-    parts = [block.text for block in response.content if block.type == "text"]
-    return "".join(parts).strip() or "…"
+    return (choice.message.content or "").strip() or "…"
