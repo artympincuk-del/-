@@ -172,8 +172,7 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
     try:
         reply_text = await ai.ask_claude(history, message.text, model)
     except ai.AIError:
-        await message.answer("Не удалось получить ответ от Claude. Попробуйте ещё раз."
-            ")
+        await message.answer("Не удалось получить ответ от Claude. Попробуйте ещё раз.")
         return
 
     history = history + [
