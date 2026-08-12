@@ -81,9 +81,14 @@ async def handle_spin(request: web.Request) -> web.Response:
     )
 
 
+async def handle_index(request: web.Request) -> web.FileResponse:
+    return web.FileResponse(WEBAPP_DIR / "index.html")
+
+
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/api/state", handle_state)
     app.router.add_post("/api/spin", handle_spin)
+    app.router.add_get("/", handle_index)
     app.router.add_static("/", WEBAPP_DIR, show_index=False)
     return app
