@@ -8,12 +8,15 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
     WebAppInfo,
 )
 
 from bot import db
 from bot.config import WEBAPP_URL
+from bot.payments import PACKAGES, packages_keyboard
 from bot.roulette import bet_label, color_emoji, color_of, payout_multiplier, spin
 
 router = Router()
@@ -72,6 +75,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "Команды:\n"
         "/play &lt;ставка&gt; — сделать ставку (текстом)\n"
         "/balance — узнать баланс\n"
+        "/buy — купить фишки за Telegram Stars\n"
         "/top — таблица лидеров\n"
         "/help — правила игры",
         reply_markup=webapp_keyboard(),
@@ -109,6 +113,50 @@ async def cmd_top(message: Message) -> None:
         name = f"@{username}" if username else "аноним"
         lines.append(f"{i}. {name} — {balance}")
     await message.answer("\n".join(lines))
+
+
+@router.message(Command("buy"))
+async def cmd_buy(message: Message) -> None:
+    await message.answer(
+        "💎 <b>Купить фишки за Telegram Stars</b>\n\nВыберите пакет:",
+        reply_markup=packages_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("buy:"))
+async def cb_buy(callback: CallbackQuery) -> None:
+    idx = int(callback.data.split(":")[1])
+    pkg = PACKAGES[idx]
+    await callback.answer()
+    await callback.message.answer_invoice(
+        title=f"{pkg['chips']} фишек рулетки",
+        description="Пополнение игрового баланса. Фишки виртуальные, вывод недоступен.",
+        payload=f"chips:{pkg['chips']}",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"{pkg['chips']} фишек", amount=pkg["stars"])],
+        provider_token="",
+    )
+
+
+@router.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def process_successful_payment(message: Message) -> None:
+    payload = message.successful_payment.invoice_payload
+    _, _, chips_str = payload.partition(":")
+    chips = int(chips_str)
+
+    balance = db.get_or_create_player(message.from_user.id, message.from_user.username)
+    balance += chips
+    db.set_balance(message.from_user.id, balance)
+
+    await message.answer(
+        f"✅ Оплата получена! Начислено <b>{chips}</b> фишек.\n"
+        f"Баланс: <b>{balance}</b> фишек."
+    )
 
 
 @router.message(Command("play"))
