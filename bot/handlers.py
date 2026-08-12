@@ -1,3 +1,5 @@
+import base64
+
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -11,7 +13,13 @@ from aiogram.types import (
 )
 
 from bot import ai, db
-from bot.config import DAILY_FREE_MESSAGES, FAST_MODEL, PREMIUM_CREDIT_COST, PREMIUM_MODEL
+from bot.config import (
+    DAILY_FREE_MESSAGES,
+    FAST_MODEL,
+    PREMIUM_CREDIT_COST,
+    PREMIUM_MODEL,
+    VISION_MODEL,
+)
 from bot.payments import PACKAGES, packages_keyboard
 
 router = Router()
@@ -31,6 +39,18 @@ def model_keyboard(current: str) -> InlineKeyboardMarkup:
     )
 
 
+def quota_denied_text(status: dict) -> str:
+    if status["model_pref"] == "premium":
+        return (
+            "Недостаточно докупленных сообщений для премиум-модели. "
+            "Пополните баланс: /buy, либо переключитесь на быструю модель: /model"
+        )
+    return (
+        f"Бесплатный лимит на сегодня исчерпан ({DAILY_FREE_MESSAGES} сообщений). "
+        "Докупите сообщения: /buy — или дождитесь сброса в полночь."
+    )
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -44,7 +64,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "/buy — купить сообщения за Stars\n"
         "/reset — начать диалог заново\n"
         "/help — подробнее\n\n"
-        "Просто напиши мне вопрос — и я отвечу."
+        "Просто напиши мне вопрос или пришли фото — и я отвечу."
     )
 
 
@@ -55,7 +75,9 @@ async def cmd_help(message: Message) -> None:
         f"• Быстрая модель (Llama 3.1 8B): {DAILY_FREE_MESSAGES} бесплатных сообщений в день, "
         "дальше — из докупленного пакета.\n"
         f"• Премиум модель (Llama 3.3 70B): точнее и умнее, но без бесплатного лимита — "
-        f"каждое сообщение списывает {PREMIUM_CREDIT_COST} сообщений из докупленного пакета.\n\n"
+        f"каждое сообщение списывает {PREMIUM_CREDIT_COST} сообщений из докупленного пакета.\n"
+        "• Фото: пришли картинку (можно с подписью-вопросом) — распознаю содержимое. "
+        "Списывается как обычное сообщение.\n\n"
         "Переключить модель: /model\n"
         "Купить сообщения: /buy\n"
         "Сбросить историю диалога: /reset"
@@ -150,16 +172,7 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
         user_id, username, DAILY_FREE_MESSAGES, PREMIUM_CREDIT_COST
     )
     if not allowed:
-        if status["model_pref"] == "premium":
-            await message.answer(
-                "Недостаточно докупленных сообщений для премиум-модели. "
-                "Пополните баланс: /buy, либо переключитесь на быструю модель: /model"
-            )
-        else:
-            await message.answer(
-                f"Бесплатный лимит на сегодня исчерпан ({DAILY_FREE_MESSAGES} сообщений). "
-                "Докупите сообщения: /buy — или дождитесь сброса в полночь."
-            )
+        await message.answer(quota_denied_text(status))
         return
 
     model = PREMIUM_MODEL if status["model_pref"] == "premium" else FAST_MODEL
@@ -172,11 +185,55 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
     try:
         reply_text = await ai.ask_ai(history, message.text, model)
     except ai.AIError:
-        await message.answer("Не удалось получить ответ от Claude. Попробуйте ещё раз.")
+        await message.answer("Не удалось получить ответ. Попробуйте ещё раз.")
         return
 
     history = history + [
         {"role": "user", "content": message.text},
+        {"role": "assistant", "content": reply_text},
+    ]
+    history = history[-(2 * 10):]
+    await state.update_data(history=history)
+
+    await message.answer(reply_text, parse_mode=None)
+
+
+@router.message(F.photo)
+async def handle_photo_message(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id
+    username = message.from_user.username
+
+    allowed, status = db.try_consume_message(
+        user_id, username, DAILY_FREE_MESSAGES, PREMIUM_CREDIT_COST
+    )
+    if not allowed:
+        await message.answer(quota_denied_text(status))
+        return
+
+    caption = message.caption or "Опиши, что на этом фото."
+
+    file_buf = await message.bot.download(message.photo[-1].file_id)
+    image_b64 = base64.b64encode(file_buf.read()).decode()
+    data_url = f"data:image/jpeg;base64,{image_b64}"
+
+    data = await state.get_data()
+    history = data.get("history", [])
+
+    await message.bot.send_chat_action(message.chat.id, "typing")
+
+    user_content = [
+        {"type": "text", "text": caption},
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]
+
+    try:
+        reply_text = await ai.ask_ai(history, user_content, VISION_MODEL)
+    except ai.AIError:
+        await message.answer("Не удалось обработать изображение. Попробуйте ещё раз.")
+        return
+
+    history = history + [
+        {"role": "user", "content": f"[фото] {caption}"},
         {"role": "assistant", "content": reply_text},
     ]
     history = history[-(2 * 10):]
