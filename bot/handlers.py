@@ -9,12 +9,24 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    WebAppInfo,
 )
 
 from bot import db
+from bot.config import WEBAPP_URL
 from bot.roulette import bet_label, color_emoji, color_of, payout_multiplier, spin
 
 router = Router()
+
+
+def webapp_keyboard() -> InlineKeyboardMarkup | None:
+    if not WEBAPP_URL:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎰 Открыть рулетку", web_app=WebAppInfo(url=WEBAPP_URL))]
+        ]
+    )
 
 
 class BetStates(StatesGroup):
@@ -58,10 +70,11 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "🎰 <b>Добро пожаловать в Рулетку!</b>\n\n"
         f"Ваш стартовый баланс: <b>{balance}</b> фишек.\n\n"
         "Команды:\n"
-        "/play &lt;ставка&gt; — сделать ставку\n"
+        "/play &lt;ставка&gt; — сделать ставку (текстом)\n"
         "/balance — узнать баланс\n"
         "/top — таблица лидеров\n"
-        "/help — правила игры"
+        "/help — правила игры",
+        reply_markup=webapp_keyboard(),
     )
 
 
