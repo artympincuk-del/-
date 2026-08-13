@@ -19,15 +19,17 @@ from bot.config import (
     DAILY_FREE_MESSAGES,
     DAILY_FREE_PREMIUM_MESSAGES,
     FAST_MODEL,
+    FAST_REASONING_EFFORT,
     PREMIUM_CREDIT_COST,
     PREMIUM_MODEL,
+    PREMIUM_REASONING_EFFORT,
     VISION_MODEL,
 )
 from bot.payments import PACKAGES, packages_keyboard
 
 router = Router()
 
-MODEL_NAMES = {"fast": "⚡ Быстрая (Llama 3.1 8B)", "premium": "💎 Премиум (Llama 3.3 70B)"}
+MODEL_NAMES = {"fast": "⚡ Быстрая (GPT-OSS 20B)", "premium": "💎 Премиум (GPT-OSS 120B, глубокий анализ)"}
 
 BTN_BALANCE = "💰 Баланс"
 BTN_BUY = "💎 Пополнить"
@@ -107,11 +109,11 @@ async def cmd_menu(message: Message) -> None:
 
 HELP_TEXT = (
     "🤖 <b>Как это работает</b>\n\n"
-    f"• Быстрая модель (Llama 3.1 8B): {DAILY_FREE_MESSAGES} бесплатных сообщений в день, "
+    f"• Быстрая модель (GPT-OSS 20B): {DAILY_FREE_MESSAGES} бесплатных сообщений в день, "
     "дальше — из докупленного пакета.\n"
-    f"• Премиум модель (Llama 3.3 70B): точнее и умнее — {DAILY_FREE_PREMIUM_MESSAGES} "
-    f"бесплатных сообщений в день, дальше каждое списывает {PREMIUM_CREDIT_COST} "
-    "сообщений из докупленного пакета.\n"
+    f"• Премиум модель (GPT-OSS 120B): думает глубже и точнее отвечает на сложные "
+    f"вопросы — {DAILY_FREE_PREMIUM_MESSAGES} бесплатных сообщений в день, дальше каждое "
+    f"списывает {PREMIUM_CREDIT_COST} сообщений из докупленного пакета.\n"
     "• Фото: пришли картинку (можно с подписью-вопросом) — распознаю содержимое. "
     "Списывается как обычное сообщение.\n"
     "• Заметки: напиши «Запомни: ...» — я буду учитывать это в каждом ответе, даже "
@@ -386,7 +388,10 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
         await message.answer(quota_denied_text(status))
         return
 
-    model = PREMIUM_MODEL if status["model_pref"] == "premium" else FAST_MODEL
+    if status["model_pref"] == "premium":
+        model, reasoning_effort = PREMIUM_MODEL, PREMIUM_REASONING_EFFORT
+    else:
+        model, reasoning_effort = FAST_MODEL, FAST_REASONING_EFFORT
     notes = [content for _id, content in db.list_notes(user_id)]
 
     data = await state.get_data()
@@ -395,7 +400,9 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
     await message.bot.send_chat_action(message.chat.id, "typing")
 
     try:
-        reply_text = await ai.ask_ai(history, text, model, notes=notes)
+        reply_text = await ai.ask_ai(
+            history, text, model, notes=notes, reasoning_effort=reasoning_effort
+        )
     except ai.AIError:
         await message.answer("Не удалось получить ответ. Попробуйте ещё раз.")
         return

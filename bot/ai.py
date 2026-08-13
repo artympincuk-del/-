@@ -6,7 +6,8 @@ from bot.config import GROQ_API_KEY
 
 SYSTEM_PROMPT = (
     "Ты дружелюбный и полезный AI-ассистент внутри Telegram-бота. "
-    "Отвечай по существу, кратко и ясно, на языке пользователя. "
+    "Отвечай по существу, кратко и ясно, на языке пользователя, грамотно и без "
+    "орфографических и грамматических ошибок. "
     "Если вопрос требует списка или кода — используй простое форматирование Markdown, "
     "уместное для Telegram (без сложных таблиц)."
 )
@@ -40,19 +41,24 @@ def _build_system_prompt(notes: list[str] | None) -> str:
 
 
 async def ask_ai(
-    history: list[dict], user_content, model: str, notes: list[str] | None = None
+    history: list[dict],
+    user_content,
+    model: str,
+    notes: list[str] | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     """`user_content` is either a plain string (text-only turn) or a list of
     content blocks (e.g. text + image_url) for multimodal turns."""
     messages = [{"role": "system", "content": _build_system_prompt(notes)}] + history + [
         {"role": "user", "content": user_content}
     ]
+    kwargs = {"model": model, "max_tokens": 4096, "messages": messages}
+    if model.startswith("openai/gpt-oss"):
+        kwargs["reasoning_effort"] = reasoning_effort or "medium"
+        kwargs["include_reasoning"] = False
+
     try:
-        response = await _client.chat.completions.create(
-            model=model,
-            max_tokens=2048,
-            messages=messages,
-        )
+        response = await _client.chat.completions.create(**kwargs)
     except groq.APIStatusError as e:
         raise AIError(f"Groq API error: {e.status_code}") from e
     except groq.APIConnectionError as e:
@@ -63,4 +69,6 @@ async def ask_ai(
         return "Не могу ответить на этот запрос."
 
     text = _strip_thinking(choice.message.content or "")
+    if not text and choice.finish_reason == "length":
+        return "Ответ получился слишком длинным для обработки. Попробуйте задать вопрос короче."
     return text or "…"
