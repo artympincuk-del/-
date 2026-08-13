@@ -357,16 +357,29 @@ async def cmd_whoami(message: Message) -> None:
     await message.answer(f"Твой Telegram ID: <code>{message.from_user.id}</code>")
 
 
+def _resolve_target(target: str) -> int | None:
+    """Accepts either a numeric Telegram ID or @username (username lookup
+    only works for users who have messaged the bot at least once)."""
+    if target.startswith("@"):
+        return db.find_user_id_by_username(target[1:])
+    if target.isdigit():
+        return int(target)
+    return None
+
+
 @router.message(Command("admin"))
 async def cmd_admin(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
     await message.answer(
         "🔑 <b>Админ-панель</b>\n\n"
-        "/grant &lt;user_id&gt; &lt;amount&gt; — выдать (или списать, если amount отрицательный) "
-        "сообщения пользователю\n"
-        "/users — список пользователей и их лимитов\n"
-        "/chatlog &lt;user_id&gt; [N] — последние N сообщений переписки (по умолчанию 20)"
+        "/grant &lt;user_id или @username&gt; &lt;amount&gt; — выдать (или списать, если "
+        "amount отрицательный) сообщения пользователю\n"
+        "/users — список пользователей и их лимитов (юзернеймы видны там же)\n"
+        "/chatlog &lt;user_id или @username&gt; [N] — последние N сообщений переписки "
+        "(по умолчанию 20)\n\n"
+        "По @username находит только тех, кто хотя бы раз писал боту — иначе бот не знает "
+        "его username."
     )
 
 
@@ -375,13 +388,16 @@ async def cmd_grant(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
     parts = message.text.split()
-    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].lstrip("-").isdigit():
-        await message.answer("Использование: /grant <user_id> <amount>")
+    if len(parts) != 3 or not parts[2].lstrip("-").isdigit():
+        await message.answer("Использование: /grant <user_id или @username> <amount>")
         return
-    target_id = int(parts[1])
+    target_id = _resolve_target(parts[1])
+    if target_id is None:
+        await message.answer(f"Пользователь {parts[1]} не найден (он должен хотя бы раз написать боту).")
+        return
     amount = int(parts[2])
     new_balance = db.add_bonus_credits(target_id, None, amount)
-    await message.answer(f"Готово. Баланс пользователя {target_id}: {new_balance} сообщений.")
+    await message.answer(f"Готово. Баланс пользователя {parts[1]}: {new_balance} сообщений.")
 
 
 @router.message(Command("users"))
@@ -408,16 +424,19 @@ async def cmd_chatlog(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
     parts = message.text.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Использование: /chatlog <user_id> [N]")
+    if len(parts) < 2:
+        await message.answer("Использование: /chatlog <user_id или @username> [N]")
         return
-    target_id = int(parts[1])
+    target_id = _resolve_target(parts[1])
+    if target_id is None:
+        await message.answer(f"Пользователь {parts[1]} не найден (он должен хотя бы раз написать боту).")
+        return
     limit = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 20
     rows = db.get_recent_chat(target_id, limit)
     if not rows:
         await message.answer("Нет сообщений для этого пользователя.")
         return
-    lines = [f"💬 Чат с {target_id} (последние {len(rows)}):\n"]
+    lines = [f"💬 Чат с {parts[1]} (последние {len(rows)}):\n"]
     for role, content, created_at in rows:
         who = "👤" if role == "user" else "🤖"
         text = content if len(content) <= 300 else content[:300] + "…"

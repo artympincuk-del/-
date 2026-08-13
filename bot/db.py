@@ -285,3 +285,16 @@ def list_users(limit: int = 30) -> list[tuple]:
             (limit,),
         )
         return cur.fetchall()
+
+
+def find_user_id_by_username(username: str) -> int | None:
+    """Look up a user_id by @username (case-insensitive). Only works for
+    users who have messaged the bot at least once, since that's the only
+    way we learn their username."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT user_id FROM players WHERE username = ? COLLATE NOCASE",
+            (username,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
