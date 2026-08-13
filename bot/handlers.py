@@ -11,10 +11,11 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     LabeledPrice,
     Message,
     PreCheckoutQuery,
-    ReplyKeyboardRemove,
+    ReplyKeyboardMarkup,
 )
 from PIL import Image
 from pypdf import PdfReader
@@ -68,6 +69,19 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text=BTN_HELP, callback_data="menu:help"),
             ],
         ]
+    )
+
+
+PERSISTENT_MENU_BTN = "📋 Меню"
+
+
+def persistent_keyboard() -> ReplyKeyboardMarkup:
+    """Small always-visible bottom keyboard so the menu is reachable even
+    after the inline menu card has scrolled out of view — unlike inline
+    keyboards, this stays pinned regardless of how much the chat scrolls."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=PERSISTENT_MENU_BTN)]],
+        resize_keyboard=True,
     )
 
 
@@ -141,14 +155,20 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "Дальше — докупка сообщений за Telegram Stars.\n\n"
         "Пиши текстом, голосом, присылай фото или PDF — отвечу на всё. Умею искать "
         "свежую информацию в интернете и рисовать картинки по описанию.\n\n"
-        "Подробнее — кнопка «Помощь» в меню ниже.",
-        reply_markup=ReplyKeyboardRemove(),
+        "Подробнее — кнопка «Помощь» в меню ниже. Кнопка «📋 Меню» внизу экрана "
+        "всегда под рукой, даже если это сообщение прокрутится вверх.",
+        reply_markup=persistent_keyboard(),
     )
     await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
 
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message) -> None:
+    await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
+
+
+@router.message(F.text == PERSISTENT_MENU_BTN)
+async def btn_persistent_menu(message: Message) -> None:
     await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
 
 
