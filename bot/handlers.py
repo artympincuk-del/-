@@ -16,7 +16,9 @@ from aiogram.types import (
 
 from bot import ai, db
 from bot.config import (
+    ADMIN_IDS,
     DAILY_FREE_MESSAGES,
+    DAILY_FREE_PREMIUM_MESSAGES,
     FAST_MODEL,
     PREMIUM_CREDIT_COST,
     PREMIUM_MODEL,
@@ -45,6 +47,10 @@ MAIN_MENU = ReplyKeyboardMarkup(
 )
 
 
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
 def model_keyboard(current: str) -> InlineKeyboardMarkup:
     def label(key: str, text: str) -> str:
         return f"✅ {text}" if key == current else text
@@ -60,7 +66,9 @@ def model_keyboard(current: str) -> InlineKeyboardMarkup:
 def quota_denied_text(status: dict) -> str:
     if status["model_pref"] == "premium":
         return (
-            "Недостаточно докупленных сообщений для премиум-модели. "
+            f"Бесплатные премиум-запросы на сегодня закончились "
+            f"({status['premium_used_today']}/{DAILY_FREE_PREMIUM_MESSAGES}), "
+            "а докупленных сообщений не хватает. "
             "Пополните баланс: /buy, либо переключитесь на быструю модель: /model"
         )
     return (
@@ -74,16 +82,10 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         "🤖 <b>Привет! Я AI-ассистент на базе Llama (Groq).</b>\n\n"
-        f"Бесплатно: <b>{DAILY_FREE_MESSAGES}</b> сообщений в день (сброс в 00:00).\n"
+        f"Бесплатно: <b>{DAILY_FREE_MESSAGES}</b> сообщений в день на быстрой модели "
+        f"и <b>{DAILY_FREE_PREMIUM_MESSAGES}</b> на премиум (сброс в 00:00).\n"
         "Дальше — докупка сообщений за Telegram Stars.\n\n"
-        "Пользуйся кнопками меню внизу или командами:\n"
-        "/model — выбрать модель (быстрая / премиум)\n"
-        "/balance — остаток лимита\n"
-        "/buy — купить сообщения за Stars\n"
-        "/remember &lt;текст&gt; — запомнить заметку о себе\n"
-        "/notes — список заметок\n"
-        "/reset — начать диалог заново\n"
-        "/help — подробнее\n\n"
+        "Пользуйся кнопками меню внизу.\n\n"
         "Просто напиши мне вопрос или пришли фото — и я отвечу.",
         reply_markup=MAIN_MENU,
     )
@@ -94,15 +96,14 @@ async def _send_help(message: Message) -> None:
         "🤖 <b>Как это работает</b>\n\n"
         f"• Быстрая модель (Llama 3.1 8B): {DAILY_FREE_MESSAGES} бесплатных сообщений в день, "
         "дальше — из докупленного пакета.\n"
-        f"• Премиум модель (Llama 3.3 70B): точнее и умнее, но без бесплатного лимита — "
-        f"каждое сообщение списывает {PREMIUM_CREDIT_COST} сообщений из докупленного пакета.\n"
+        f"• Премиум модель (Llama 3.3 70B): точнее и умнее — {DAILY_FREE_PREMIUM_MESSAGES} "
+        f"бесплатных сообщений в день, дальше каждое списывает {PREMIUM_CREDIT_COST} "
+        "сообщений из докупленного пакета.\n"
         "• Фото: пришли картинку (можно с подписью-вопросом) — распознаю содержимое. "
         "Списывается как обычное сообщение.\n"
-        "• Заметки: напиши «Запомни: ...» или команду /remember — я буду учитывать это "
-        "в каждом ответе, даже после перезапуска. Список — /notes, удалить — /forget &lt;номер&gt;.\n\n"
-        "Переключить модель: /model\n"
-        "Купить сообщения: /buy\n"
-        "Сбросить историю диалога: /reset"
+        "• Заметки: напиши «Запомни: ...» — я буду учитывать это в каждом ответе, даже "
+        "после перезапуска. Список — кнопка «Заметки», удалить — /forget <номер>.\n\n"
+        "Кнопки меню внизу экрана дублируют все основные действия."
     )
 
 
@@ -122,7 +123,8 @@ async def _send_balance(message: Message) -> None:
     await message.answer(
         f"📊 <b>Баланс</b>\n\n"
         f"Модель: {model_name}\n"
-        f"Бесплатных сообщений сегодня использовано: {status['used_today']}/{DAILY_FREE_MESSAGES}\n"
+        f"Быстрая, бесплатных сегодня: {status['used_today']}/{DAILY_FREE_MESSAGES}\n"
+        f"Премиум, бесплатных сегодня: {status['premium_used_today']}/{DAILY_FREE_PREMIUM_MESSAGES}\n"
         f"Докупленные сообщения: <b>{status['bonus_credits']}</b>"
     )
 
@@ -232,7 +234,7 @@ async def _send_notes_list(message: Message) -> None:
     notes = db.list_notes(message.from_user.id)
     if not notes:
         await message.answer(
-            "Пока нет заметок. Добавь: /remember <текст> или напиши «Запомни: ...»."
+            "Пока нет заметок. Просто напиши «Запомни: ...» или команду /remember <текст>."
         )
         return
     lines = ["📝 <b>Заметки</b>\n"]
@@ -266,13 +268,89 @@ async def cmd_remember(message: Message) -> None:
 async def cmd_forget(message: Message) -> None:
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip().isdigit():
-        await message.answer("Укажи номер заметки: /forget <номер> (список — /notes)")
+        await message.answer("Укажи номер заметки: /forget <номер> (список — кнопка «Заметки»)")
         return
     note_id = int(parts[1].strip())
     if db.delete_note(message.from_user.id, note_id):
         await message.answer(f"Заметка №{note_id} удалена.")
     else:
         await message.answer("Заметка с таким номером не найдена.")
+
+
+@router.message(Command("whoami"))
+async def cmd_whoami(message: Message) -> None:
+    await message.answer(f"Твой Telegram ID: <code>{message.from_user.id}</code>")
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "🔑 <b>Админ-панель</b>\n\n"
+        "/grant &lt;user_id&gt; &lt;amount&gt; — выдать (или списать, если amount отрицательный) "
+        "сообщения пользователю\n"
+        "/users — список пользователей и их лимитов\n"
+        "/chatlog &lt;user_id&gt; [N] — последние N сообщений переписки (по умолчанию 20)"
+    )
+
+
+@router.message(Command("grant"))
+async def cmd_grant(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].lstrip("-").isdigit():
+        await message.answer("Использование: /grant <user_id> <amount>")
+        return
+    target_id = int(parts[1])
+    amount = int(parts[2])
+    new_balance = db.add_bonus_credits(target_id, None, amount)
+    await message.answer(f"Готово. Баланс пользователя {target_id}: {new_balance} сообщений.")
+
+
+@router.message(Command("users"))
+async def cmd_users(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    users = db.list_users()
+    if not users:
+        await message.answer("Пока нет пользователей.")
+        return
+    lines = ["👥 <b>Пользователи</b>\n"]
+    for uid, uname, used, premium_used, bonus, pref, last_active in users:
+        name = f"@{uname}" if uname else str(uid)
+        lines.append(
+            f"{name} (id {uid}) — {pref}, "
+            f"free {used}/{DAILY_FREE_MESSAGES}+{premium_used}/{DAILY_FREE_PREMIUM_MESSAGES}, "
+            f"bonus {bonus}, активен {last_active}"
+        )
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("chatlog"))
+async def cmd_chatlog(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Использование: /chatlog <user_id> [N]")
+        return
+    target_id = int(parts[1])
+    limit = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 20
+    rows = db.get_recent_chat(target_id, limit)
+    if not rows:
+        await message.answer("Нет сообщений для этого пользователя.")
+        return
+    lines = [f"💬 Чат с {target_id} (последние {len(rows)}):\n"]
+    for role, content, created_at in rows:
+        who = "👤" if role == "user" else "🤖"
+        text = content if len(content) <= 300 else content[:300] + "…"
+        lines.append(f"{who} [{created_at}] {text}")
+    full_text = "\n".join(lines)
+    if len(full_text) > 3800:
+        full_text = full_text[-3800:]
+    await message.answer(full_text, parse_mode=None)
 
 
 REMEMBER_PREFIXES = ("запомни:", "запомни,", "запомни ")
@@ -296,7 +374,7 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
     username = message.from_user.username
 
     allowed, status = db.try_consume_message(
-        user_id, username, DAILY_FREE_MESSAGES, PREMIUM_CREDIT_COST
+        user_id, username, DAILY_FREE_MESSAGES, DAILY_FREE_PREMIUM_MESSAGES, PREMIUM_CREDIT_COST
     )
     if not allowed:
         await message.answer(quota_denied_text(status))
@@ -316,6 +394,9 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
         await message.answer("Не удалось получить ответ. Попробуйте ещё раз.")
         return
 
+    db.log_message(user_id, username, "user", text)
+    db.log_message(user_id, username, "assistant", reply_text)
+
     history = history + [
         {"role": "user", "content": text},
         {"role": "assistant", "content": reply_text},
@@ -332,7 +413,7 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     username = message.from_user.username
 
     allowed, status = db.try_consume_message(
-        user_id, username, DAILY_FREE_MESSAGES, PREMIUM_CREDIT_COST
+        user_id, username, DAILY_FREE_MESSAGES, DAILY_FREE_PREMIUM_MESSAGES, PREMIUM_CREDIT_COST
     )
     if not allowed:
         await message.answer(quota_denied_text(status))
@@ -360,6 +441,9 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     except ai.AIError:
         await message.answer("Не удалось обработать изображение. Попробуйте ещё раз.")
         return
+
+    db.log_message(user_id, username, "user", f"[фото] {caption}")
+    db.log_message(user_id, username, "assistant", reply_text)
 
     history = history + [
         {"role": "user", "content": f"[фото] {caption}"},
