@@ -1,4 +1,5 @@
 import base64
+import io
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -12,6 +13,7 @@ from aiogram.types import (
     PreCheckoutQuery,
     ReplyKeyboardRemove,
 )
+from PIL import Image
 
 from bot import ai, db
 from bot.config import (
@@ -60,6 +62,29 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+MAX_IMAGE_DIM = 1600
+
+
+def _prepare_image(raw: bytes) -> bytes:
+    """Downscale/recompress a photo so it stays well under the vision API's
+    request-size limit (large phone-camera photos otherwise trigger 413s)."""
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    if max(img.size) > MAX_IMAGE_DIM:
+        img.thumbnail((MAX_IMAGE_DIM, MAX_IMAGE_DIM), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+TELEGRAM_MAX_MESSAGE_LEN = 4000
+
+
+async def _send_long(message: Message, text: str) -> None:
+    """Telegram rejects messages over ~4096 chars outright; split instead of crashing."""
+    for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LEN):
+        await message.answer(text[i : i + TELEGRAM_MAX_MESSAGE_LEN], parse_mode=None)
 
 
 def model_keyboard(current: str) -> InlineKeyboardMarkup:
@@ -403,8 +428,8 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
         reply_text = await ai.ask_ai(
             history, text, model, notes=notes, reasoning_effort=reasoning_effort
         )
-    except ai.AIError:
-        await message.answer("Не удалось получить ответ. Попробуйте ещё раз.")
+    except ai.AIError as e:
+        await message.answer(e.user_message)
         return
 
     db.log_message(user_id, username, "user", text)
@@ -417,7 +442,7 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
     history = history[-(2 * 10):]
     await state.update_data(history=history)
 
-    await message.answer(reply_text, parse_mode=None)
+    await _send_long(message, reply_text)
 
 
 @router.message(F.photo)
@@ -436,7 +461,12 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     notes = [content for _id, content in db.list_notes(user_id)]
 
     file_buf = await message.bot.download(message.photo[-1].file_id)
-    image_b64 = base64.b64encode(file_buf.read()).decode()
+    try:
+        image_bytes = _prepare_image(file_buf.read())
+    except Exception:
+        await message.answer("Не удалось обработать изображение. Попробуйте другое фото.")
+        return
+    image_b64 = base64.b64encode(image_bytes).decode()
     data_url = f"data:image/jpeg;base64,{image_b64}"
 
     data = await state.get_data()
@@ -450,9 +480,11 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     ]
 
     try:
-        reply_text = await ai.ask_ai(history, user_content, VISION_MODEL, notes=notes)
-    except ai.AIError:
-        await message.answer("Не удалось обработать изображение. Попробуйте ещё раз.")
+        reply_text = await ai.ask_ai(
+            history, user_content, VISION_MODEL, notes=notes, max_tokens=3000
+        )
+    except ai.AIError as e:
+        await message.answer(e.user_message)
         return
 
     db.log_message(user_id, username, "user", f"[фото] {caption}")
@@ -465,4 +497,4 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     history = history[-(2 * 10):]
     await state.update_data(history=history)
 
-    await message.answer(reply_text, parse_mode=None)
+    await _send_long(message, reply_text)
