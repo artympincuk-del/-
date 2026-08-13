@@ -1,5 +1,6 @@
 import base64
 import io
+import re
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -31,6 +32,7 @@ from bot.config import (
     PREMIUM_CREDIT_COST,
     PREMIUM_MODEL,
     PREMIUM_REASONING_EFFORT,
+    REFERRAL_BONUS_MESSAGES,
     VISION_MODEL,
 )
 from bot.payments import PACKAGES, TIME_PACKAGES, packages_keyboard
@@ -49,6 +51,7 @@ BTN_BUY = "💎 Пополнить"
 BTN_MODEL = "🧠 Модель"
 BTN_NOTES = "📝 Заметки"
 BTN_IMAGE = "🎨 Картинка"
+BTN_INVITE = "🎁 Пригласить друга"
 BTN_RESET = "🔄 Сбросить диалог"
 BTN_HELP = "❓ Помощь"
 
@@ -65,7 +68,10 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text=BTN_IMAGE, callback_data="menu:image"),
             ],
             [
+                InlineKeyboardButton(text=BTN_INVITE, callback_data="menu:invite"),
                 InlineKeyboardButton(text=BTN_RESET, callback_data="menu:reset"),
+            ],
+            [
                 InlineKeyboardButton(text=BTN_HELP, callback_data="menu:help"),
             ],
         ]
@@ -89,6 +95,42 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+_bot_username_cache: str | None = None
+
+
+async def _get_bot_username(bot) -> str:
+    global _bot_username_cache
+    if _bot_username_cache is None:
+        me = await bot.get_me()
+        _bot_username_cache = me.username
+    return _bot_username_cache
+
+
+async def _should_respond_in_group(message: Message) -> bool:
+    """Private chats: always respond. Groups: only when the bot is directly
+    addressed (replied to, or @mentioned) — Telegram delivers every group
+    message to the bot once privacy mode is off, and answering all of them
+    would spam the whole chat instead of just the person who asked."""
+    if message.chat.type == "private":
+        return True
+    if (
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.id == message.bot.id
+    ):
+        return True
+    text = message.text or message.caption or ""
+    username = await _get_bot_username(message.bot)
+    return f"@{username}".lower() in text.lower()
+
+
+async def _strip_mention(message: Message, text: str) -> str:
+    if message.chat.type == "private" or not text:
+        return text
+    username = await _get_bot_username(message.bot)
+    return re.sub(rf"@{re.escape(username)}", "", text, flags=re.IGNORECASE).strip()
+
+
 MAX_IMAGE_DIM = 1600
 
 
@@ -106,17 +148,43 @@ def _prepare_image(raw: bytes) -> bytes:
 TELEGRAM_MAX_MESSAGE_LEN = 4000
 
 
-async def _send_long(message: Message, text: str) -> None:
+async def _send_long(
+    message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None
+) -> None:
     """Telegram rejects messages over ~4096 chars outright; split instead of crashing.
     Sends with the bot's default HTML parse mode so the model's <b>/<i>/<code>
     formatting renders; if the model ever emits malformed markup, fall back to
-    plain text for that chunk instead of losing the reply entirely."""
-    for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LEN):
-        chunk = text[i : i + TELEGRAM_MAX_MESSAGE_LEN]
+    plain text for that chunk instead of losing the reply entirely. `reply_markup`
+    (if given) is attached only to the last chunk."""
+    chunks = [
+        text[i : i + TELEGRAM_MAX_MESSAGE_LEN]
+        for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LEN)
+    ] or [""]
+    for i, chunk in enumerate(chunks):
+        markup = reply_markup if i == len(chunks) - 1 else None
         try:
-            await message.answer(chunk)
+            await message.answer(chunk, reply_markup=markup)
         except TelegramBadRequest:
-            await message.answer(chunk, parse_mode=None)
+            await message.answer(chunk, parse_mode=None, reply_markup=markup)
+
+
+QUICK_ACTIONS = {
+    "detail": "Дай больше деталей и разверни предыдущий ответ подробнее.",
+    "simpler": "Объясни то же самое проще, другими словами, как для новичка.",
+    "example": "Приведи ещё один похожий пример с решением.",
+}
+
+
+def quick_actions_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔍 Подробнее", callback_data="qa:detail"),
+                InlineKeyboardButton(text="💡 Проще", callback_data="qa:simpler"),
+                InlineKeyboardButton(text="📝 Пример", callback_data="qa:example"),
+            ]
+        ]
+    )
 
 
 def model_keyboard(current: str) -> InlineKeyboardMarkup:
@@ -146,9 +214,34 @@ def quota_denied_text(status: dict) -> str:
     )
 
 
+async def _apply_referral(message: Message) -> None:
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].startswith("ref_"):
+        return
+    referrer_str = parts[1][len("ref_") :]
+    if not referrer_str.isdigit():
+        return
+    referrer_id = int(referrer_str)
+    user_id = message.from_user.id
+    db.get_status(user_id, message.from_user.username)  # ensure the row exists first
+    if not db.set_referrer(user_id, referrer_id):
+        return
+    db.add_bonus_credits(user_id, message.from_user.username, REFERRAL_BONUS_MESSAGES)
+    new_balance = db.add_bonus_credits(referrer_id, None, REFERRAL_BONUS_MESSAGES)
+    try:
+        await message.bot.send_message(
+            referrer_id,
+            f"🎉 По твоей ссылке присоединился новый пользователь — начислено "
+            f"<b>{REFERRAL_BONUS_MESSAGES}</b> сообщений! Баланс: {new_balance}.",
+        )
+    except Exception:
+        pass  # referrer may have blocked the bot — not worth failing /start over
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
+    await _apply_referral(message)
     await message.answer(
         "🤖 <b>Привет! Я AI-ассистент.</b>\n"
         "Пиши текстом, голосом, присылай фото или PDF — отвечу на всё.\n\n"
@@ -219,7 +312,13 @@ HELP_TEXT = (
     "• Заметки: напиши «Запомни: ...» — я буду учитывать это в каждом ответе, даже "
     "после перезапуска. Список — кнопка «Заметки» в меню, удалить — /forget &lt;номер&gt;.\n"
     "• ⏱ Безлимит на время: в разделе «Баланс» можно купить безлимит на 30 минут, час "
-    "или день — удобно, если нужно решить много задач подряд и не считать сообщения.\n\n"
+    "или день — удобно, если нужно решить много задач подряд и не считать сообщения.\n"
+    "• Под каждым ответом есть кнопки «Подробнее» / «Проще» / «Пример» — не нужно "
+    "переписывать вопрос, чтобы уточнить ответ.\n"
+    f"• Пригласи друга (кнопка в меню) — когда он запустит бота по твоей ссылке, вы оба "
+    f"получите по {REFERRAL_BONUS_MESSAGES} сообщений.\n"
+    "• В группах бот отвечает, только если его упомянуть (@username) или ответить на "
+    "его сообщение — чтобы не отвечать на каждое сообщение в чате.\n\n"
     "Открыть меню в любой момент — /menu."
 )
 
@@ -330,6 +429,35 @@ async def cb_menu_reset(callback: CallbackQuery, state: FSMContext) -> None:
 async def btn_reset_text(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("Диалог сброшен. Начнём заново.")
+
+
+async def _invite_text(bot, user_id: int) -> str:
+    username = await _get_bot_username(bot)
+    link = f"https://t.me/{username}?start=ref_{user_id}"
+    return (
+        f"🎁 <b>Пригласи друга</b>\n\n"
+        f"Отправь эту ссылку другу — как только он запустит бота по ней, вы "
+        f"<b>оба</b> получите по {REFERRAL_BONUS_MESSAGES} бесплатных сообщений.\n\n"
+        f"<code>{link}</code>"
+    )
+
+
+@router.message(Command("invite"))
+async def cmd_invite(message: Message) -> None:
+    await message.answer(await _invite_text(message.bot, message.from_user.id))
+
+
+@router.callback_query(F.data == "menu:invite")
+async def cb_menu_invite(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await _edit_or_send(
+        callback, await _invite_text(callback.bot, callback.from_user.id), back_keyboard()
+    )
+
+
+@router.message(F.text == BTN_INVITE)
+async def btn_invite_text(message: Message) -> None:
+    await message.answer(await _invite_text(message.bot, message.from_user.id))
 
 
 BUY_TEXT = "💎 <b>Купить сообщения за Telegram Stars</b>\n\nВыберите пакет:"
@@ -634,29 +762,12 @@ async def cmd_chatlog(message: Message) -> None:
 REMEMBER_PREFIXES = ("запомни:", "запомни,", "запомни ")
 
 
-async def _process_text_query(message: Message, state: FSMContext, text: str) -> None:
-    """Shared pipeline for anything that resolves to a text question — typed
-    messages and transcribed voice messages alike."""
-    lowered = text.strip().lower()
-
-    for prefix in REMEMBER_PREFIXES:
-        if lowered.startswith(prefix):
-            note_text = text.strip()[len(prefix):].strip()
-            if note_text:
-                note_id = db.add_note(message.from_user.id, note_text)
-                await message.answer(f"✅ Запомнил (заметка №{note_id}).")
-                return
-            break
-
-    for prefix in IMAGE_PREFIXES:
-        if lowered.startswith(prefix):
-            prompt = text.strip()[len(prefix):].strip()
-            await _process_image_request(message, prompt)
-            return
-
-    user_id = message.from_user.id
-    username = message.from_user.username
-
+async def _answer_text_query(
+    message: Message, state: FSMContext, text: str, user_id: int, username: str | None
+) -> None:
+    """Core pipeline for anything that resolves to a text question: typed
+    messages, transcribed voice, and quick-action follow-ups alike. Callers
+    have already handled remember/image-prefix detection."""
     allowed, status = db.try_consume_message(
         user_id, username, DAILY_FREE_MESSAGES, DAILY_FREE_PREMIUM_MESSAGES, PREMIUM_CREDIT_COST
     )
@@ -693,16 +804,58 @@ async def _process_text_query(message: Message, state: FSMContext, text: str) ->
     history = history[-(2 * 10):]
     await state.update_data(history=history)
 
-    await _send_long(message, reply_text)
+    await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
+
+
+async def _process_text_query(message: Message, state: FSMContext, text: str) -> None:
+    """Public entry point: checks remember/image prefixes first, then falls
+    through to the shared answering pipeline."""
+    lowered = text.strip().lower()
+
+    for prefix in REMEMBER_PREFIXES:
+        if lowered.startswith(prefix):
+            note_text = text.strip()[len(prefix):].strip()
+            if note_text:
+                note_id = db.add_note(message.from_user.id, note_text)
+                await message.answer(f"✅ Запомнил (заметка №{note_id}).")
+                return
+            break
+
+    for prefix in IMAGE_PREFIXES:
+        if lowered.startswith(prefix):
+            prompt = text.strip()[len(prefix):].strip()
+            await _process_image_request(message, prompt)
+            return
+
+    await _answer_text_query(message, state, text, message.from_user.id, message.from_user.username)
+
+
+@router.callback_query(F.data.startswith("qa:"))
+async def cb_quick_action(callback: CallbackQuery, state: FSMContext) -> None:
+    instruction = QUICK_ACTIONS.get(callback.data.split(":", 1)[1])
+    await callback.answer()
+    if not instruction:
+        return
+    await _answer_text_query(
+        callback.message, state, instruction, callback.from_user.id, callback.from_user.username
+    )
 
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_chat_message(message: Message, state: FSMContext) -> None:
-    await _process_text_query(message, state, message.text)
+    if not await _should_respond_in_group(message):
+        return
+    text = await _strip_mention(message, message.text)
+    if not text:
+        return
+    await _process_text_query(message, state, text)
 
 
 @router.message(F.voice)
 async def handle_voice_message(message: Message, state: FSMContext) -> None:
+    if not await _should_respond_in_group(message):
+        return
+
     file_buf = await message.bot.download(message.voice.file_id)
     try:
         text = await ai.transcribe_audio(file_buf.read())
@@ -724,6 +877,9 @@ MAX_PDF_CHARS = 20000
 
 @router.message(F.document)
 async def handle_document_message(message: Message, state: FSMContext) -> None:
+    if not await _should_respond_in_group(message):
+        return
+
     user_id = message.from_user.id
     username = message.from_user.username
 
@@ -758,7 +914,7 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
     truncated = len(doc_text) > MAX_PDF_CHARS
     doc_text = doc_text[:MAX_PDF_CHARS]
 
-    caption = message.caption or "Кратко перескажи документ и выдели главное."
+    caption = await _strip_mention(message, message.caption) or "Кратко перескажи документ и выдели главное."
     prompt = (
         f"Пользователь прислал PDF «{filename}» ({len(reader.pages)} стр."
         f"{', показана только часть текста' if truncated else ''}). Содержимое документа:\n\n"
@@ -788,18 +944,26 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
     db.log_message(user_id, username, "user", short_ref)
     db.log_message(user_id, username, "assistant", reply_text)
 
+    # Keep a capped excerpt (not the full doc — history gets replayed on
+    # every future turn) so follow-up questions about the same PDF still
+    # have some content to work with without re-uploading it.
+    MAX_DOC_HISTORY_CHARS = 2000
+    history_entry = f"[Документ «{filename}»] {caption}\n\n{doc_text[:MAX_DOC_HISTORY_CHARS]}"
     history = history + [
-        {"role": "user", "content": short_ref},
+        {"role": "user", "content": history_entry},
         {"role": "assistant", "content": reply_text},
     ]
     history = history[-(2 * 10):]
     await state.update_data(history=history)
 
-    await _send_long(message, reply_text)
+    await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
 
 
 @router.message(F.photo)
 async def handle_photo_message(message: Message, state: FSMContext) -> None:
+    if not await _should_respond_in_group(message):
+        return
+
     user_id = message.from_user.id
     username = message.from_user.username
 
@@ -810,7 +974,9 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
         await message.answer(quota_denied_text(status))
         return
 
-    caption = message.caption or "Реши задание на фото. Если это не задание — опиши, что на фото."
+    caption = await _strip_mention(message, message.caption) or (
+        "Реши задание на фото. Если это не задание — опиши, что на фото."
+    )
     notes = [content for _id, content in db.list_notes(user_id)]
 
     file_buf = await message.bot.download(message.photo[-1].file_id)
@@ -878,11 +1044,16 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     db.log_message(user_id, username, "user", f"[фото] {caption}")
     db.log_message(user_id, username, "assistant", reply_text)
 
+    # Store the actual description (not just the caption) so a follow-up
+    # text question like "а второе задание?" still has something to work
+    # with — vision_text is already short (stage 1 is tuned for brevity),
+    # so it's safe to keep in full rather than just a placeholder.
+    history_entry = f"[Фото] {caption}\n\nСодержимое фото: {vision_text}"
     history = history + [
-        {"role": "user", "content": f"[фото] {caption}"},
+        {"role": "user", "content": history_entry},
         {"role": "assistant", "content": reply_text},
     ]
     history = history[-(2 * 10):]
     await state.update_data(history=history)
 
-    await _send_long(message, reply_text)
+    await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())

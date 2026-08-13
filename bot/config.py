@@ -18,6 +18,7 @@ IMAGE_CREDIT_COST = int(os.environ.get("IMAGE_CREDIT_COST", "5"))
 
 DAILY_FREE_MESSAGES = int(os.environ.get("DAILY_FREE_MESSAGES", "10"))
 DAILY_FREE_PREMIUM_MESSAGES = int(os.environ.get("DAILY_FREE_PREMIUM_MESSAGES", "3"))
+REFERRAL_BONUS_MESSAGES = int(os.environ.get("REFERRAL_BONUS_MESSAGES", "20"))
 
 DB_PATH = os.environ.get("DB_PATH", "assistant.db")
 MAX_HISTORY_TURNS = 10

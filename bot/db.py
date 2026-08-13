@@ -56,6 +56,7 @@ def _ensure_column(table: str, column: str, coldef: str) -> None:
 _ensure_column("players", "premium_messages_used_today", "INTEGER NOT NULL DEFAULT 0")
 _ensure_column("players", "last_active_at", "TEXT")
 _ensure_column("players", "unlimited_until", "TEXT")
+_ensure_column("players", "referred_by", "INTEGER")
 
 
 def _now() -> str:
@@ -332,3 +333,21 @@ def activate_unlimited(user_id: int, username: str | None, minutes: int) -> str:
         )
         _conn.commit()
         return new_expiry
+
+
+def set_referrer(user_id: int, referrer_id: int) -> bool:
+    """Records who referred this user, but only the first time and never for
+    self-referrals. Returns True iff this call actually set it (i.e. the
+    referral bonus should be paid out); False means already set/invalid."""
+    if referrer_id == user_id:
+        return False
+    with _lock:
+        cur = _conn.execute("SELECT referred_by FROM players WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        if row is None or row[0] is not None:
+            return False
+        _conn.execute(
+            "UPDATE players SET referred_by = ? WHERE user_id = ?", (referrer_id, user_id)
+        )
+        _conn.commit()
+        return True
