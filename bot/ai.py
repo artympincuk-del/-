@@ -233,9 +233,16 @@ async def _translate_for_image(prompt: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "Translate the user's image description into a short, vivid English "
-                    "prompt suitable for an image generation model. Reply with ONLY the "
-                    "translated prompt, nothing else."
+                    "Translate the user's image description into a short, literal English "
+                    "prompt for an image generation model. Put the main subject first in "
+                    "plain, unambiguous terms (e.g. 'a pug dog', not just 'a pug'). If the "
+                    "subject is an animal, say so explicitly ('a real cat', 'a dog', etc.) "
+                    "and do NOT phrase it in a way that could be misread as a human "
+                    "character — image models sometimes draw a person instead of the "
+                    "animal when an animal is described doing a human-like action (e.g. "
+                    "wearing glasses, reading). Only add scene/style details the user "
+                    "actually mentioned; don't invent extra atmosphere, lighting, or "
+                    "backdrop. Reply with ONLY the translated prompt, nothing else."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -255,7 +262,11 @@ async def _translate_for_image(prompt: str) -> str:
 async def generate_image(prompt: str, width: int = 1024, height: int = 1024) -> bytes:
     prompt = await _translate_for_image(prompt)
     url = IMAGE_GEN_URL.format(prompt=urllib.parse.quote(prompt))
-    params = {"width": width, "height": height, "nologo": "true"}
+    # Pollinations' anonymous-tier default model (sana) is noticeably worse at
+    # following the prompt than flux, which is also free/keyless — e.g. "a pug
+    # on a hoverboard" produced an unrelated person with the default model but
+    # an accurate pug with flux in testing.
+    params = {"width": width, "height": height, "nologo": "true", "model": "flux"}
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
             async with session.get(url, params=params) as resp:
