@@ -55,6 +55,7 @@ def _ensure_column(table: str, column: str, coldef: str) -> None:
 
 _ensure_column("players", "premium_messages_used_today", "INTEGER NOT NULL DEFAULT 0")
 _ensure_column("players", "last_active_at", "TEXT")
+_ensure_column("players", "unlimited_until", "TEXT")
 
 
 def _now() -> str:
@@ -90,21 +91,32 @@ def _reset_if_new_day(user_id: int) -> None:
         _conn.commit()
 
 
+def _active_unlimited_until(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    try:
+        expiry = datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return raw if expiry > datetime.datetime.utcnow() else None
+
+
 def get_status(user_id: int, username: str | None) -> dict:
     with _lock:
         _ensure_player(user_id, username)
         _reset_if_new_day(user_id)
         cur = _conn.execute(
-            "SELECT messages_used_today, premium_messages_used_today, bonus_credits, model_pref "
-            "FROM players WHERE user_id = ?",
+            "SELECT messages_used_today, premium_messages_used_today, bonus_credits, "
+            "model_pref, unlimited_until FROM players WHERE user_id = ?",
             (user_id,),
         )
-        used, premium_used, bonus, model_pref = cur.fetchone()
+        used, premium_used, bonus, model_pref, unlimited_until = cur.fetchone()
         return {
             "used_today": used,
             "premium_used_today": premium_used,
             "bonus_credits": bonus,
             "model_pref": model_pref,
+            "unlimited_until": _active_unlimited_until(unlimited_until),
         }
 
 
@@ -135,11 +147,25 @@ def try_consume_message(
         _ensure_player(user_id, username)
         _reset_if_new_day(user_id)
         cur = _conn.execute(
-            "SELECT messages_used_today, premium_messages_used_today, bonus_credits, model_pref "
-            "FROM players WHERE user_id = ?",
+            "SELECT messages_used_today, premium_messages_used_today, bonus_credits, "
+            "model_pref, unlimited_until FROM players WHERE user_id = ?",
             (user_id,),
         )
-        used, premium_used, bonus, model_pref = cur.fetchone()
+        used, premium_used, bonus, model_pref, unlimited_raw = cur.fetchone()
+        unlimited_until = _active_unlimited_until(unlimited_raw)
+
+        def status(used=used, premium_used=premium_used, bonus=bonus) -> dict:
+            return {
+                "used_today": used,
+                "premium_used_today": premium_used,
+                "bonus_credits": bonus,
+                "model_pref": model_pref,
+                "unlimited_until": unlimited_until,
+            }
+
+        if unlimited_until:
+            # Active time pass: no quota/credits touched at all.
+            return True, status()
 
         if model_pref == "premium":
             if premium_used < daily_premium_limit:
@@ -149,31 +175,16 @@ def try_consume_message(
                     (user_id,),
                 )
                 _conn.commit()
-                return True, {
-                    "used_today": used,
-                    "premium_used_today": premium_used + 1,
-                    "bonus_credits": bonus,
-                    "model_pref": model_pref,
-                }
+                return True, status(premium_used=premium_used + 1)
 
             if bonus < premium_cost:
-                return False, {
-                    "used_today": used,
-                    "premium_used_today": premium_used,
-                    "bonus_credits": bonus,
-                    "model_pref": model_pref,
-                }
+                return False, status()
             _conn.execute(
                 "UPDATE players SET bonus_credits = bonus_credits - ? WHERE user_id = ?",
                 (premium_cost, user_id),
             )
             _conn.commit()
-            return True, {
-                "used_today": used,
-                "premium_used_today": premium_used,
-                "bonus_credits": bonus - premium_cost,
-                "model_pref": model_pref,
-            }
+            return True, status(bonus=bonus - premium_cost)
 
         if used < daily_limit:
             _conn.execute(
@@ -181,12 +192,7 @@ def try_consume_message(
                 (user_id,),
             )
             _conn.commit()
-            return True, {
-                "used_today": used + 1,
-                "premium_used_today": premium_used,
-                "bonus_credits": bonus,
-                "model_pref": model_pref,
-            }
+            return True, status(used=used + 1)
 
         if bonus > 0:
             _conn.execute(
@@ -194,19 +200,9 @@ def try_consume_message(
                 (user_id,),
             )
             _conn.commit()
-            return True, {
-                "used_today": used,
-                "premium_used_today": premium_used,
-                "bonus_credits": bonus - 1,
-                "model_pref": model_pref,
-            }
+            return True, status(bonus=bonus - 1)
 
-        return False, {
-            "used_today": used,
-            "premium_used_today": premium_used,
-            "bonus_credits": bonus,
-            "model_pref": model_pref,
-        }
+        return False, status()
 
 
 def add_bonus_credits(user_id: int, username: str | None, amount: int) -> int:
@@ -315,3 +311,24 @@ def find_user_id_by_username(username: str) -> int | None:
         )
         row = cur.fetchone()
         return row[0] if row else None
+
+
+def activate_unlimited(user_id: int, username: str | None, minutes: int) -> str:
+    """Grants (or extends) unrestricted access for `minutes`. Stacks on top of
+    an already-active window instead of overwriting it, so buying another pass
+    before the current one expires adds to the remaining time."""
+    with _lock:
+        _ensure_player(user_id, username)
+        cur = _conn.execute("SELECT unlimited_until FROM players WHERE user_id = ?", (user_id,))
+        (current_raw,) = cur.fetchone()
+        now = datetime.datetime.utcnow()
+        base = now
+        active = _active_unlimited_until(current_raw)
+        if active:
+            base = datetime.datetime.fromisoformat(active)
+        new_expiry = (base + datetime.timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        _conn.execute(
+            "UPDATE players SET unlimited_until = ? WHERE user_id = ?", (new_expiry, user_id)
+        )
+        _conn.commit()
+        return new_expiry

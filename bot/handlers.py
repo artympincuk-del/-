@@ -33,7 +33,7 @@ from bot.config import (
     PREMIUM_REASONING_EFFORT,
     VISION_MODEL,
 )
-from bot.payments import PACKAGES, packages_keyboard
+from bot.payments import PACKAGES, TIME_PACKAGES, packages_keyboard
 
 router = Router()
 
@@ -188,7 +188,9 @@ HELP_TEXT = (
     "• Поиск в интернете: для вопросов про свежие новости, курсы, актуальные факты — сам "
     "решаю, когда стоит поискать в сети, и использую это в ответе.\n"
     "• Заметки: напиши «Запомни: ...» — я буду учитывать это в каждом ответе, даже "
-    "после перезапуска. Список — кнопка «Заметки» в меню, удалить — /forget <номер>.\n\n"
+    "после перезапуска. Список — кнопка «Заметки» в меню, удалить — /forget <номер>.\n"
+    "• ⏱ Безлимит на время: в разделе «Баланс» можно купить безлимит на 30 минут, час "
+    "или день — удобно, если нужно решить много задач подряд и не считать сообщения.\n\n"
     "Открыть меню в любой момент — /menu."
 )
 
@@ -214,8 +216,13 @@ async def btn_help_text(message: Message) -> None:
 def _balance_text(user_id: int, username: str | None) -> str:
     status = db.get_status(user_id, username)
     model_name = MODEL_NAMES[status["model_pref"]]
+    unlimited_line = ""
+    if status["unlimited_until"]:
+        until_local = status["unlimited_until"].replace("T", " ")
+        unlimited_line = f"⏱ <b>Безлимит активен до {until_local} (UTC)</b> — лимиты ниже не расходуются.\n\n"
     return (
         f"📊 <b>Баланс</b>\n\n"
+        f"{unlimited_line}"
         f"Модель: {model_name}\n"
         f"Быстрая, бесплатных сегодня: {status['used_today']}/{DAILY_FREE_MESSAGES}\n"
         f"Премиум, бесплатных сегодня: {status['premium_used_today']}/{DAILY_FREE_PREMIUM_MESSAGES}\n"
@@ -331,6 +338,21 @@ async def cb_buy(callback: CallbackQuery) -> None:
     )
 
 
+@router.callback_query(F.data.startswith("buytime:"))
+async def cb_buy_time(callback: CallbackQuery) -> None:
+    idx = int(callback.data.split(":")[1])
+    pkg = TIME_PACKAGES[idx]
+    await callback.answer()
+    await callback.message.answer_invoice(
+        title=f"Безлимит на {pkg['label']}",
+        description="Без ограничения по количеству сообщений на выбранное время.",
+        payload=f"unlimited:{pkg['minutes']}",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"Безлимит {pkg['label']}", amount=pkg["stars"])],
+        provider_token="",
+    )
+
+
 @router.pre_checkout_query()
 async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
     await pre_checkout_query.answer(ok=True)
@@ -339,11 +361,22 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
 @router.message(F.successful_payment)
 async def process_successful_payment(message: Message) -> None:
     payload = message.successful_payment.invoice_payload
-    _, _, count_str = payload.partition(":")
-    count = int(count_str)
+    kind, _, value_str = payload.partition(":")
+    user_id = message.from_user.id
+    username = message.from_user.username
 
-    new_balance = db.add_bonus_credits(message.from_user.id, message.from_user.username, count)
+    if kind == "unlimited":
+        minutes = int(value_str)
+        expiry = db.activate_unlimited(user_id, username, minutes)
+        until_local = expiry.replace("T", " ")
+        await message.answer(
+            f"✅ Оплата получена! Безлимит активирован до <b>{until_local}</b> (UTC).\n"
+            f"Все сообщения без ограничений, пока безлимит активен."
+        )
+        return
 
+    count = int(value_str)
+    new_balance = db.add_bonus_credits(user_id, username, count)
     await message.answer(
         f"✅ Оплата получена! Начислено <b>{count}</b> сообщений.\n"
         f"Доступно докупленных сообщений: <b>{new_balance}</b>."
@@ -749,7 +782,7 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
         await message.answer(quota_denied_text(status))
         return
 
-    caption = message.caption or "Опиши, что на этом фото."
+    caption = message.caption or "Реши задание на фото. Если это не задание — опиши, что на фото."
     notes = [content for _id, content in db.list_notes(user_id)]
 
     file_buf = await message.bot.download(message.photo[-1].file_id)
@@ -766,14 +799,42 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
 
     await message.bot.send_chat_action(message.chat.id, "typing")
 
-    user_content = [
-        {"type": "text", "text": caption},
+    # Stage 1 — pure perception: get an accurate, literal transcription of
+    # what's on the photo. Kept separate from solving so the vision model
+    # (weaker at multi-step reasoning) isn't also responsible for getting
+    # the actual answer right — it only has to accurately see. Keeping the
+    # instruction short and explicitly "no analysis" measurably cut down on
+    # the model over-thinking and running into the reasoning-token budget
+    # (verified via repeated testing — an elaborate "think carefully and
+    # fully" instruction was the actual cause of intermittent truncation).
+    transcription_request = [
+        {
+            "type": "text",
+            "text": (
+                "Transcribe exactly what is written in this image (problem text, numbers, "
+                "formulas, diagram contents). Be direct and concise — output only the "
+                "transcription, no analysis, no commentary, no extra reasoning."
+            ),
+        },
         {"type": "image_url", "image_url": {"url": data_url}},
     ]
+    try:
+        vision_text = await ai.ask_ai([], transcription_request, VISION_MODEL, max_tokens=3000)
+    except ai.AIError as e:
+        await message.answer(e.user_message)
+        return
 
+    # Stage 2 — actual solving, always handed to the strongest reasoning
+    # model regardless of the user's fast/premium chat preference: accuracy
+    # on homework is the core promise of this bot, worth the extra seconds.
+    solve_prompt = (
+        f"Вот что распознано на фото пользователя:\n\n{vision_text}\n\n---\n"
+        f"Запрос пользователя: {caption}\n\n"
+        f"Реши точно и по шагам, объясни ключевые моменты решения."
+    )
     try:
         reply_text = await ai.ask_ai(
-            history, user_content, VISION_MODEL, notes=notes, max_tokens=4500
+            history, solve_prompt, PREMIUM_MODEL, notes=notes, reasoning_effort="high", max_tokens=6144
         )
     except ai.AIError as e:
         await message.answer(e.user_message)
