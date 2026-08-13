@@ -2,6 +2,7 @@ import base64
 import io
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
@@ -82,9 +83,16 @@ TELEGRAM_MAX_MESSAGE_LEN = 4000
 
 
 async def _send_long(message: Message, text: str) -> None:
-    """Telegram rejects messages over ~4096 chars outright; split instead of crashing."""
+    """Telegram rejects messages over ~4096 chars outright; split instead of crashing.
+    Sends with the bot's default HTML parse mode so the model's <b>/<i>/<code>
+    formatting renders; if the model ever emits malformed markup, fall back to
+    plain text for that chunk instead of losing the reply entirely."""
     for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LEN):
-        await message.answer(text[i : i + TELEGRAM_MAX_MESSAGE_LEN], parse_mode=None)
+        chunk = text[i : i + TELEGRAM_MAX_MESSAGE_LEN]
+        try:
+            await message.answer(chunk)
+        except TelegramBadRequest:
+            await message.answer(chunk, parse_mode=None)
 
 
 def model_keyboard(current: str) -> InlineKeyboardMarkup:
@@ -158,6 +166,13 @@ async def cb_menu_help(callback: CallbackQuery) -> None:
     await callback.message.answer(HELP_TEXT)
 
 
+@router.message(F.text == BTN_HELP)
+async def btn_help_text(message: Message) -> None:
+    # Safety net: users who haven't re-opened /start since the reply-keyboard
+    # menu was removed may still have the old buttons cached client-side.
+    await message.answer(HELP_TEXT)
+
+
 def _balance_text(user_id: int, username: str | None) -> str:
     status = db.get_status(user_id, username)
     model_name = MODEL_NAMES[status["model_pref"]]
@@ -181,6 +196,11 @@ async def cb_menu_balance(callback: CallbackQuery) -> None:
     await callback.message.answer(_balance_text(callback.from_user.id, callback.from_user.username))
 
 
+@router.message(F.text == BTN_BALANCE)
+async def btn_balance_text(message: Message) -> None:
+    await message.answer(_balance_text(message.from_user.id, message.from_user.username))
+
+
 @router.message(Command("model"))
 async def cmd_model(message: Message) -> None:
     status = db.get_status(message.from_user.id, message.from_user.username)
@@ -192,6 +212,12 @@ async def cb_menu_model(callback: CallbackQuery) -> None:
     await callback.answer()
     status = db.get_status(callback.from_user.id, callback.from_user.username)
     await callback.message.answer("Выберите модель:", reply_markup=model_keyboard(status["model_pref"]))
+
+
+@router.message(F.text == BTN_MODEL)
+async def btn_model_text(message: Message) -> None:
+    status = db.get_status(message.from_user.id, message.from_user.username)
+    await message.answer("Выберите модель:", reply_markup=model_keyboard(status["model_pref"]))
 
 
 @router.callback_query(F.data.startswith("model:"))
@@ -217,6 +243,12 @@ async def cb_menu_reset(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.answer("Диалог сброшен. Начнём заново.")
 
 
+@router.message(F.text == BTN_RESET)
+async def btn_reset_text(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Диалог сброшен. Начнём заново.")
+
+
 BUY_TEXT = "💎 <b>Купить сообщения за Telegram Stars</b>\n\nВыберите пакет:"
 
 
@@ -229,6 +261,11 @@ async def cmd_buy(message: Message) -> None:
 async def cb_menu_buy(callback: CallbackQuery) -> None:
     await callback.answer()
     await callback.message.answer(BUY_TEXT, reply_markup=packages_keyboard())
+
+
+@router.message(F.text == BTN_BUY)
+async def btn_buy_text(message: Message) -> None:
+    await message.answer(BUY_TEXT, reply_markup=packages_keyboard())
 
 
 @router.callback_query(F.data.startswith("buy:"))
@@ -285,6 +322,11 @@ async def cmd_notes(message: Message) -> None:
 async def cb_menu_notes(callback: CallbackQuery) -> None:
     await callback.answer()
     await callback.message.answer(_notes_text(callback.from_user.id))
+
+
+@router.message(F.text == BTN_NOTES)
+async def btn_notes_text(message: Message) -> None:
+    await message.answer(_notes_text(message.from_user.id))
 
 
 @router.message(Command("remember"))
