@@ -481,7 +481,7 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
 
     try:
         reply_text = await ai.ask_ai(
-            history, user_content, VISION_MODEL, notes=notes, max_tokens=3000
+            history, user_content, VISION_MODEL, notes=notes, max_tokens=4500
         )
     except ai.AIError as e:
         await message.answer(e.user_message)

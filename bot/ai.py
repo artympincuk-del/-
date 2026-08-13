@@ -64,6 +64,13 @@ async def ask_ai(
     if model.startswith("openai/gpt-oss"):
         kwargs["reasoning_effort"] = reasoning_effort or "medium"
         kwargs["include_reasoning"] = False
+    elif model.startswith("qwen/"):
+        # Qwen only accepts reasoning_effort "default"/"none" (not low/high).
+        # "default" + hidden keeps answers grounded (vs "none", which tends
+        # to guess) while capping reasoning tokens so dense photos don't blow
+        # through Groq's free-tier per-minute token limit.
+        kwargs["reasoning_effort"] = "default"
+        kwargs["reasoning_format"] = "hidden"
 
     try:
         response = await _client.chat.completions.create(**kwargs)
