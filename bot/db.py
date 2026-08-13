@@ -18,7 +18,19 @@ _conn.execute(
     )
     """
 )
+_conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """
+)
 _conn.commit()
+
+MAX_NOTES_PER_USER = 30
 
 
 def _today() -> str:
@@ -132,3 +144,39 @@ def add_bonus_credits(user_id: int, username: str | None, amount: int) -> int:
         _conn.commit()
         cur = _conn.execute("SELECT bonus_credits FROM players WHERE user_id = ?", (user_id,))
         return cur.fetchone()[0]
+
+
+def add_note(user_id: int, content: str) -> int:
+    with _lock:
+        cur = _conn.execute("SELECT COUNT(*) FROM notes WHERE user_id = ?", (user_id,))
+        (count,) = cur.fetchone()
+        if count >= MAX_NOTES_PER_USER:
+            _conn.execute(
+                "DELETE FROM notes WHERE id = ("
+                "  SELECT id FROM notes WHERE user_id = ? ORDER BY id LIMIT 1"
+                ")",
+                (user_id,),
+            )
+        cur = _conn.execute(
+            "INSERT INTO notes (user_id, content, created_at) VALUES (?, ?, ?)",
+            (user_id, content, _today()),
+        )
+        _conn.commit()
+        return cur.lastrowid
+
+
+def list_notes(user_id: int) -> list[tuple[int, str]]:
+    with _lock:
+        cur = _conn.execute(
+            "SELECT id, content FROM notes WHERE user_id = ? ORDER BY id", (user_id,)
+        )
+        return cur.fetchall()
+
+
+def delete_note(user_id: int, note_id: int) -> bool:
+    with _lock:
+        cur = _conn.execute(
+            "DELETE FROM notes WHERE user_id = ? AND id = ?", (user_id, note_id)
+        )
+        _conn.commit()
+        return cur.rowcount > 0

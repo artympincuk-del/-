@@ -27,10 +27,24 @@ class AIError(Exception):
     pass
 
 
-async def ask_ai(history: list[dict], user_content, model: str) -> str:
+def _build_system_prompt(notes: list[str] | None) -> str:
+    if not notes:
+        return SYSTEM_PROMPT
+    notes_block = "\n".join(f"- {n}" for n in notes)
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        "Заметки о пользователе, которые нужно учитывать при ответе "
+        "(это факты, сохранённые самим пользователем через /remember):\n"
+        f"{notes_block}"
+    )
+
+
+async def ask_ai(
+    history: list[dict], user_content, model: str, notes: list[str] | None = None
+) -> str:
     """`user_content` is either a plain string (text-only turn) or a list of
     content blocks (e.g. text + image_url) for multimodal turns."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [
+    messages = [{"role": "system", "content": _build_system_prompt(notes)}] + history + [
         {"role": "user", "content": user_content}
     ]
     try:
