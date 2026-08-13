@@ -12,9 +12,11 @@ from bot.handlers import router
 
 BOT_COMMANDS = [
     BotCommand(command="start", description="Начало работы"),
+    BotCommand(command="menu", description="Открыть меню"),
     BotCommand(command="balance", description="Баланс сообщений"),
     BotCommand(command="buy", description="Купить сообщения за Stars"),
     BotCommand(command="model", description="Выбрать модель"),
+    BotCommand(command="image", description="Сгенерировать картинку"),
     BotCommand(command="remember", description="Запомнить заметку"),
     BotCommand(command="notes", description="Список заметок"),
     BotCommand(command="forget", description="Удалить заметку"),

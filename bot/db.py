@@ -221,6 +221,23 @@ def add_bonus_credits(user_id: int, username: str | None, amount: int) -> int:
         return cur.fetchone()[0]
 
 
+def try_consume_bonus_credits(user_id: int, username: str | None, cost: int) -> tuple[bool, int]:
+    """Spends `cost` bonus credits if available (used for paid-only extras like
+    image generation, which don't draw from the daily free quota)."""
+    with _lock:
+        _ensure_player(user_id, username)
+        cur = _conn.execute("SELECT bonus_credits FROM players WHERE user_id = ?", (user_id,))
+        (bonus,) = cur.fetchone()
+        if bonus < cost:
+            return False, bonus
+        _conn.execute(
+            "UPDATE players SET bonus_credits = bonus_credits - ? WHERE user_id = ?",
+            (cost, user_id),
+        )
+        _conn.commit()
+        return True, bonus - cost
+
+
 def add_note(user_id: int, content: str) -> int:
     with _lock:
         cur = _conn.execute("SELECT COUNT(*) FROM notes WHERE user_id = ?", (user_id,))

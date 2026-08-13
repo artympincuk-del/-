@@ -1,15 +1,23 @@
+import asyncio
+import json
 import re
+import urllib.parse
 
+import aiohttp
 import groq
+from ddgs import DDGS
 
-from bot.config import GROQ_API_KEY
+from bot.config import GROQ_API_KEY, STT_MODEL
 
 SYSTEM_PROMPT = (
     "Ты дружелюбный и полезный AI-ассистент внутри Telegram-бота. "
     "Отвечай по существу, кратко и ясно, на языке пользователя, грамотно и без "
     "орфографических и грамматических ошибок.\n\n"
-    "Форматирование сообщения — ТОЛЬКО через HTML-теги, которые понимает Telegram: "
-    "<b>жирный</b>, <i>курсив</i>, <code>инлайн-код</code>, <pre>блок кода</pre>. "
+    "Форматирование сообщения — ТОЛЬКО через HTML-теги, которые понимает Telegram, и НИКАКИХ "
+    "других: <b>жирный</b>, <i>курсив</i>, <code>инлайн-код</code>, <pre>блок кода</pre>. "
+    "Запрещены любые другие HTML-теги (<p>, <div>, <ul>, <li>, <h1> и т.п.) — Telegram их не "
+    "поддерживает и сообщение не отправится. Для абзацев и списков используй просто перенос "
+    "строки и дефис «- », без тегов.\n\n"
     "Никогда не используй Markdown (**жирный**, `код`, ### заголовки, - списки со звёздочкой) — "
     "Telegram не превращает его в форматирование, и пользователь увидит звёздочки и решётки "
     "прямо в тексте. Не используй заголовки (### и подобное) вообще: если нужно разделить "
@@ -19,8 +27,31 @@ SYSTEM_PROMPT = (
     "юникод-надстрочными (x²), дроби — через слэш (7/13), корень — словом «корень» или знаком √. "
     "Пример правильной записи: x^2 - 2x - 3 = 0, а не $x^2-2x-3=0$.\n\n"
     "Если по смыслу нужен символ < или >, пиши словами «меньше»/«больше» — так безопаснее для "
-    "разметки сообщения."
+    "разметки сообщения.\n\n"
+    "Если для точного ответа нужна свежая информация (новости, курсы валют, актуальные цены, "
+    "события) — используй инструмент search_web вместо того, чтобы гадать по памяти."
 )
+
+SEARCH_TOOL_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": (
+                "Search the web for current information — news, prices, exchange rates, "
+                "events, facts that may have changed after training. Returns titles, URLs "
+                "and short snippets of the top results."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"}
+                },
+                "required": ["query"],
+            },
+        },
+    }
+]
 
 _client = groq.AsyncGroq(api_key=GROQ_API_KEY)
 
@@ -45,6 +76,26 @@ class AIError(Exception):
         self.user_message = user_message or "Не удалось получить ответ. Попробуйте ещё раз."
 
 
+def _sync_search_web(query: str, max_results: int = 5) -> str:
+    try:
+        results = DDGS().text(query, max_results=max_results, region="ru-ru")
+    except Exception as e:
+        return f"Поиск не удался: {e}"
+    if not results:
+        return "Ничего не найдено."
+    lines = []
+    for r in results:
+        title = r.get("title", "")
+        href = r.get("href", "")
+        body = (r.get("body") or "")[:300]
+        lines.append(f"- {title}\n  {href}\n  {body}")
+    return "\n".join(lines)
+
+
+async def _search_web(query: str) -> str:
+    return await asyncio.to_thread(_sync_search_web, query)
+
+
 def _build_system_prompt(notes: list[str] | None) -> str:
     if not notes:
         return SYSTEM_PROMPT
@@ -64,6 +115,7 @@ async def ask_ai(
     notes: list[str] | None = None,
     reasoning_effort: str | None = None,
     max_tokens: int = 4096,
+    enable_search: bool = False,
 ) -> str:
     """`user_content` is either a plain string (text-only turn) or a list of
     content blocks (e.g. text + image_url) for multimodal turns."""
@@ -82,31 +134,108 @@ async def ask_ai(
         kwargs["reasoning_effort"] = "default"
         kwargs["reasoning_format"] = "hidden"
 
+    # Tool calling is only wired up for gpt-oss (OpenAI-compatible tool_calls).
+    if enable_search and model.startswith("openai/gpt-oss"):
+        kwargs["tools"] = SEARCH_TOOL_SCHEMA
+        kwargs["tool_choice"] = "auto"
+
+    # Up to 2 tool-calling round trips before forcing a final answer, so a
+    # model that keeps wanting to search can't loop forever.
+    for _round in range(3):
+        try:
+            response = await _client.chat.completions.create(**kwargs)
+        except groq.APIStatusError as e:
+            if e.status_code == 413:
+                raise AIError(
+                    "Groq API error: 413",
+                    user_message=(
+                        "Слишком много данных для бесплатного лимита модели за один запрос. "
+                        "Пришлите фото с меньшим количеством текста или задайте вопрос короче."
+                    ),
+                ) from e
+            if e.status_code == 429:
+                raise AIError(
+                    "Groq API error: 429",
+                    user_message="Сейчас слишком много запросов. Попробуйте через несколько секунд.",
+                ) from e
+            raise AIError(f"Groq API error: {e.status_code}") from e
+        except groq.APIConnectionError as e:
+            raise AIError("Groq API connection error") from e
+
+        choice = response.choices[0]
+        message = choice.message
+
+        if choice.finish_reason == "tool_calls" and message.tool_calls:
+            kwargs["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": message.content or "",
+                    "tool_calls": [tc.model_dump() for tc in message.tool_calls],
+                }
+            )
+            for tc in message.tool_calls:
+                if tc.function.name == "search_web":
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                    result = await _search_web(args.get("query", ""))
+                else:
+                    result = "Неизвестный инструмент."
+                kwargs["messages"].append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": result}
+                )
+            continue
+
+        if choice.finish_reason == "content_filter":
+            return "Не могу ответить на этот запрос."
+
+        text = _strip_thinking(message.content or "")
+        if not text and choice.finish_reason == "length":
+            return "Ответ получился слишком длинным для обработки. Попробуйте задать вопрос короче."
+        return text or "…"
+
+    return "Не удалось получить ответ после поиска в интернете. Попробуйте переформулировать вопрос."
+
+
+async def transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
     try:
-        response = await _client.chat.completions.create(**kwargs)
+        transcription = await _client.audio.transcriptions.create(
+            file=(filename, audio_bytes),
+            model=STT_MODEL,
+            response_format="text",
+        )
     except groq.APIStatusError as e:
-        if e.status_code == 413:
-            raise AIError(
-                "Groq API error: 413",
-                user_message=(
-                    "Слишком много данных для бесплатного лимита модели за один запрос. "
-                    "Пришлите фото с меньшим количеством текста или задайте вопрос короче."
-                ),
-            ) from e
-        if e.status_code == 429:
-            raise AIError(
-                "Groq API error: 429",
-                user_message="Сейчас слишком много запросов. Попробуйте через несколько секунд.",
-            ) from e
-        raise AIError(f"Groq API error: {e.status_code}") from e
+        raise AIError(
+            f"Groq STT error: {e.status_code}",
+            user_message="Не удалось распознать голосовое сообщение. Попробуйте ещё раз.",
+        ) from e
     except groq.APIConnectionError as e:
-        raise AIError("Groq API connection error") from e
+        raise AIError(
+            "Groq STT connection error",
+            user_message="Не удалось распознать голосовое сообщение. Попробуйте ещё раз.",
+        ) from e
 
-    choice = response.choices[0]
-    if choice.finish_reason == "content_filter":
-        return "Не могу ответить на этот запрос."
+    return transcription if isinstance(transcription, str) else str(transcription).strip()
 
-    text = _strip_thinking(choice.message.content or "")
-    if not text and choice.finish_reason == "length":
-        return "Ответ получился слишком длинным для обработки. Попробуйте задать вопрос короче."
-    return text or "…"
+
+IMAGE_GEN_URL = "https://image.pollinations.ai/prompt/{prompt}"
+
+
+async def generate_image(prompt: str, width: int = 1024, height: int = 1024) -> bytes:
+    url = IMAGE_GEN_URL.format(prompt=urllib.parse.quote(prompt))
+    params = {"width": width, "height": height, "nologo": "true"}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    raise AIError(
+                        f"Image gen error: {resp.status}",
+                        user_message="Не удалось сгенерировать изображение. Попробуйте другое описание.",
+                    )
+                return await resp.read()
+    except aiohttp.ClientError as e:
+        raise AIError(
+            f"Image gen connection error: {e}",
+            user_message="Не удалось сгенерировать изображение. Попробуйте ещё раз.",
+        ) from e

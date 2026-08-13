@@ -6,6 +6,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -15,6 +16,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 from PIL import Image
+from pypdf import PdfReader
 
 from bot import ai, db
 from bot.config import (
@@ -23,6 +25,7 @@ from bot.config import (
     DAILY_FREE_PREMIUM_MESSAGES,
     FAST_MODEL,
     FAST_REASONING_EFFORT,
+    IMAGE_CREDIT_COST,
     PREMIUM_CREDIT_COST,
     PREMIUM_MODEL,
     PREMIUM_REASONING_EFFORT,
@@ -38,6 +41,7 @@ BTN_BALANCE = "💰 Баланс"
 BTN_BUY = "💎 Пополнить"
 BTN_MODEL = "🧠 Модель"
 BTN_NOTES = "📝 Заметки"
+BTN_IMAGE = "🎨 Картинка"
 BTN_RESET = "🔄 Сбросить диалог"
 BTN_HELP = "❓ Помощь"
 
@@ -54,7 +58,10 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text=BTN_NOTES, callback_data="menu:notes"),
             ],
             [
+                InlineKeyboardButton(text=BTN_IMAGE, callback_data="menu:image"),
                 InlineKeyboardButton(text=BTN_RESET, callback_data="menu:reset"),
+            ],
+            [
                 InlineKeyboardButton(text=BTN_HELP, callback_data="menu:help"),
             ],
         ]
@@ -125,11 +132,13 @@ def quota_denied_text(status: dict) -> str:
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "🤖 <b>Привет! Я AI-ассистент на базе Llama (Groq).</b>\n\n"
+        "🤖 <b>Привет! Я AI-ассистент.</b>\n\n"
         f"Бесплатно: <b>{DAILY_FREE_MESSAGES}</b> сообщений в день на быстрой модели "
         f"и <b>{DAILY_FREE_PREMIUM_MESSAGES}</b> на премиум (сброс в 00:00).\n"
         "Дальше — докупка сообщений за Telegram Stars.\n\n"
-        "Просто напиши мне вопрос или пришли фото — и я отвечу.",
+        "Пиши текстом, голосом, присылай фото или PDF — отвечу на всё. Умею искать "
+        "свежую информацию в интернете и рисовать картинки по описанию.\n\n"
+        "Подробнее — кнопка «Помощь» в меню ниже.",
         reply_markup=ReplyKeyboardRemove(),
     )
     await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
@@ -149,6 +158,12 @@ HELP_TEXT = (
     f"списывает {PREMIUM_CREDIT_COST} сообщений из докупленного пакета.\n"
     "• Фото: пришли картинку (можно с подписью-вопросом) — распознаю содержимое. "
     "Списывается как обычное сообщение.\n"
+    "• Голосовые: пришли голосовое — распознаю речь и отвечу как на обычное сообщение.\n"
+    "• PDF-документы: пришли файл — прочитаю и отвечу по содержимому.\n"
+    f"• Картинки: напиши «нарисуй ...» или /image &lt;описание&gt; — сгенерирую изображение "
+    f"({IMAGE_CREDIT_COST} докупленных сообщений за картинку).\n"
+    "• Поиск в интернете: для вопросов про свежие новости, курсы, актуальные факты — сам "
+    "решаю, когда стоит поискать в сети, и использую это в ответе.\n"
     "• Заметки: напиши «Запомни: ...» — я буду учитывать это в каждом ответе, даже "
     "после перезапуска. Список — кнопка «Заметки» в меню, удалить — /forget <номер>.\n\n"
     "Открыть меню в любой момент — /menu."
@@ -329,6 +344,69 @@ async def btn_notes_text(message: Message) -> None:
     await message.answer(_notes_text(message.from_user.id))
 
 
+IMAGE_INTRO_TEXT = (
+    f"🎨 <b>Генерация картинок</b>\n\n"
+    f"Опиши, что нарисовать: <code>/image закат над горами в стиле акварели</code>\n"
+    f"Либо просто напиши «нарисуй ...» в чат.\n\n"
+    f"Стоимость: {IMAGE_CREDIT_COST} докупленных сообщений за картинку (из бесплатного "
+    f"дневного лимита не списывается). Пополнить — /buy."
+)
+
+IMAGE_PREFIXES = ("нарисуй:", "нарисуй,", "нарисуй ", "сгенерируй картинку", "сгенерируй изображение")
+
+
+async def _process_image_request(message: Message, prompt: str) -> None:
+    prompt = prompt.strip()
+    if not prompt:
+        await message.answer(IMAGE_INTRO_TEXT)
+        return
+
+    user_id = message.from_user.id
+    username = message.from_user.username
+
+    allowed, bonus = db.try_consume_bonus_credits(user_id, username, IMAGE_CREDIT_COST)
+    if not allowed:
+        await message.answer(
+            f"Генерация картинки стоит {IMAGE_CREDIT_COST} докупленных сообщений, а на "
+            f"балансе только {bonus}. Пополните баланс: /buy"
+        )
+        return
+
+    await message.bot.send_chat_action(message.chat.id, "upload_photo")
+
+    try:
+        image_bytes = await ai.generate_image(prompt)
+    except ai.AIError as e:
+        db.add_bonus_credits(user_id, username, IMAGE_CREDIT_COST)  # refund on failure
+        await message.answer(e.user_message)
+        return
+
+    db.log_message(user_id, username, "user", f"[генерация картинки] {prompt}")
+    db.log_message(user_id, username, "assistant", "[изображение отправлено]")
+
+    await message.answer_photo(
+        BufferedInputFile(image_bytes, filename="image.jpg"),
+        caption=f"🎨 {prompt}",
+    )
+
+
+@router.message(Command("image"))
+async def cmd_image(message: Message) -> None:
+    parts = message.text.split(maxsplit=1)
+    await _process_image_request(message, parts[1] if len(parts) > 1 else "")
+
+
+@router.callback_query(F.data == "menu:image")
+async def cb_menu_image(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.answer(IMAGE_INTRO_TEXT)
+
+
+@router.message(F.text == BTN_IMAGE)
+async def btn_image_text(message: Message) -> None:
+    await message.answer(IMAGE_INTRO_TEXT)
+
+
 @router.message(Command("remember"))
 async def cmd_remember(message: Message) -> None:
     parts = message.text.split(maxsplit=1)
@@ -450,9 +528,9 @@ async def cmd_chatlog(message: Message) -> None:
 REMEMBER_PREFIXES = ("запомни:", "запомни,", "запомни ")
 
 
-@router.message(F.text & ~F.text.startswith("/"))
-async def handle_chat_message(message: Message, state: FSMContext) -> None:
-    text = message.text
+async def _process_text_query(message: Message, state: FSMContext, text: str) -> None:
+    """Shared pipeline for anything that resolves to a text question — typed
+    messages and transcribed voice messages alike."""
     lowered = text.strip().lower()
 
     for prefix in REMEMBER_PREFIXES:
@@ -463,6 +541,12 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
                 await message.answer(f"✅ Запомнил (заметка №{note_id}).")
                 return
             break
+
+    for prefix in IMAGE_PREFIXES:
+        if lowered.startswith(prefix):
+            prompt = text.strip()[len(prefix):].strip()
+            await _process_image_request(message, prompt)
+            return
 
     user_id = message.from_user.id
     username = message.from_user.username
@@ -487,7 +571,7 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
 
     try:
         reply_text = await ai.ask_ai(
-            history, text, model, notes=notes, reasoning_effort=reasoning_effort
+            history, text, model, notes=notes, reasoning_effort=reasoning_effort, enable_search=True
         )
     except ai.AIError as e:
         await message.answer(e.user_message)
@@ -498,6 +582,108 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
 
     history = history + [
         {"role": "user", "content": text},
+        {"role": "assistant", "content": reply_text},
+    ]
+    history = history[-(2 * 10):]
+    await state.update_data(history=history)
+
+    await _send_long(message, reply_text)
+
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_chat_message(message: Message, state: FSMContext) -> None:
+    await _process_text_query(message, state, message.text)
+
+
+@router.message(F.voice)
+async def handle_voice_message(message: Message, state: FSMContext) -> None:
+    file_buf = await message.bot.download(message.voice.file_id)
+    try:
+        text = await ai.transcribe_audio(file_buf.read())
+    except ai.AIError as e:
+        await message.answer(e.user_message)
+        return
+
+    text = text.strip()
+    if not text:
+        await message.answer("Не удалось разобрать голосовое сообщение. Попробуйте ещё раз.")
+        return
+
+    await message.answer(f"🎙 <i>Распознано:</i> {text}")
+    await _process_text_query(message, state, text)
+
+
+MAX_PDF_CHARS = 20000
+
+
+@router.message(F.document)
+async def handle_document_message(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id
+    username = message.from_user.username
+
+    doc = message.document
+    filename = doc.file_name or "document.pdf"
+    if not filename.lower().endswith(".pdf"):
+        await message.answer("Пока умею читать только PDF. Пришлите документ в формате .pdf.")
+        return
+
+    allowed, status = db.try_consume_message(
+        user_id, username, DAILY_FREE_MESSAGES, DAILY_FREE_PREMIUM_MESSAGES, PREMIUM_CREDIT_COST
+    )
+    if not allowed:
+        await message.answer(quota_denied_text(status))
+        return
+
+    file_buf = await message.bot.download(doc.file_id)
+    try:
+        reader = PdfReader(file_buf)
+        doc_text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+    except Exception:
+        await message.answer("Не удалось прочитать PDF. Возможно, файл повреждён.")
+        return
+
+    if not doc_text:
+        await message.answer(
+            "В этом PDF нет текстового слоя (похоже на скан без OCR). "
+            "Пришлите страницы как фото — так я смогу распознать текст."
+        )
+        return
+
+    truncated = len(doc_text) > MAX_PDF_CHARS
+    doc_text = doc_text[:MAX_PDF_CHARS]
+
+    caption = message.caption or "Кратко перескажи документ и выдели главное."
+    prompt = (
+        f"Пользователь прислал PDF «{filename}» ({len(reader.pages)} стр."
+        f"{', показана только часть текста' if truncated else ''}). Содержимое документа:\n\n"
+        f"{doc_text}\n\n---\nЗадача: {caption}"
+    )
+
+    if status["model_pref"] == "premium":
+        model, reasoning_effort = PREMIUM_MODEL, PREMIUM_REASONING_EFFORT
+    else:
+        model, reasoning_effort = FAST_MODEL, FAST_REASONING_EFFORT
+    notes = [content for _id, content in db.list_notes(user_id)]
+
+    data = await state.get_data()
+    history = data.get("history", [])
+
+    await message.bot.send_chat_action(message.chat.id, "typing")
+
+    try:
+        reply_text = await ai.ask_ai(
+            history, prompt, model, notes=notes, reasoning_effort=reasoning_effort
+        )
+    except ai.AIError as e:
+        await message.answer(e.user_message)
+        return
+
+    short_ref = f"[документ «{filename}»] {caption}"
+    db.log_message(user_id, username, "user", short_ref)
+    db.log_message(user_id, username, "assistant", reply_text)
+
+    history = history + [
+        {"role": "user", "content": short_ref},
         {"role": "assistant", "content": reply_text},
     ]
     history = history[-(2 * 10):]
