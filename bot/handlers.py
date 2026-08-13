@@ -827,21 +827,27 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
 
     await message.bot.send_chat_action(message.chat.id, "typing")
 
-    # Stage 1 — pure perception: get an accurate, literal transcription of
-    # what's on the photo. Kept separate from solving so the vision model
-    # (weaker at multi-step reasoning) isn't also responsible for getting
-    # the actual answer right — it only has to accurately see. Keeping the
-    # instruction short and explicitly "no analysis" measurably cut down on
-    # the model over-thinking and running into the reasoning-token budget
-    # (verified via repeated testing — an elaborate "think carefully and
-    # fully" instruction was the actual cause of intermittent truncation).
+    # Stage 1 — pure perception: get an accurate, literal description of
+    # what's on the photo (text/problem AND general visual content — the
+    # PREMIUM_MODEL doing the solving in stage 2 has no vision at all, so
+    # whatever isn't captured here is permanently lost to it). Kept separate
+    # from solving so the vision model (weaker at multi-step reasoning)
+    # isn't also responsible for getting the actual answer right — it only
+    # has to accurately see. Keeping the instruction short and explicitly
+    # "no analysis" measurably cut down on the model over-thinking and
+    # running into the reasoning-token budget (verified via repeated
+    # testing — an elaborate "think carefully and fully" instruction was
+    # the actual cause of intermittent truncation).
     transcription_request = [
         {
             "type": "text",
             "text": (
-                "Transcribe exactly what is written in this image (problem text, numbers, "
-                "formulas, diagram contents). Be direct and concise — output only the "
-                "transcription, no analysis, no commentary, no extra reasoning."
+                "Describe exactly what is in this image. If it contains text/a problem "
+                "(numbers, formulas, questions), transcribe it verbatim. If it's a photo "
+                "or scene with no text, describe what's visually shown instead (objects, "
+                "people, animals, colors, setting) in enough detail to answer questions "
+                "about it. Be direct and concise — no analysis, no commentary, no extra "
+                "reasoning, just the transcription/description."
             ),
         },
         {"type": "image_url", "image_url": {"url": data_url}},
@@ -852,13 +858,14 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
         await message.answer(e.user_message)
         return
 
-    # Stage 2 — actual solving, always handed to the strongest reasoning
-    # model regardless of the user's fast/premium chat preference: accuracy
-    # on homework is the core promise of this bot, worth the extra seconds.
+    # Stage 2 — actual solving/answering, always handed to the strongest
+    # reasoning model regardless of the user's fast/premium chat preference:
+    # accuracy on homework is the core promise of this bot, worth the extra
+    # seconds. It never sees the photo itself, only stage 1's description.
     solve_prompt = (
-        f"Вот что распознано на фото пользователя:\n\n{vision_text}\n\n---\n"
+        f"Вот описание фото, которое прислал пользователь:\n\n{vision_text}\n\n---\n"
         f"Запрос пользователя: {caption}\n\n"
-        f"Реши точно и по шагам, объясни ключевые моменты решения."
+        f"Ответь точно и по существу. Если это учебное задание — реши по шагам."
     )
     try:
         reply_text = await ai.ask_ai(
