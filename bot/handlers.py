@@ -5,6 +5,7 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -35,9 +36,14 @@ from bot.payments import PACKAGES, packages_keyboard
 
 router = Router()
 
+
+class Form(StatesGroup):
+    waiting_for_image_prompt = State()
+
+
 MODEL_NAMES = {"fast": "⚡ Быстрая (GPT-OSS 20B)", "premium": "💎 Премиум (GPT-OSS 120B, глубокий анализ)"}
 
-BTN_BALANCE = "💰 Баланс"
+BTN_BALANCE = "💰 Баланс / Пополнить"
 BTN_BUY = "💎 Пополнить"
 BTN_MODEL = "🧠 Модель"
 BTN_NOTES = "📝 Заметки"
@@ -51,17 +57,14 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(text=BTN_BALANCE, callback_data="menu:balance"),
-                InlineKeyboardButton(text=BTN_BUY, callback_data="menu:buy"),
-            ],
-            [
                 InlineKeyboardButton(text=BTN_MODEL, callback_data="menu:model"),
+            ],
+            [
                 InlineKeyboardButton(text=BTN_NOTES, callback_data="menu:notes"),
-            ],
-            [
                 InlineKeyboardButton(text=BTN_IMAGE, callback_data="menu:image"),
-                InlineKeyboardButton(text=BTN_RESET, callback_data="menu:reset"),
             ],
             [
+                InlineKeyboardButton(text=BTN_RESET, callback_data="menu:reset"),
                 InlineKeyboardButton(text=BTN_HELP, callback_data="menu:help"),
             ],
         ]
@@ -160,8 +163,8 @@ HELP_TEXT = (
     "Списывается как обычное сообщение.\n"
     "• Голосовые: пришли голосовое — распознаю речь и отвечу как на обычное сообщение.\n"
     "• PDF-документы: пришли файл — прочитаю и отвечу по содержимому.\n"
-    f"• Картинки: напиши «нарисуй ...» или /image &lt;описание&gt; — сгенерирую изображение "
-    f"({IMAGE_CREDIT_COST} докупленных сообщений за картинку).\n"
+    f"• Картинки: кнопка «Картинка» в меню (или напиши «нарисуй ...») — опиши, что нарисовать, "
+    f"без всяких команд. Стоит {IMAGE_CREDIT_COST} докупленных сообщений за картинку.\n"
     "• Поиск в интернете: для вопросов про свежие новости, курсы, актуальные факты — сам "
     "решаю, когда стоит поискать в сети, и использую это в ответе.\n"
     "• Заметки: напиши «Запомни: ...» — я буду учитывать это в каждом ответе, даже "
@@ -196,24 +199,34 @@ def _balance_text(user_id: int, username: str | None) -> str:
         f"Модель: {model_name}\n"
         f"Быстрая, бесплатных сегодня: {status['used_today']}/{DAILY_FREE_MESSAGES}\n"
         f"Премиум, бесплатных сегодня: {status['premium_used_today']}/{DAILY_FREE_PREMIUM_MESSAGES}\n"
-        f"Докупленные сообщения: <b>{status['bonus_credits']}</b>"
+        f"Докупленные сообщения: <b>{status['bonus_credits']}</b>\n\n"
+        f"Пополнить прямо здесь — выбери пакет ниже:"
     )
 
 
 @router.message(Command("balance"))
 async def cmd_balance(message: Message) -> None:
-    await message.answer(_balance_text(message.from_user.id, message.from_user.username))
+    await message.answer(
+        _balance_text(message.from_user.id, message.from_user.username),
+        reply_markup=packages_keyboard(),
+    )
 
 
 @router.callback_query(F.data == "menu:balance")
 async def cb_menu_balance(callback: CallbackQuery) -> None:
     await callback.answer()
-    await callback.message.answer(_balance_text(callback.from_user.id, callback.from_user.username))
+    await callback.message.answer(
+        _balance_text(callback.from_user.id, callback.from_user.username),
+        reply_markup=packages_keyboard(),
+    )
 
 
 @router.message(F.text == BTN_BALANCE)
 async def btn_balance_text(message: Message) -> None:
-    await message.answer(_balance_text(message.from_user.id, message.from_user.username))
+    await message.answer(
+        _balance_text(message.from_user.id, message.from_user.username),
+        reply_markup=packages_keyboard(),
+    )
 
 
 @router.message(Command("model"))
@@ -346,10 +359,10 @@ async def btn_notes_text(message: Message) -> None:
 
 IMAGE_INTRO_TEXT = (
     f"🎨 <b>Генерация картинок</b>\n\n"
-    f"Опиши, что нарисовать: <code>/image закат над горами в стиле акварели</code>\n"
-    f"Либо просто напиши «нарисуй ...» в чат.\n\n"
+    f"Опиши следующим сообщением, что нарисовать (например: «закат над горами в стиле "
+    f"акварели») — не нужна команда, просто напиши и отправь.\n\n"
     f"Стоимость: {IMAGE_CREDIT_COST} докупленных сообщений за картинку (из бесплатного "
-    f"дневного лимита не списывается). Пополнить — /buy."
+    f"дневного лимита не списывается). Пополнить — кнопка «Баланс»."
 )
 
 IMAGE_PREFIXES = ("нарисуй:", "нарисуй,", "нарисуй ", "сгенерируй картинку", "сгенерируй изображение")
@@ -391,20 +404,32 @@ async def _process_image_request(message: Message, prompt: str) -> None:
 
 
 @router.message(Command("image"))
-async def cmd_image(message: Message) -> None:
+async def cmd_image(message: Message, state: FSMContext) -> None:
     parts = message.text.split(maxsplit=1)
-    await _process_image_request(message, parts[1] if len(parts) > 1 else "")
+    if len(parts) > 1:
+        await _process_image_request(message, parts[1])
+        return
+    await state.set_state(Form.waiting_for_image_prompt)
+    await message.answer(IMAGE_INTRO_TEXT)
 
 
 @router.callback_query(F.data == "menu:image")
-async def cb_menu_image(callback: CallbackQuery) -> None:
+async def cb_menu_image(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
+    await state.set_state(Form.waiting_for_image_prompt)
     await callback.message.answer(IMAGE_INTRO_TEXT)
 
 
 @router.message(F.text == BTN_IMAGE)
-async def btn_image_text(message: Message) -> None:
+async def btn_image_text(message: Message, state: FSMContext) -> None:
+    await state.set_state(Form.waiting_for_image_prompt)
     await message.answer(IMAGE_INTRO_TEXT)
+
+
+@router.message(Form.waiting_for_image_prompt, F.text & ~F.text.startswith("/"))
+async def handle_image_prompt_state(message: Message, state: FSMContext) -> None:
+    await state.set_state(None)  # clear pending state only, keep conversation history
+    await _process_image_request(message, message.text)
 
 
 @router.message(Command("remember"))

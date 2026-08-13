@@ -7,7 +7,7 @@ import aiohttp
 import groq
 from ddgs import DDGS
 
-from bot.config import GROQ_API_KEY, STT_MODEL
+from bot.config import FAST_MODEL, GROQ_API_KEY, STT_MODEL
 
 SYSTEM_PROMPT = (
     "Ты дружелюбный и полезный AI-ассистент внутри Telegram-бота. "
@@ -222,7 +222,38 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> s
 IMAGE_GEN_URL = "https://image.pollinations.ai/prompt/{prompt}"
 
 
+async def _translate_for_image(prompt: str) -> str:
+    """Pollinations' free model barely understands non-English prompts (a
+    Russian description reliably produced an unrelated image in testing) —
+    translate to English first so the generated image actually matches."""
+    kwargs = {
+        "model": FAST_MODEL,
+        "max_tokens": 200,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Translate the user's image description into a short, vivid English "
+                    "prompt suitable for an image generation model. Reply with ONLY the "
+                    "translated prompt, nothing else."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+    }
+    if FAST_MODEL.startswith("openai/gpt-oss"):
+        kwargs["reasoning_effort"] = "low"
+        kwargs["include_reasoning"] = False
+    try:
+        response = await _client.chat.completions.create(**kwargs)
+        translated = _strip_thinking(response.choices[0].message.content or "").strip()
+        return translated or prompt
+    except Exception:
+        return prompt
+
+
 async def generate_image(prompt: str, width: int = 1024, height: int = 1024) -> bytes:
+    prompt = await _translate_for_image(prompt)
     url = IMAGE_GEN_URL.format(prompt=urllib.parse.quote(prompt))
     params = {"width": width, "height": height, "nologo": "true"}
     try:

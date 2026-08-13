@@ -10,18 +10,14 @@ from aiogram.types import BotCommand, MenuButtonDefault
 from bot.config import BOT_TOKEN
 from bot.handlers import router
 
+# Kept short on purpose — everything here is also one tap away in the inline
+# menu (/menu). Less-common commands (buy, image, remember, notes, forget,
+# whoami, admin...) still work when typed, just aren't suggested by Telegram's
+# "/" autocomplete, to keep that list from feeling cluttered on mobile.
 BOT_COMMANDS = [
     BotCommand(command="start", description="Начало работы"),
     BotCommand(command="menu", description="Открыть меню"),
-    BotCommand(command="balance", description="Баланс сообщений"),
-    BotCommand(command="buy", description="Купить сообщения за Stars"),
-    BotCommand(command="model", description="Выбрать модель"),
-    BotCommand(command="image", description="Сгенерировать картинку"),
-    BotCommand(command="remember", description="Запомнить заметку"),
-    BotCommand(command="notes", description="Список заметок"),
-    BotCommand(command="forget", description="Удалить заметку"),
     BotCommand(command="reset", description="Сбросить диалог"),
-    BotCommand(command="whoami", description="Мой Telegram ID"),
     BotCommand(command="help", description="Помощь"),
 ]
 
