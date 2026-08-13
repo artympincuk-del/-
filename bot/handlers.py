@@ -161,19 +161,44 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 
 @router.message(Command("menu"))
-async def cmd_menu(message: Message) -> None:
+async def cmd_menu(message: Message, state: FSMContext) -> None:
+    await state.set_state(None)  # cancel any pending "waiting for image prompt" etc.
     await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
 
 
 @router.message(F.text == PERSISTENT_MENU_BTN)
-async def btn_persistent_menu(message: Message) -> None:
+async def btn_persistent_menu(message: Message, state: FSMContext) -> None:
+    await state.set_state(None)
     await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
 
 
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")]]
+    )
+
+
+async def _edit_or_send(
+    callback: CallbackQuery, text: str, reply_markup: InlineKeyboardMarkup | None = None
+) -> None:
+    """Edits the button's own message in place instead of sending a new one,
+    so navigating the menu doesn't spam the chat with a fresh message every
+    tap. Falls back to sending a new message if editing isn't possible
+    (e.g. re-selecting the same option leaves text/markup unchanged, which
+    Telegram rejects as "message is not modified")."""
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return
+        await callback.message.answer(text, reply_markup=reply_markup)
+
+
 @router.callback_query(F.data == "menu:back")
-async def cb_menu_back(callback: CallbackQuery) -> None:
+async def cb_menu_back(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
-    await callback.message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
+    await state.set_state(None)
+    await _edit_or_send(callback, "📋 <b>Меню</b>", main_menu_keyboard())
 
 
 HELP_TEXT = (
@@ -192,7 +217,7 @@ HELP_TEXT = (
     "• Поиск в интернете: для вопросов про свежие новости, курсы, актуальные факты — сам "
     "решаю, когда стоит поискать в сети, и использую это в ответе.\n"
     "• Заметки: напиши «Запомни: ...» — я буду учитывать это в каждом ответе, даже "
-    "после перезапуска. Список — кнопка «Заметки» в меню, удалить — /forget <номер>.\n"
+    "после перезапуска. Список — кнопка «Заметки» в меню, удалить — /forget &lt;номер&gt;.\n"
     "• ⏱ Безлимит на время: в разделе «Баланс» можно купить безлимит на 30 минут, час "
     "или день — удобно, если нужно решить много задач подряд и не считать сообщения.\n\n"
     "Открыть меню в любой момент — /menu."
@@ -207,7 +232,7 @@ async def cmd_help(message: Message) -> None:
 @router.callback_query(F.data == "menu:help")
 async def cb_menu_help(callback: CallbackQuery) -> None:
     await callback.answer()
-    await callback.message.answer(HELP_TEXT)
+    await _edit_or_send(callback, HELP_TEXT, back_keyboard())
 
 
 @router.message(F.text == BTN_HELP)
@@ -246,9 +271,10 @@ async def cmd_balance(message: Message) -> None:
 @router.callback_query(F.data == "menu:balance")
 async def cb_menu_balance(callback: CallbackQuery) -> None:
     await callback.answer()
-    await callback.message.answer(
+    await _edit_or_send(
+        callback,
         _balance_text(callback.from_user.id, callback.from_user.username),
-        reply_markup=packages_keyboard(),
+        packages_keyboard(),
     )
 
 
@@ -270,7 +296,7 @@ async def cmd_model(message: Message) -> None:
 async def cb_menu_model(callback: CallbackQuery) -> None:
     await callback.answer()
     status = db.get_status(callback.from_user.id, callback.from_user.username)
-    await callback.message.answer("Выберите модель:", reply_markup=model_keyboard(status["model_pref"]))
+    await _edit_or_send(callback, "Выберите модель:", model_keyboard(status["model_pref"]))
 
 
 @router.message(F.text == BTN_MODEL)
@@ -284,9 +310,7 @@ async def cb_model(callback: CallbackQuery) -> None:
     choice = callback.data.split(":")[1]
     db.set_model_pref(callback.from_user.id, callback.from_user.username, choice)
     await callback.answer(f"Модель: {MODEL_NAMES[choice]}")
-    await callback.message.edit_text(
-        "Выберите модель:", reply_markup=model_keyboard(choice)
-    )
+    await _edit_or_send(callback, "Выберите модель:", model_keyboard(choice))
 
 
 @router.message(Command("reset"))
@@ -299,7 +323,7 @@ async def cmd_reset(message: Message, state: FSMContext) -> None:
 async def cb_menu_reset(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.answer("Диалог сброшен")
-    await callback.message.answer("Диалог сброшен. Начнём заново.")
+    await _edit_or_send(callback, "✅ Диалог сброшен. Начнём заново.", back_keyboard())
 
 
 @router.message(F.text == BTN_RESET)
@@ -319,7 +343,7 @@ async def cmd_buy(message: Message) -> None:
 @router.callback_query(F.data == "menu:buy")
 async def cb_menu_buy(callback: CallbackQuery) -> None:
     await callback.answer()
-    await callback.message.answer(BUY_TEXT, reply_markup=packages_keyboard())
+    await _edit_or_send(callback, BUY_TEXT, packages_keyboard())
 
 
 @router.message(F.text == BTN_BUY)
@@ -390,11 +414,11 @@ async def process_successful_payment(message: Message) -> None:
 def _notes_text(user_id: int) -> str:
     notes = db.list_notes(user_id)
     if not notes:
-        return "Пока нет заметок. Просто напиши «Запомни: ...» или команду /remember <текст>."
+        return "Пока нет заметок. Просто напиши «Запомни: ...» или команду /remember &lt;текст&gt;."
     lines = ["📝 <b>Заметки</b>\n"]
     for note_id, content in notes:
         lines.append(f"{note_id}. {content}")
-    lines.append("\nУдалить: /forget <номер>")
+    lines.append("\nУдалить: /forget &lt;номер&gt;")
     return "\n".join(lines)
 
 
@@ -406,7 +430,7 @@ async def cmd_notes(message: Message) -> None:
 @router.callback_query(F.data == "menu:notes")
 async def cb_menu_notes(callback: CallbackQuery) -> None:
     await callback.answer()
-    await callback.message.answer(_notes_text(callback.from_user.id))
+    await _edit_or_send(callback, _notes_text(callback.from_user.id), back_keyboard())
 
 
 @router.message(F.text == BTN_NOTES)
@@ -474,7 +498,7 @@ async def cmd_image(message: Message, state: FSMContext) -> None:
 async def cb_menu_image(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.set_state(Form.waiting_for_image_prompt)
-    await callback.message.answer(IMAGE_INTRO_TEXT)
+    await _edit_or_send(callback, IMAGE_INTRO_TEXT, back_keyboard())
 
 
 @router.message(F.text == BTN_IMAGE)
@@ -493,7 +517,7 @@ async def handle_image_prompt_state(message: Message, state: FSMContext) -> None
 async def cmd_remember(message: Message) -> None:
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await message.answer("Укажи, что запомнить: /remember <текст>")
+        await message.answer("Укажи, что запомнить: /remember &lt;текст&gt;")
         return
     note_id = db.add_note(message.from_user.id, parts[1].strip())
     await message.answer(f"✅ Запомнил (заметка №{note_id}).")
@@ -503,7 +527,7 @@ async def cmd_remember(message: Message) -> None:
 async def cmd_forget(message: Message) -> None:
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip().isdigit():
-        await message.answer("Укажи номер заметки: /forget <номер> (список — кнопка «Заметки»)")
+        await message.answer("Укажи номер заметки: /forget &lt;номер&gt; (список — кнопка «Заметки»)")
         return
     note_id = int(parts[1].strip())
     if db.delete_note(message.from_user.id, note_id):
@@ -549,7 +573,7 @@ async def cmd_grant(message: Message) -> None:
         return
     parts = message.text.split()
     if len(parts) != 3 or not parts[2].lstrip("-").isdigit():
-        await message.answer("Использование: /grant <user_id или @username> <amount>")
+        await message.answer("Использование: /grant &lt;user_id или @username&gt; &lt;amount&gt;")
         return
     target_id = _resolve_target(parts[1])
     if target_id is None:
@@ -585,7 +609,7 @@ async def cmd_chatlog(message: Message) -> None:
         return
     parts = message.text.split()
     if len(parts) < 2:
-        await message.answer("Использование: /chatlog <user_id или @username> [N]")
+        await message.answer("Использование: /chatlog &lt;user_id или @username&gt; [N]")
         return
     target_id = _resolve_target(parts[1])
     if target_id is None:
