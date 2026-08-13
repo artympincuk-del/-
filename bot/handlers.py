@@ -7,11 +7,10 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     LabeledPrice,
     Message,
     PreCheckoutQuery,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 from bot import ai, db
@@ -37,14 +36,24 @@ BTN_NOTES = "📝 Заметки"
 BTN_RESET = "🔄 Сбросить диалог"
 BTN_HELP = "❓ Помощь"
 
-MAIN_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_BUY)],
-        [KeyboardButton(text=BTN_MODEL), KeyboardButton(text=BTN_NOTES)],
-        [KeyboardButton(text=BTN_RESET), KeyboardButton(text=BTN_HELP)],
-    ],
-    resize_keyboard=True,
-)
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=BTN_BALANCE, callback_data="menu:balance"),
+                InlineKeyboardButton(text=BTN_BUY, callback_data="menu:buy"),
+            ],
+            [
+                InlineKeyboardButton(text=BTN_MODEL, callback_data="menu:model"),
+                InlineKeyboardButton(text=BTN_NOTES, callback_data="menu:notes"),
+            ],
+            [
+                InlineKeyboardButton(text=BTN_RESET, callback_data="menu:reset"),
+                InlineKeyboardButton(text=BTN_HELP, callback_data="menu:help"),
+            ],
+        ]
+    )
 
 
 def is_admin(user_id: int) -> bool:
@@ -85,42 +94,47 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         f"Бесплатно: <b>{DAILY_FREE_MESSAGES}</b> сообщений в день на быстрой модели "
         f"и <b>{DAILY_FREE_PREMIUM_MESSAGES}</b> на премиум (сброс в 00:00).\n"
         "Дальше — докупка сообщений за Telegram Stars.\n\n"
-        "Пользуйся кнопками меню внизу.\n\n"
         "Просто напиши мне вопрос или пришли фото — и я отвечу.",
-        reply_markup=MAIN_MENU,
+        reply_markup=ReplyKeyboardRemove(),
     )
+    await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
 
 
-async def _send_help(message: Message) -> None:
-    await message.answer(
-        "🤖 <b>Как это работает</b>\n\n"
-        f"• Быстрая модель (Llama 3.1 8B): {DAILY_FREE_MESSAGES} бесплатных сообщений в день, "
-        "дальше — из докупленного пакета.\n"
-        f"• Премиум модель (Llama 3.3 70B): точнее и умнее — {DAILY_FREE_PREMIUM_MESSAGES} "
-        f"бесплатных сообщений в день, дальше каждое списывает {PREMIUM_CREDIT_COST} "
-        "сообщений из докупленного пакета.\n"
-        "• Фото: пришли картинку (можно с подписью-вопросом) — распознаю содержимое. "
-        "Списывается как обычное сообщение.\n"
-        "• Заметки: напиши «Запомни: ...» — я буду учитывать это в каждом ответе, даже "
-        "после перезапуска. Список — кнопка «Заметки», удалить — /forget <номер>.\n\n"
-        "Кнопки меню внизу экрана дублируют все основные действия."
-    )
+@router.message(Command("menu"))
+async def cmd_menu(message: Message) -> None:
+    await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
+
+
+HELP_TEXT = (
+    "🤖 <b>Как это работает</b>\n\n"
+    f"• Быстрая модель (Llama 3.1 8B): {DAILY_FREE_MESSAGES} бесплатных сообщений в день, "
+    "дальше — из докупленного пакета.\n"
+    f"• Премиум модель (Llama 3.3 70B): точнее и умнее — {DAILY_FREE_PREMIUM_MESSAGES} "
+    f"бесплатных сообщений в день, дальше каждое списывает {PREMIUM_CREDIT_COST} "
+    "сообщений из докупленного пакета.\n"
+    "• Фото: пришли картинку (можно с подписью-вопросом) — распознаю содержимое. "
+    "Списывается как обычное сообщение.\n"
+    "• Заметки: напиши «Запомни: ...» — я буду учитывать это в каждом ответе, даже "
+    "после перезапуска. Список — кнопка «Заметки» в меню, удалить — /forget <номер>.\n\n"
+    "Открыть меню в любой момент — /menu."
+)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    await _send_help(message)
+    await message.answer(HELP_TEXT)
 
 
-@router.message(F.text == BTN_HELP)
-async def btn_help(message: Message) -> None:
-    await _send_help(message)
+@router.callback_query(F.data == "menu:help")
+async def cb_menu_help(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.answer(HELP_TEXT)
 
 
-async def _send_balance(message: Message) -> None:
-    status = db.get_status(message.from_user.id, message.from_user.username)
+def _balance_text(user_id: int, username: str | None) -> str:
+    status = db.get_status(user_id, username)
     model_name = MODEL_NAMES[status["model_pref"]]
-    await message.answer(
+    return (
         f"📊 <b>Баланс</b>\n\n"
         f"Модель: {model_name}\n"
         f"Быстрая, бесплатных сегодня: {status['used_today']}/{DAILY_FREE_MESSAGES}\n"
@@ -131,30 +145,26 @@ async def _send_balance(message: Message) -> None:
 
 @router.message(Command("balance"))
 async def cmd_balance(message: Message) -> None:
-    await _send_balance(message)
+    await message.answer(_balance_text(message.from_user.id, message.from_user.username))
 
 
-@router.message(F.text == BTN_BALANCE)
-async def btn_balance(message: Message) -> None:
-    await _send_balance(message)
-
-
-async def _send_model_menu(message: Message) -> None:
-    status = db.get_status(message.from_user.id, message.from_user.username)
-    await message.answer(
-        "Выберите модель:",
-        reply_markup=model_keyboard(status["model_pref"]),
-    )
+@router.callback_query(F.data == "menu:balance")
+async def cb_menu_balance(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.answer(_balance_text(callback.from_user.id, callback.from_user.username))
 
 
 @router.message(Command("model"))
 async def cmd_model(message: Message) -> None:
-    await _send_model_menu(message)
+    status = db.get_status(message.from_user.id, message.from_user.username)
+    await message.answer("Выберите модель:", reply_markup=model_keyboard(status["model_pref"]))
 
 
-@router.message(F.text == BTN_MODEL)
-async def btn_model(message: Message) -> None:
-    await _send_model_menu(message)
+@router.callback_query(F.data == "menu:model")
+async def cb_menu_model(callback: CallbackQuery) -> None:
+    await callback.answer()
+    status = db.get_status(callback.from_user.id, callback.from_user.username)
+    await callback.message.answer("Выберите модель:", reply_markup=model_keyboard(status["model_pref"]))
 
 
 @router.callback_query(F.data.startswith("model:"))
@@ -173,27 +183,25 @@ async def cmd_reset(message: Message, state: FSMContext) -> None:
     await message.answer("Диалог сброшен. Начнём заново.")
 
 
-@router.message(F.text == BTN_RESET)
-async def btn_reset(message: Message, state: FSMContext) -> None:
+@router.callback_query(F.data == "menu:reset")
+async def cb_menu_reset(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Диалог сброшен. Начнём заново.")
+    await callback.answer("Диалог сброшен")
+    await callback.message.answer("Диалог сброшен. Начнём заново.")
 
 
-async def _send_buy_menu(message: Message) -> None:
-    await message.answer(
-        "💎 <b>Купить сообщения за Telegram Stars</b>\n\nВыберите пакет:",
-        reply_markup=packages_keyboard(),
-    )
+BUY_TEXT = "💎 <b>Купить сообщения за Telegram Stars</b>\n\nВыберите пакет:"
 
 
 @router.message(Command("buy"))
 async def cmd_buy(message: Message) -> None:
-    await _send_buy_menu(message)
+    await message.answer(BUY_TEXT, reply_markup=packages_keyboard())
 
 
-@router.message(F.text == BTN_BUY)
-async def btn_buy(message: Message) -> None:
-    await _send_buy_menu(message)
+@router.callback_query(F.data == "menu:buy")
+async def cb_menu_buy(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.answer(BUY_TEXT, reply_markup=packages_keyboard())
 
 
 @router.callback_query(F.data.startswith("buy:"))
@@ -230,28 +238,26 @@ async def process_successful_payment(message: Message) -> None:
     )
 
 
-async def _send_notes_list(message: Message) -> None:
-    notes = db.list_notes(message.from_user.id)
+def _notes_text(user_id: int) -> str:
+    notes = db.list_notes(user_id)
     if not notes:
-        await message.answer(
-            "Пока нет заметок. Просто напиши «Запомни: ...» или команду /remember <текст>."
-        )
-        return
+        return "Пока нет заметок. Просто напиши «Запомни: ...» или команду /remember <текст>."
     lines = ["📝 <b>Заметки</b>\n"]
     for note_id, content in notes:
         lines.append(f"{note_id}. {content}")
     lines.append("\nУдалить: /forget <номер>")
-    await message.answer("\n".join(lines))
+    return "\n".join(lines)
 
 
 @router.message(Command("notes"))
 async def cmd_notes(message: Message) -> None:
-    await _send_notes_list(message)
+    await message.answer(_notes_text(message.from_user.id))
 
 
-@router.message(F.text == BTN_NOTES)
-async def btn_notes(message: Message) -> None:
-    await _send_notes_list(message)
+@router.callback_query(F.data == "menu:notes")
+async def cb_menu_notes(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.answer(_notes_text(callback.from_user.id))
 
 
 @router.message(Command("remember"))
