@@ -39,4 +39,5 @@ def packages_keyboard() -> InlineKeyboardMarkup:
                 )
             ]
         )
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

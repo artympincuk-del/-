@@ -127,6 +127,7 @@ def model_keyboard(current: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text=label("fast", MODEL_NAMES["fast"]), callback_data="model:fast")],
             [InlineKeyboardButton(text=label("premium", MODEL_NAMES["premium"]), callback_data="model:premium")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")],
         ]
     )
 
@@ -149,14 +150,11 @@ def quota_denied_text(status: dict) -> str:
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "🤖 <b>Привет! Я AI-ассистент.</b>\n\n"
-        f"Бесплатно: <b>{DAILY_FREE_MESSAGES}</b> сообщений в день на быстрой модели "
-        f"и <b>{DAILY_FREE_PREMIUM_MESSAGES}</b> на премиум (сброс в 00:00).\n"
-        "Дальше — докупка сообщений за Telegram Stars.\n\n"
-        "Пиши текстом, голосом, присылай фото или PDF — отвечу на всё. Умею искать "
-        "свежую информацию в интернете и рисовать картинки по описанию.\n\n"
-        "Подробнее — кнопка «Помощь» в меню ниже. Кнопка «📋 Меню» внизу экрана "
-        "всегда под рукой, даже если это сообщение прокрутится вверх.",
+        "🤖 <b>Привет! Я AI-ассистент.</b>\n"
+        "Пиши текстом, голосом, присылай фото или PDF — отвечу на всё.\n\n"
+        f"Бесплатно: <b>{DAILY_FREE_MESSAGES}</b> сообщений в день "
+        f"(+{DAILY_FREE_PREMIUM_MESSAGES} премиум), сброс в 00:00.\n\n"
+        "Кнопка «📋 Меню» внизу — всегда под рукой. Подробнее — «Помощь».",
         reply_markup=persistent_keyboard(),
     )
     await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
@@ -170,6 +168,12 @@ async def cmd_menu(message: Message) -> None:
 @router.message(F.text == PERSISTENT_MENU_BTN)
 async def btn_persistent_menu(message: Message) -> None:
     await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
+
+
+@router.callback_query(F.data == "menu:back")
+async def cb_menu_back(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
 
 
 HELP_TEXT = (
