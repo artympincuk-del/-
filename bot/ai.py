@@ -76,13 +76,26 @@ class AIError(Exception):
         self.user_message = user_message or "Не удалось получить ответ. Попробуйте ещё раз."
 
 
+# "auto" backend selection in ddgs can land on a flaky engine (startpage
+# timed out repeatedly in testing) with no fallback. Try a short list of
+# engines in order and use the first that actually returns results, instead
+# of failing the whole search over one engine's outage.
+_SEARCH_BACKENDS = ("duckduckgo", "google", "brave", "yahoo")
+
+
 def _sync_search_web(query: str, max_results: int = 5) -> str:
-    try:
-        results = DDGS().text(query, max_results=max_results, region="ru-ru")
-    except Exception as e:
-        return f"Поиск не удался: {e}"
+    results = None
+    for backend in _SEARCH_BACKENDS:
+        try:
+            results = DDGS(timeout=6).text(
+                query, max_results=max_results, region="ru-ru", backend=backend
+            )
+        except Exception:
+            results = None
+        if results:
+            break
     if not results:
-        return "Ничего не найдено."
+        return "Поиск не дал результатов — свежих данных по этому запросу найти не удалось."
     lines = []
     for r in results:
         title = r.get("title", "")
