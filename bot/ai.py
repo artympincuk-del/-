@@ -121,30 +121,29 @@ def _build_system_prompt(notes: list[str] | None) -> str:
     )
 
 
-async def ask_ai(
-    history: list[dict],
-    user_content,
+# Both gpt-oss models and qwen sit on Groq's free-tier 8000 TPM cap, so we
+# can't just raise max_tokens to avoid truncation — that risks a 413 instead.
+# The real fix is spending fewer tokens on reasoning when the first attempt
+# comes up empty, freeing more of the same budget for the visible answer.
+_EFFORT_FALLBACK = {"high": "medium", "medium": "low", "default": "none"}
+
+
+async def _complete_once(
+    messages: list[dict],
     model: str,
-    notes: list[str] | None = None,
-    reasoning_effort: str | None = None,
-    max_tokens: int = 4096,
-    enable_search: bool = False,
-) -> str:
-    """`user_content` is either a plain string (text-only turn) or a list of
-    content blocks (e.g. text + image_url) for multimodal turns."""
-    messages = [{"role": "system", "content": _build_system_prompt(notes)}] + history + [
-        {"role": "user", "content": user_content}
-    ]
-    kwargs = {"model": model, "max_tokens": max_tokens, "messages": messages}
+    max_tokens: int,
+    reasoning_effort: str | None,
+    enable_search: bool,
+) -> str | None:
+    """One attempt at a full answer, including any tool-calling round trips.
+    Returns the answer text, or None if the model ran out of its token
+    budget on reasoning without producing one (caller may retry cheaper)."""
+    kwargs = {"model": model, "max_tokens": max_tokens, "messages": list(messages)}
     if model.startswith("openai/gpt-oss"):
         kwargs["reasoning_effort"] = reasoning_effort or "medium"
         kwargs["include_reasoning"] = False
     elif model.startswith("qwen/"):
-        # Qwen only accepts reasoning_effort "default"/"none" (not low/high).
-        # "default" + hidden keeps answers grounded (vs "none", which tends
-        # to guess) while capping reasoning tokens so dense photos don't blow
-        # through Groq's free-tier per-minute token limit.
-        kwargs["reasoning_effort"] = "default"
+        kwargs["reasoning_effort"] = reasoning_effort or "default"
         kwargs["reasoning_format"] = "hidden"
 
     # Tool calling is only wired up for gpt-oss (OpenAI-compatible tool_calls).
@@ -205,10 +204,44 @@ async def ask_ai(
 
         text = _strip_thinking(message.content or "")
         if not text and choice.finish_reason == "length":
-            return "Ответ получился слишком длинным для обработки. Попробуйте задать вопрос короче."
+            return None
         return text or "…"
 
-    return "Не удалось получить ответ после поиска в интернете. Попробуйте переформулировать вопрос."
+    return None
+
+
+async def ask_ai(
+    history: list[dict],
+    user_content,
+    model: str,
+    notes: list[str] | None = None,
+    reasoning_effort: str | None = None,
+    max_tokens: int = 4096,
+    enable_search: bool = False,
+) -> str:
+    """`user_content` is either a plain string (text-only turn) or a list of
+    content blocks (e.g. text + image_url) for multimodal turns."""
+    messages = [{"role": "system", "content": _build_system_prompt(notes)}] + history + [
+        {"role": "user", "content": user_content}
+    ]
+
+    if reasoning_effort is not None:
+        effort = reasoning_effort
+    elif model.startswith("openai/gpt-oss"):
+        effort = "medium"
+    elif model.startswith("qwen/"):
+        effort = "default"
+    else:
+        effort = None
+
+    text = await _complete_once(messages, model, max_tokens, effort, enable_search)
+    while text is None and effort in _EFFORT_FALLBACK:
+        effort = _EFFORT_FALLBACK[effort]
+        text = await _complete_once(messages, model, max_tokens, effort, enable_search)
+
+    if text is not None:
+        return text
+    return "Ответ получился слишком длинным для обработки. Попробуйте задать вопрос короче."
 
 
 async def transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
