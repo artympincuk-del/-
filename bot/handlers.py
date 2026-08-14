@@ -1034,14 +1034,13 @@ def image_actions_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def _process_image_request(message: Message, state: FSMContext, prompt: str) -> None:
+async def _process_image_request(
+    message: Message, state: FSMContext, prompt: str, user_id: int, username: str | None
+) -> None:
     prompt = prompt.strip()
     if not prompt:
         await message.answer(IMAGE_INTRO_TEXT)
         return
-
-    user_id = message.from_user.id
-    username = message.from_user.username
 
     allowed, bonus = db.try_consume_bonus_credits(user_id, username, IMAGE_CREDIT_COST)
     if not allowed:
@@ -1080,7 +1079,9 @@ async def _process_image_request(message: Message, state: FSMContext, prompt: st
 async def cmd_image(message: Message, state: FSMContext) -> None:
     parts = message.text.split(maxsplit=1)
     if len(parts) > 1:
-        await _process_image_request(message, state, parts[1])
+        await _process_image_request(
+            message, state, parts[1], message.from_user.id, message.from_user.username
+        )
         return
     await state.set_state(Form.waiting_for_image_prompt)
     await message.answer(IMAGE_INTRO_TEXT)
@@ -1107,7 +1108,9 @@ async def handle_image_prompt_state(message: Message, state: FSMContext) -> None
         await message.answer(BUSY_TEXT)
         return
     async with lock:
-        await _process_image_request(message, state, message.text)
+        await _process_image_request(
+            message, state, message.text, message.from_user.id, message.from_user.username
+        )
 
 
 NO_LAST_IMAGE_TEXT = "Не помню, что генерировал в прошлый раз — опишите картинку заново."
@@ -1125,7 +1128,9 @@ async def cb_image_retry(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.message.answer(BUSY_TEXT)
         return
     async with lock:
-        await _process_image_request(callback.message, state, prompt)
+        await _process_image_request(
+            callback.message, state, prompt, callback.from_user.id, callback.from_user.username
+        )
 
 
 @router.callback_query(F.data == "img:edit")
@@ -1151,7 +1156,9 @@ async def handle_image_edit_state(message: Message, state: FSMContext) -> None:
         await message.answer(BUSY_TEXT)
         return
     async with lock:
-        await _process_image_request(message, state, prompt)
+        await _process_image_request(
+            message, state, prompt, message.from_user.id, message.from_user.username
+        )
 
 
 @router.message(Command("remember"))
@@ -1637,7 +1644,9 @@ async def _process_text_query(message: Message, state: FSMContext, text: str) ->
     for prefix in IMAGE_PREFIXES:
         if lowered.startswith(prefix):
             prompt = text.strip()[len(prefix):].strip()
-            await _process_image_request(message, state, prompt)
+            await _process_image_request(
+                message, state, prompt, message.from_user.id, message.from_user.username
+            )
             return
 
     await _answer_text_query(message, state, text, message.from_user.id, message.from_user.username)
