@@ -66,6 +66,7 @@ router = Router()
 
 class Form(StatesGroup):
     waiting_for_image_prompt = State()
+    waiting_for_image_edit = State()
 
 
 # (tier, choice) -> which actual Groq model + reasoning_effort to use. `tier`
@@ -476,7 +477,9 @@ HELP_TEXT = (
     "• Голосовые: пришли голосовое — распознаю речь и отвечу как на обычное сообщение.\n"
     "• PDF-документы: пришли файл — прочитаю и отвечу по содержимому.\n"
     f"• Картинки: кнопка «Картинка» в меню (или напиши «нарисуй ...») — опиши, что нарисовать, "
-    f"без всяких команд. Стоит {IMAGE_CREDIT_COST} докупленных сообщений за картинку.\n"
+    f"без всяких команд. Стоит {IMAGE_CREDIT_COST} докупленных сообщений за картинку. Под "
+    f"готовой картинкой — кнопки «Ещё раз» (сгенерировать заново) и «Изменить» (описать "
+    f"правку и перегенерировать с её учётом).\n"
     "• Поиск в интернете: для вопросов про свежие новости, курсы, актуальные факты — сам "
     "решаю, когда стоит поискать в сети, и использую это в ответе.\n"
     "• Заметки: напиши «Запомни: ...» — я буду учитывать это в каждом ответе, даже "
@@ -1020,7 +1023,18 @@ IMAGE_INTRO_TEXT = (
 IMAGE_PREFIXES = ("нарисуй:", "нарисуй,", "нарисуй ", "сгенерируй картинку", "сгенерируй изображение")
 
 
-async def _process_image_request(message: Message, prompt: str) -> None:
+def image_actions_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔁 Ещё раз", callback_data="img:retry"),
+                InlineKeyboardButton(text="✏️ Изменить", callback_data="img:edit"),
+            ]
+        ]
+    )
+
+
+async def _process_image_request(message: Message, state: FSMContext, prompt: str) -> None:
     prompt = prompt.strip()
     if not prompt:
         await message.answer(IMAGE_INTRO_TEXT)
@@ -1049,9 +1063,16 @@ async def _process_image_request(message: Message, prompt: str) -> None:
     db.log_message(user_id, username, "user", f"[генерация картинки] {prompt}")
     db.log_message(user_id, username, "assistant", "[изображение отправлено]")
 
+    # Remembered so "Ещё раз"/"Изменить" can regenerate without the user
+    # having to retype the description — this is prompt-level (Pollinations
+    # has no image-to-image/inpainting endpoint here), not literal pixel
+    # editing of the sent photo.
+    await state.update_data(last_image_prompt=prompt)
+
     await message.answer_photo(
         BufferedInputFile(image_bytes, filename="image.jpg"),
         caption=f"🎨 {prompt}",
+        reply_markup=image_actions_keyboard(),
     )
 
 
@@ -1059,7 +1080,7 @@ async def _process_image_request(message: Message, prompt: str) -> None:
 async def cmd_image(message: Message, state: FSMContext) -> None:
     parts = message.text.split(maxsplit=1)
     if len(parts) > 1:
-        await _process_image_request(message, parts[1])
+        await _process_image_request(message, state, parts[1])
         return
     await state.set_state(Form.waiting_for_image_prompt)
     await message.answer(IMAGE_INTRO_TEXT)
@@ -1086,7 +1107,51 @@ async def handle_image_prompt_state(message: Message, state: FSMContext) -> None
         await message.answer(BUSY_TEXT)
         return
     async with lock:
-        await _process_image_request(message, message.text)
+        await _process_image_request(message, state, message.text)
+
+
+NO_LAST_IMAGE_TEXT = "Не помню, что генерировал в прошлый раз — опишите картинку заново."
+
+
+@router.callback_query(F.data == "img:retry")
+async def cb_image_retry(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    prompt = (await state.get_data()).get("last_image_prompt")
+    if not prompt:
+        await callback.message.answer(NO_LAST_IMAGE_TEXT)
+        return
+    lock = _get_user_lock(callback.from_user.id)
+    if lock.locked():
+        await callback.message.answer(BUSY_TEXT)
+        return
+    async with lock:
+        await _process_image_request(callback.message, state, prompt)
+
+
+@router.callback_query(F.data == "img:edit")
+async def cb_image_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if not (await state.get_data()).get("last_image_prompt"):
+        await callback.message.answer(NO_LAST_IMAGE_TEXT)
+        return
+    await state.set_state(Form.waiting_for_image_edit)
+    await callback.message.answer(
+        "✏️ Опишите, что изменить (например: «сделай фон синим», «добавь очки») — "
+        "сгенерирую картинку заново с учётом правки."
+    )
+
+
+@router.message(Form.waiting_for_image_edit, F.text & ~F.text.startswith("/"))
+async def handle_image_edit_state(message: Message, state: FSMContext) -> None:
+    base_prompt = (await state.get_data()).get("last_image_prompt")
+    await state.set_state(None)  # clear pending state only, keep conversation history
+    prompt = f"{base_prompt}, {message.text.strip()}" if base_prompt else message.text
+    lock = _get_user_lock(message.from_user.id)
+    if lock.locked():
+        await message.answer(BUSY_TEXT)
+        return
+    async with lock:
+        await _process_image_request(message, state, prompt)
 
 
 @router.message(Command("remember"))
@@ -1572,7 +1637,7 @@ async def _process_text_query(message: Message, state: FSMContext, text: str) ->
     for prefix in IMAGE_PREFIXES:
         if lowered.startswith(prefix):
             prompt = text.strip()[len(prefix):].strip()
-            await _process_image_request(message, prompt)
+            await _process_image_request(message, state, prompt)
             return
 
     await _answer_text_query(message, state, text, message.from_user.id, message.from_user.username)
