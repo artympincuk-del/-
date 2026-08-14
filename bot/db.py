@@ -52,6 +52,23 @@ _conn.execute(
     )
     """
 )
+# Conversation context fed to the model on each turn (distinct from chat_log,
+# which is an admin-facing audit trail of everything ever sent/received and
+# is never trimmed or read back into a prompt).
+_conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS dialog_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """
+)
+_conn.execute(
+    "CREATE INDEX IF NOT EXISTS idx_dialog_history_user_id ON dialog_history (user_id)"
+)
 _conn.commit()
 
 MAX_NOTES_PER_USER = 30
@@ -347,6 +364,56 @@ def get_recent_chat(user_id: int, limit: int = 20) -> list[tuple[str, str, str]]
         )
         rows = cur.fetchall()
         return list(reversed(rows))
+
+
+def get_dialog_history(user_id: int, max_turns: int) -> list[dict]:
+    """Returns this user's conversation context (oldest first, as
+    {"role", "content"} dicts ready to feed straight into ask_ai), capped to
+    the most recent `max_turns` user+assistant turns. Persisted in the
+    dialog_history table rather than FSM memory, so it survives restarts —
+    unlike chat_log (admin audit trail), this is what actually gets replayed
+    into the model's context."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT role, content FROM dialog_history WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, max_turns * 2),
+        )
+        rows = cur.fetchall()
+        return [{"role": role, "content": content} for role, content in reversed(rows)]
+
+
+def append_dialog_turn(
+    user_id: int, user_content: str, assistant_content: str, max_turns: int
+) -> None:
+    """Appends one user+assistant turn and prunes anything older than the
+    most recent `max_turns` turns for this user, so the table doesn't grow
+    unboundedly per user the way the old in-memory history would have (it
+    just lost everything on restart instead; this keeps the same cap but
+    persists it)."""
+    with _lock:
+        now = _now()
+        _conn.execute(
+            "INSERT INTO dialog_history (user_id, role, content, created_at) VALUES (?, 'user', ?, ?)",
+            (user_id, user_content, now),
+        )
+        _conn.execute(
+            "INSERT INTO dialog_history (user_id, role, content, created_at) "
+            "VALUES (?, 'assistant', ?, ?)",
+            (user_id, assistant_content, now),
+        )
+        _conn.execute(
+            "DELETE FROM dialog_history WHERE user_id = ? AND id NOT IN ("
+            "  SELECT id FROM dialog_history WHERE user_id = ? ORDER BY id DESC LIMIT ?"
+            ")",
+            (user_id, user_id, max_turns * 2),
+        )
+        _conn.commit()
+
+
+def clear_dialog_history(user_id: int) -> None:
+    with _lock:
+        _conn.execute("DELETE FROM dialog_history WHERE user_id = ?", (user_id,))
+        _conn.commit()
 
 
 def list_users(limit: int = 30, offset: int = 0) -> list[tuple]:

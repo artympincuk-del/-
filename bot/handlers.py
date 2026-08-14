@@ -33,6 +33,7 @@ from bot.config import (
     FAST_MODEL,
     FAST_REASONING_EFFORT,
     IMAGE_CREDIT_COST,
+    MAX_HISTORY_TURNS,
     PREMIUM_CREDIT_COST,
     PREMIUM_MODEL,
     PREMIUM_REASONING_EFFORT,
@@ -504,12 +505,14 @@ async def cb_model(callback: CallbackQuery) -> None:
 @router.message(Command("reset"))
 async def cmd_reset(message: Message, state: FSMContext) -> None:
     await state.clear()
+    db.clear_dialog_history(message.from_user.id)
     await message.answer("Диалог сброшен. Начнём заново.")
 
 
 @router.callback_query(F.data == "menu:reset")
 async def cb_menu_reset(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
+    db.clear_dialog_history(callback.from_user.id)
     await callback.answer("Диалог сброшен")
     await _edit_or_send(callback, "✅ Диалог сброшен. Начнём заново.", back_keyboard())
 
@@ -517,6 +520,7 @@ async def cb_menu_reset(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(F.text == BTN_RESET)
 async def btn_reset_text(message: Message, state: FSMContext) -> None:
     await state.clear()
+    db.clear_dialog_history(message.from_user.id)
     await message.answer("Диалог сброшен. Начнём заново.")
 
 
@@ -1176,8 +1180,7 @@ async def _answer_text_query(
     model, reasoning_effort = opt["model"], opt["reasoning"]
     notes = [content for _id, content in db.list_notes(user_id)]
 
-    data = await state.get_data()
-    history = data.get("history", [])
+    history = db.get_dialog_history(user_id, MAX_HISTORY_TURNS)
 
     await message.bot.send_chat_action(message.chat.id, "typing")
 
@@ -1193,13 +1196,7 @@ async def _answer_text_query(
 
     db.log_message(user_id, username, "user", text)
     db.log_message(user_id, username, "assistant", reply_text)
-
-    history = history + [
-        {"role": "user", "content": text},
-        {"role": "assistant", "content": reply_text},
-    ]
-    history = history[-(2 * 10):]
-    await state.update_data(history=history)
+    db.append_dialog_turn(user_id, text, reply_text, MAX_HISTORY_TURNS)
 
     footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · {opt['label']}</i>"
     await _send_long(message, reply_text + footer, reply_markup=quick_actions_keyboard())
@@ -1231,8 +1228,7 @@ async def _process_text_query(message: Message, state: FSMContext, text: str) ->
 @router.callback_query(F.data == "qa:share")
 async def cb_share(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
-    data = await state.get_data()
-    history = data.get("history", [])
+    history = db.get_dialog_history(callback.from_user.id, MAX_HISTORY_TURNS)
     if not history or history[-1]["role"] != "assistant":
         await callback.message.answer("Нечего делиться — сначала задай вопрос.")
         return
@@ -1344,8 +1340,7 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
     model, reasoning_effort = opt["model"], opt["reasoning"]
     notes = [content for _id, content in db.list_notes(user_id)]
 
-    data = await state.get_data()
-    history = data.get("history", [])
+    history = db.get_dialog_history(user_id, MAX_HISTORY_TURNS)
 
     await message.bot.send_chat_action(message.chat.id, "typing")
 
@@ -1366,12 +1361,7 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
     # have some content to work with without re-uploading it.
     MAX_DOC_HISTORY_CHARS = 2000
     history_entry = f"[Документ «{filename}»] {caption}\n\n{doc_text[:MAX_DOC_HISTORY_CHARS]}"
-    history = history + [
-        {"role": "user", "content": history_entry},
-        {"role": "assistant", "content": reply_text},
-    ]
-    history = history[-(2 * 10):]
-    await state.update_data(history=history)
+    db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
 
     await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
 
@@ -1405,8 +1395,7 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     image_b64 = base64.b64encode(image_bytes).decode()
     data_url = f"data:image/jpeg;base64,{image_b64}"
 
-    data = await state.get_data()
-    history = data.get("history", [])
+    history = db.get_dialog_history(user_id, MAX_HISTORY_TURNS)
 
     await message.bot.send_chat_action(message.chat.id, "typing")
     status_msg = await message.answer("🔍 <i>Распознаю задание...</i>")
@@ -1482,12 +1471,7 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     # with — vision_text is already short (stage 1 is tuned for brevity),
     # so it's safe to keep in full rather than just a placeholder.
     history_entry = f"[Фото] {caption}\n\nСодержимое фото: {vision_text}"
-    history = history + [
-        {"role": "user", "content": history_entry},
-        {"role": "assistant", "content": reply_text},
-    ]
-    history = history[-(2 * 10):]
-    await state.update_data(history=history)
+    db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
 
     elapsed = time.monotonic() - t0
     has_check = "✅ Проверка" in reply_text or "Проверка:" in reply_text
