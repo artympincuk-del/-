@@ -40,6 +40,18 @@ _conn.execute(
     )
     """
 )
+_conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        username TEXT,
+        kind TEXT NOT NULL,
+        amount_stars INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """
+)
 _conn.commit()
 
 MAX_NOTES_PER_USER = 30
@@ -72,11 +84,15 @@ def _today() -> str:
 
 
 def _ensure_player(user_id: int, username: str | None) -> None:
+    # COALESCE keeps the previously known username when this call passes None
+    # (e.g. admin actions that only have a user_id) instead of blanking it out.
     _conn.execute(
         """
         INSERT INTO players (user_id, username, quota_date, messages_used_today, bonus_credits, model_pref, last_active_at)
         VALUES (?, ?, ?, 0, 0, 'fast', ?)
-        ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, last_active_at = excluded.last_active_at
+        ON CONFLICT(user_id) DO UPDATE SET
+            username = COALESCE(excluded.username, players.username),
+            last_active_at = excluded.last_active_at
         """,
         (user_id, username, _today(), _now()),
     )
@@ -225,6 +241,25 @@ def add_bonus_credits(user_id: int, username: str | None, amount: int) -> int:
         return cur.fetchone()[0]
 
 
+def admin_add_bonus_credits(user_id: int, amount: int) -> int | None:
+    """Grants/deducts bonus credits for an admin action: unlike
+    add_bonus_credits, doesn't touch last_active_at (this isn't the user
+    being active) and doesn't create a new player row for an unknown id
+    (returns None instead, so the admin gets a clear "not found")."""
+    with _lock:
+        cur = _conn.execute("SELECT bonus_credits FROM players WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        _conn.execute(
+            "UPDATE players SET bonus_credits = bonus_credits + ? WHERE user_id = ?",
+            (amount, user_id),
+        )
+        _conn.commit()
+        cur = _conn.execute("SELECT bonus_credits FROM players WHERE user_id = ?", (user_id,))
+        return cur.fetchone()[0]
+
+
 def try_consume_bonus_credits(user_id: int, username: str | None, cost: int) -> tuple[bool, int]:
     """Spends `cost` bonus credits if available (used for paid-only extras like
     image generation, which don't draw from the daily free quota)."""
@@ -297,15 +332,48 @@ def get_recent_chat(user_id: int, limit: int = 20) -> list[tuple[str, str, str]]
         return list(reversed(rows))
 
 
-def list_users(limit: int = 30) -> list[tuple]:
+def list_users(limit: int = 30, offset: int = 0) -> list[tuple]:
     with _lock:
         cur = _conn.execute(
             "SELECT user_id, username, messages_used_today, premium_messages_used_today, "
             "bonus_credits, model_pref, last_active_at "
-            "FROM players ORDER BY last_active_at DESC LIMIT ?",
-            (limit,),
+            "FROM players ORDER BY last_active_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         )
         return cur.fetchall()
+
+
+def count_users() -> int:
+    with _lock:
+        cur = _conn.execute("SELECT COUNT(*) FROM players")
+        return cur.fetchone()[0]
+
+
+def get_player(user_id: int) -> dict | None:
+    """Read-only lookup for admin display — unlike get_status, doesn't
+    upsert a row or touch last_active_at/username."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT user_id, username, messages_used_today, premium_messages_used_today, "
+            "bonus_credits, model_pref, model_choice, unlimited_until, last_active_at "
+            "FROM players WHERE user_id = ?",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        uid, uname, used, premium_used, bonus, pref, choice, unlimited_raw, last_active = row
+        return {
+            "user_id": uid,
+            "username": uname,
+            "used_today": used,
+            "premium_used_today": premium_used,
+            "bonus_credits": bonus,
+            "model_pref": pref,
+            "model_choice": choice,
+            "unlimited_until": _active_unlimited_until(unlimited_raw),
+            "last_active_at": last_active,
+        }
 
 
 def find_user_id_by_username(username: str) -> int | None:
@@ -340,6 +408,55 @@ def activate_unlimited(user_id: int, username: str | None, minutes: int) -> str:
         )
         _conn.commit()
         return new_expiry
+
+
+def log_payment(user_id: int, username: str | None, kind: str, amount_stars: int) -> None:
+    with _lock:
+        _conn.execute(
+            "INSERT INTO payments (user_id, username, kind, amount_stars, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, kind, amount_stars, _now()),
+        )
+        _conn.commit()
+
+
+def get_admin_stats() -> dict:
+    with _lock:
+        today = _today()
+        week_ago = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
+
+        cur = _conn.execute("SELECT COUNT(*) FROM players")
+        (total_users,) = cur.fetchone()
+
+        cur = _conn.execute(
+            "SELECT COUNT(*) FROM players WHERE last_active_at >= ?", (today,)
+        )
+        (active_today,) = cur.fetchone()
+
+        cur = _conn.execute("SELECT COALESCE(SUM(bonus_credits), 0) FROM players")
+        (bonus_outstanding,) = cur.fetchone()
+
+        def revenue_since(since: str) -> tuple[int, int]:
+            cur = _conn.execute(
+                "SELECT COALESCE(SUM(amount_stars), 0), COUNT(*) FROM payments WHERE created_at >= ?",
+                (since,),
+            )
+            return cur.fetchone()
+
+        revenue_today, payments_today = revenue_since(today)
+        revenue_7d, payments_7d = revenue_since(week_ago)
+        revenue_all, payments_all = revenue_since("")
+
+        return {
+            "total_users": total_users,
+            "active_today": active_today,
+            "bonus_outstanding": bonus_outstanding,
+            "revenue_today": revenue_today,
+            "payments_today": payments_today,
+            "revenue_7d": revenue_7d,
+            "payments_7d": payments_7d,
+            "revenue_all": revenue_all,
+            "payments_all": payments_all,
+        }
 
 
 def set_referrer(user_id: int, referrer_id: int) -> bool:

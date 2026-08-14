@@ -339,19 +339,24 @@ def back_keyboard() -> InlineKeyboardMarkup:
 
 
 async def _edit_or_send(
-    callback: CallbackQuery, text: str, reply_markup: InlineKeyboardMarkup | None = None
+    callback: CallbackQuery,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = "HTML",
 ) -> None:
     """Edits the button's own message in place instead of sending a new one,
     so navigating the menu doesn't spam the chat with a fresh message every
     tap. Falls back to sending a new message if editing isn't possible
     (e.g. re-selecting the same option leaves text/markup unchanged, which
-    Telegram rejects as "message is not modified")."""
+    Telegram rejects as "message is not modified"). Pass parse_mode=None for
+    screens that embed raw user content, so stray '<'/'&' can't crash the
+    edit the way they used to for the old HTML-only menus."""
     try:
-        await callback.message.edit_text(text, reply_markup=reply_markup)
+        await callback.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
             return
-        await callback.message.answer(text, reply_markup=reply_markup)
+        await callback.message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 
 @router.callback_query(F.data == "menu:back")
@@ -601,6 +606,8 @@ async def process_successful_payment(message: Message) -> None:
     kind, _, value_str = payload.partition(":")
     user_id = message.from_user.id
     username = message.from_user.username
+    stars = message.successful_payment.total_amount
+    db.log_payment(user_id, username, kind, stars)
 
     if kind == "unlimited":
         minutes = int(value_str)
@@ -760,20 +767,190 @@ def _resolve_target(target: str) -> int | None:
     return None
 
 
+ADMIN_PAGE_SIZE = 8
+
+ADMIN_MENU_TEXT = (
+    "🔑 <b>Админ-панель</b>\n\n"
+    "Команды по-прежнему работают: /grant, /users, /chatlog "
+    "&lt;user_id или @username&gt;."
+)
+
+
+def admin_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
+            [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users:0")],
+        ]
+    )
+
+
 @router.message(Command("admin"))
 async def cmd_admin(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
-    await message.answer(
-        "🔑 <b>Админ-панель</b>\n\n"
-        "/grant &lt;user_id или @username&gt; &lt;amount&gt; — выдать (или списать, если "
-        "amount отрицательный) сообщения пользователю\n"
-        "/users — список пользователей и их лимитов (юзернеймы видны там же)\n"
-        "/chatlog &lt;user_id или @username&gt; [N] — последние N сообщений переписки "
-        "(по умолчанию 20)\n\n"
-        "По @username находит только тех, кто хотя бы раз писал боту — иначе бот не знает "
-        "его username."
+    await message.answer(ADMIN_MENU_TEXT, reply_markup=admin_menu_keyboard())
+
+
+@router.callback_query(F.data == "admin:menu")
+async def cb_admin_menu(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.answer()
+    await _edit_or_send(callback, ADMIN_MENU_TEXT, admin_menu_keyboard())
+
+
+def _admin_stats_text() -> str:
+    s = db.get_admin_stats()
+    return (
+        "📊 <b>Статистика</b>\n\n"
+        f"Всего пользователей: <b>{s['total_users']}</b>\n"
+        f"Активны сегодня: <b>{s['active_today']}</b>\n"
+        f"Докупленных сообщений на руках: <b>{s['bonus_outstanding']}</b>\n\n"
+        f"⭐ Доход сегодня: <b>{s['revenue_today']}</b> ({s['payments_today']} плат.)\n"
+        f"⭐ Доход за 7 дней: <b>{s['revenue_7d']}</b> ({s['payments_7d']} плат.)\n"
+        f"⭐ Доход всего: <b>{s['revenue_all']}</b> ({s['payments_all']} плат.)"
     )
+
+
+@router.callback_query(F.data == "admin:stats")
+async def cb_admin_stats(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.answer()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin:menu")]]
+    )
+    await _edit_or_send(callback, _admin_stats_text(), kb)
+
+
+def admin_users_keyboard(page: int, total: int, users: list[tuple]) -> InlineKeyboardMarkup:
+    rows = []
+    for uid, uname, used, premium_used, bonus, pref, last_active in users:
+        label = f"@{uname}" if uname else str(uid)
+        rows.append(
+            [InlineKeyboardButton(text=f"{label} · {bonus}💬", callback_data=f"admin:user:{uid}:{page}")]
+        )
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"admin:users:{page - 1}"))
+    if (page + 1) * ADMIN_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"admin:users:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="◀️ В меню", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("admin:users:"))
+async def cb_admin_users(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    page = int(callback.data.split(":")[2])
+    await callback.answer()
+    total = db.count_users()
+    if total == 0:
+        await _edit_or_send(callback, "Пока нет пользователей.", admin_menu_keyboard())
+        return
+    users = db.list_users(limit=ADMIN_PAGE_SIZE, offset=page * ADMIN_PAGE_SIZE)
+    text = f"👥 <b>Пользователи</b> ({total}) — стр. {page + 1}"
+    await _edit_or_send(callback, text, admin_users_keyboard(page, total, users))
+
+
+def _admin_user_text(p: dict) -> str:
+    name = f"@{p['username']}" if p["username"] else str(p["user_id"])
+    lines = [
+        f"👤 <b>{name}</b> (id <code>{p['user_id']}</code>)\n",
+        f"Тариф: {p['model_pref']} / {p['model_choice']}",
+        f"Бесплатно сегодня: {p['used_today']}/{DAILY_FREE_MESSAGES} + "
+        f"{p['premium_used_today']}/{DAILY_FREE_PREMIUM_MESSAGES} премиум",
+        f"Докупленных сообщений: <b>{p['bonus_credits']}</b>",
+    ]
+    if p["unlimited_until"]:
+        lines.append(f"Безлимит до: {p['unlimited_until'].replace('T', ' ')} (UTC)")
+    lines.append(f"Последняя активность: {p['last_active_at']}")
+    return "\n".join(lines)
+
+
+def admin_user_keyboard(uid: int, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="+10", callback_data=f"admin:grant:{uid}:10:{page}"),
+                InlineKeyboardButton(text="+50", callback_data=f"admin:grant:{uid}:50:{page}"),
+                InlineKeyboardButton(text="-10", callback_data=f"admin:grant:{uid}:-10:{page}"),
+            ],
+            [InlineKeyboardButton(text="💬 Чатлог", callback_data=f"admin:chatlog:{uid}:{page}")],
+            [InlineKeyboardButton(text="◀️ К списку", callback_data=f"admin:users:{page}")],
+        ]
+    )
+
+
+@router.callback_query(F.data.startswith("admin:user:"))
+async def cb_admin_user(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    _, _, uid_str, page_str = callback.data.split(":")
+    uid, page = int(uid_str), int(page_str)
+    await callback.answer()
+    p = db.get_player(uid)
+    if p is None:
+        await _edit_or_send(callback, "Пользователь не найден.", admin_menu_keyboard())
+        return
+    await _edit_or_send(callback, _admin_user_text(p), admin_user_keyboard(uid, page))
+
+
+@router.callback_query(F.data.startswith("admin:grant:"))
+async def cb_admin_grant(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    _, _, uid_str, amount_str, page_str = callback.data.split(":")
+    uid, amount, page = int(uid_str), int(amount_str), int(page_str)
+    new_balance = db.admin_add_bonus_credits(uid, amount)
+    if new_balance is None:
+        await callback.answer("Пользователь не найден.", show_alert=True)
+        return
+    await callback.answer(f"Готово: {new_balance} сообщений")
+    p = db.get_player(uid)
+    await _edit_or_send(callback, _admin_user_text(p), admin_user_keyboard(uid, page))
+
+
+def _chatlog_text(target_label: str, rows: list[tuple]) -> str:
+    lines = [f"Чат с {target_label} (последние {len(rows)}):\n"]
+    for role, content, created_at in rows:
+        who = "[Я]" if role == "user" else "[Бот]"
+        text = content if len(content) <= 300 else content[:300] + "…"
+        lines.append(f"{who} [{created_at}] {text}")
+    full_text = "\n".join(lines)
+    if len(full_text) > 3500:
+        full_text = full_text[-3500:]
+    return full_text
+
+
+@router.callback_query(F.data.startswith("admin:chatlog:"))
+async def cb_admin_chatlog(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    _, _, uid_str, page_str = callback.data.split(":")
+    uid, page = int(uid_str), int(page_str)
+    await callback.answer()
+    rows = db.get_recent_chat(uid, 20)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin:user:{uid}:{page}")]]
+    )
+    if not rows:
+        await _edit_or_send(callback, "Нет сообщений для этого пользователя.", kb)
+        return
+    # Chat content is raw user/model text and can contain stray '<'/'&' that
+    # would crash HTML parsing (this bit the old menus before), so this
+    # screen is sent as plain text rather than risking that.
+    await _edit_or_send(callback, _chatlog_text(str(uid), rows), kb, parse_mode=None)
 
 
 @router.message(Command("grant"))
@@ -789,7 +966,10 @@ async def cmd_grant(message: Message) -> None:
         await message.answer(f"Пользователь {parts[1]} не найден (он должен хотя бы раз написать боту).")
         return
     amount = int(parts[2])
-    new_balance = db.add_bonus_credits(target_id, None, amount)
+    new_balance = db.admin_add_bonus_credits(target_id, amount)
+    if new_balance is None:
+        await message.answer(f"Пользователь {parts[1]} не найден (он должен хотя бы раз написать боту).")
+        return
     await message.answer(f"Готово. Баланс пользователя {parts[1]}: {new_balance} сообщений.")
 
 
@@ -829,15 +1009,7 @@ async def cmd_chatlog(message: Message) -> None:
     if not rows:
         await message.answer("Нет сообщений для этого пользователя.")
         return
-    lines = [f"💬 Чат с {parts[1]} (последние {len(rows)}):\n"]
-    for role, content, created_at in rows:
-        who = "👤" if role == "user" else "🤖"
-        text = content if len(content) <= 300 else content[:300] + "…"
-        lines.append(f"{who} [{created_at}] {text}")
-    full_text = "\n".join(lines)
-    if len(full_text) > 3800:
-        full_text = full_text[-3800:]
-    await message.answer(full_text, parse_mode=None)
+    await message.answer(_chatlog_text(parts[1], rows), parse_mode=None)
 
 
 REMEMBER_PREFIXES = ("запомни:", "запомни,", "запомни ")
