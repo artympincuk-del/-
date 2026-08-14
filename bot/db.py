@@ -430,6 +430,22 @@ def get_recent_chat(user_id: int, limit: int = 20) -> list[tuple[str, str, str]]
         return list(reversed(rows))
 
 
+def delete_old_chat_log(retention_days: int) -> int:
+    """Deletes chat_log rows older than `retention_days`. Unlike
+    dialog_history (already capped at MAX_HISTORY_TURNS per user), chat_log
+    is the admin support/audit trail (/chatlog) and has no other size cap,
+    so without this it grows unboundedly on disk forever. Returns how many
+    rows were deleted, for startup/daily-task logging. Admin access to
+    what's left is untouched — this only prunes the tail, not the feature."""
+    with _lock:
+        cutoff = (_utcnow_naive() - datetime.timedelta(days=retention_days)).isoformat(
+            timespec="seconds"
+        )
+        cur = _conn.execute("DELETE FROM chat_log WHERE created_at < ?", (cutoff,))
+        _conn.commit()
+        return cur.rowcount
+
+
 def get_dialog_history(user_id: int, max_turns: int) -> list[dict]:
     """Returns this user's conversation context (oldest first, as
     {"role", "content"} dicts ready to feed straight into ask_ai), capped to

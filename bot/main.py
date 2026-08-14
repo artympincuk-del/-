@@ -8,7 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, MenuButtonDefault
 
 from bot import ai, db
-from bot.config import BOT_TOKEN
+from bot.config import BOT_TOKEN, CHATLOG_RETENTION_DAYS
 from bot.handlers import router
 
 # Kept short on purpose — everything here is also one tap away in the inline
@@ -22,6 +22,30 @@ BOT_COMMANDS = [
     BotCommand(command="help", description="Помощь"),
 ]
 
+CHATLOG_RETENTION_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+def _run_chatlog_retention() -> None:
+    deleted = db.delete_old_chat_log(CHATLOG_RETENTION_DAYS)
+    if deleted:
+        logging.info(
+            "Chat log retention: deleted %d row(s) older than %d days",
+            deleted,
+            CHATLOG_RETENTION_DAYS,
+        )
+
+
+async def _chatlog_retention_loop() -> None:
+    """Runs once a day, on top of the startup run in main() — otherwise
+    chat_log (the admin support/audit trail) has no cap and grows forever
+    on Railway's disk."""
+    while True:
+        await asyncio.sleep(CHATLOG_RETENTION_INTERVAL_SECONDS)
+        try:
+            _run_chatlog_retention()
+        except Exception:
+            logging.exception("Chat log retention cleanup failed")
+
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
@@ -33,13 +57,21 @@ async def main() -> None:
     await bot.set_my_commands(BOT_COMMANDS)
     await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
     await ai.check_configured_models()
+    _run_chatlog_retention()
+    retention_task = asyncio.create_task(_chatlog_retention_loop())
 
     await bot.delete_webhook(drop_pending_updates=False)
     try:
         await dp.start_polling(bot)
     finally:
-        # Graceful shutdown: release the Telegram HTTP session and flush/close
-        # the SQLite connection instead of relying on process teardown.
+        # Graceful shutdown: stop the background task, release the Telegram
+        # HTTP session, and flush/close the SQLite connection instead of
+        # relying on process teardown.
+        retention_task.cancel()
+        try:
+            await retention_task
+        except asyncio.CancelledError:
+            pass
         await bot.session.close()
         db.close()
 
