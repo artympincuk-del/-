@@ -40,6 +40,7 @@ from bot.config import (
     REFERRAL_BONUS_MESSAGES,
     REFERRAL_DAILY_CAP,
     REFERRAL_MIN_MESSAGES,
+    REFERRAL_SIGNUP_BONUS,
     VISION_MODEL,
 )
 from bot.payments import PACKAGES, PRICE_VERSION, TIME_PACKAGES, packages_keyboard, resolve_package
@@ -288,10 +289,13 @@ def quota_denied_text(status: dict) -> str:
 
 
 async def _apply_referral(message: Message) -> None:
-    """Registers the referral link, but pays nothing yet — anti-abuse: a
-    fake account started via a referral link earns its referrer nothing
+    """Registers the referral link and pays the referee's small immediate
+    signup bonus. The referrer's (larger) bonus is NOT paid here — anti-abuse:
+    a fake account started via a referral link earns its referrer nothing
     until it sends REFERRAL_MIN_MESSAGES real messages (see
-    _credit_referral_progress, called from every real-message handler)."""
+    _credit_referral_progress, called from every real-message handler). The
+    signup bonus isn't gated the same way — a fake account getting a few
+    free messages on its own throwaway balance isn't the exploit."""
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].startswith("ref_"):
         return
@@ -304,6 +308,11 @@ async def _apply_referral(message: Message) -> None:
     if not db.set_referrer(user_id, referrer_id):
         return
     db.register_referral(user_id, referrer_id)
+    new_balance = db.add_bonus_credits(user_id, message.from_user.username, REFERRAL_SIGNUP_BONUS)
+    await message.answer(
+        f"🎁 Ты пришёл по приглашению — начислено <b>{REFERRAL_SIGNUP_BONUS}</b> "
+        f"сообщений! Баланс: {new_balance}."
+    )
 
 
 async def _credit_referral_progress(bot, user_id: int) -> None:
@@ -410,8 +419,9 @@ HELP_TEXT = (
     "или день — удобно, если нужно решить много задач подряд и не считать сообщения.\n"
     "• Под каждым ответом есть кнопки «Подробнее» / «Проще» / «Пример» — не нужно "
     "переписывать вопрос, чтобы уточнить ответ.\n"
-    f"• Пригласи друга (кнопка в меню) — когда он напишет боту {REFERRAL_MIN_MESSAGES} "
-    f"сообщения(-ий), вы оба получите по {REFERRAL_BONUS_MESSAGES} сообщений.\n"
+    f"• Пригласи друга (кнопка в меню) — он сразу получит {REFERRAL_SIGNUP_BONUS} "
+    f"сообщений, а тебе начислится {REFERRAL_BONUS_MESSAGES}, когда он напишет боту "
+    f"{REFERRAL_MIN_MESSAGES} сообщения(-ий).\n"
     "• В группах бот отвечает, только если его упомянуть (@username) или ответить на "
     "его сообщение — чтобы не отвечать на каждое сообщение в чате.\n\n"
     "Открыть меню в любой момент — /menu."
@@ -548,10 +558,10 @@ async def _invite_text(bot, user_id: int) -> str:
     link = f"https://t.me/{username}?start=ref_{user_id}"
     return (
         f"🎁 <b>Пригласи друга</b>\n\n"
-        f"Отправь эту ссылку другу. Бонус придёт не сразу: как только друг "
-        f"задаст боту {REFERRAL_MIN_MESSAGES} вопроса(-ов), вы <b>оба</b> получите "
-        f"по {REFERRAL_BONUS_MESSAGES} бесплатных сообщений — это защита от накрутки "
-        f"фейковыми аккаунтами.\n\n"
+        f"Отправь эту ссылку другу — он сразу получит {REFERRAL_SIGNUP_BONUS} "
+        f"бесплатных сообщений. Твой бонус ({REFERRAL_BONUS_MESSAGES} сообщений) придёт "
+        f"не сразу: как только друг задаст боту {REFERRAL_MIN_MESSAGES} вопроса(-ов) — "
+        f"это защита от накрутки фейковыми аккаунтами.\n\n"
         f"<code>{link}</code>"
     )
 
