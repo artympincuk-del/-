@@ -1,8 +1,10 @@
 import base64
 import io
 import re
+import time
 
 from aiogram import F, Router
+from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -10,6 +12,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -44,7 +47,38 @@ class Form(StatesGroup):
     waiting_for_image_prompt = State()
 
 
-MODEL_NAMES = {"fast": "⚡ Быстрая (GPT-OSS 20B)", "premium": "💎 Премиум (GPT-OSS 120B, глубокий анализ)"}
+# (tier, choice) -> which actual Groq model + reasoning_effort to use. `tier`
+# ('fast'/'premium') decides which quota bucket a message is billed against;
+# `choice` decides which specific engine runs within that tier — the two
+# GPT-OSS models are the default/recommended pick, the original Llama models
+# are offered alongside them as an alternative "flavor" within the same tier.
+MODEL_OPTIONS = {
+    ("fast", "gptoss"): {
+        "model": FAST_MODEL,
+        "reasoning": FAST_REASONING_EFFORT,
+        "label": "⚡ GPT-OSS 20B",
+    },
+    ("fast", "llama"): {
+        "model": "llama-3.1-8b-instant",
+        "reasoning": None,
+        "label": "🦙 Llama 3.1 8B",
+    },
+    ("premium", "gptoss"): {
+        "model": PREMIUM_MODEL,
+        "reasoning": PREMIUM_REASONING_EFFORT,
+        "label": "💎 GPT-OSS 120B (глубокий анализ)",
+    },
+    ("premium", "llama"): {
+        "model": "llama-3.3-70b-versatile",
+        "reasoning": None,
+        "label": "🦙 Llama 3.3 70B",
+    },
+}
+
+
+def _model_option(status: dict) -> dict:
+    key = (status["model_pref"], status.get("model_choice") or "gptoss")
+    return MODEL_OPTIONS.get(key, MODEL_OPTIONS[(status["model_pref"], "gptoss")])
 
 BTN_BALANCE = "💰 Баланс / Пополнить"
 BTN_BUY = "💎 Пополнить"
@@ -131,6 +165,35 @@ async def _strip_mention(message: Message, text: str) -> str:
     return re.sub(rf"@{re.escape(username)}", "", text, flags=re.IGNORECASE).strip()
 
 
+@router.my_chat_member()
+async def on_bot_membership_changed(event: ChatMemberUpdated) -> None:
+    """Introduce the bot to the whole group the moment it's added, instead of
+    staying silent until someone happens to @mention it — one add exposes the
+    entire class/chat at once instead of relying on word of mouth."""
+    if event.chat.type not in ("group", "supergroup"):
+        return
+    was_in = event.old_chat_member.status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+    )
+    is_in = event.new_chat_member.status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+    )
+    if was_in or not is_in:
+        return
+
+    username = await _get_bot_username(event.bot)
+    await event.bot.send_message(
+        event.chat.id,
+        "👋 <b>Привет! Я AI-ассистент.</b>\n\n"
+        "Помогаю с домашкой и вопросами: понимаю текст, фото, голосовые и PDF.\n\n"
+        f"В этом чате отвечаю, только если меня <b>упомянуть</b> (@{username}) или "
+        "<b>ответить</b> на моё сообщение — не буду встревать в каждый разговор.\n\n"
+        "Написать в личку и посмотреть все возможности — /menu там.",
+    )
+
+
 MAX_IMAGE_DIM = 1600
 
 
@@ -182,19 +245,23 @@ def quick_actions_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🔍 Подробнее", callback_data="qa:detail"),
                 InlineKeyboardButton(text="💡 Проще", callback_data="qa:simpler"),
                 InlineKeyboardButton(text="📝 Пример", callback_data="qa:example"),
-            ]
+            ],
+            [InlineKeyboardButton(text="📤 Поделиться", callback_data="qa:share")],
         ]
     )
 
 
-def model_keyboard(current: str) -> InlineKeyboardMarkup:
-    def label(key: str, text: str) -> str:
-        return f"✅ {text}" if key == current else text
+def model_keyboard(current_pref: str, current_choice: str) -> InlineKeyboardMarkup:
+    def label(tier: str, choice: str) -> str:
+        text = MODEL_OPTIONS[(tier, choice)]["label"]
+        return f"✅ {text}" if (tier, choice) == (current_pref, current_choice) else text
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=label("fast", MODEL_NAMES["fast"]), callback_data="model:fast")],
-            [InlineKeyboardButton(text=label("premium", MODEL_NAMES["premium"]), callback_data="model:premium")],
+            [InlineKeyboardButton(text=label("fast", "gptoss"), callback_data="model:fast:gptoss")],
+            [InlineKeyboardButton(text=label("fast", "llama"), callback_data="model:fast:llama")],
+            [InlineKeyboardButton(text=label("premium", "gptoss"), callback_data="model:premium:gptoss")],
+            [InlineKeyboardButton(text=label("premium", "llama"), callback_data="model:premium:llama")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")],
         ]
     )
@@ -343,7 +410,7 @@ async def btn_help_text(message: Message) -> None:
 
 def _balance_text(user_id: int, username: str | None) -> str:
     status = db.get_status(user_id, username)
-    model_name = MODEL_NAMES[status["model_pref"]]
+    model_name = _model_option(status)["label"]
     unlimited_line = ""
     if status["unlimited_until"]:
         until_local = status["unlimited_until"].replace("T", " ")
@@ -385,31 +452,45 @@ async def btn_balance_text(message: Message) -> None:
     )
 
 
+MODEL_MENU_TEXT = (
+    "Выберите модель:\n\n"
+    "⚡/💎 — GPT-OSS (рекомендуется, точнее следует инструкциям)\n"
+    "🦙 — оригинальные модели Llama"
+)
+
+
 @router.message(Command("model"))
 async def cmd_model(message: Message) -> None:
     status = db.get_status(message.from_user.id, message.from_user.username)
-    await message.answer("Выберите модель:", reply_markup=model_keyboard(status["model_pref"]))
+    await message.answer(
+        MODEL_MENU_TEXT, reply_markup=model_keyboard(status["model_pref"], status["model_choice"])
+    )
 
 
 @router.callback_query(F.data == "menu:model")
 async def cb_menu_model(callback: CallbackQuery) -> None:
     await callback.answer()
     status = db.get_status(callback.from_user.id, callback.from_user.username)
-    await _edit_or_send(callback, "Выберите модель:", model_keyboard(status["model_pref"]))
+    await _edit_or_send(
+        callback, MODEL_MENU_TEXT, model_keyboard(status["model_pref"], status["model_choice"])
+    )
 
 
 @router.message(F.text == BTN_MODEL)
 async def btn_model_text(message: Message) -> None:
     status = db.get_status(message.from_user.id, message.from_user.username)
-    await message.answer("Выберите модель:", reply_markup=model_keyboard(status["model_pref"]))
+    await message.answer(
+        MODEL_MENU_TEXT, reply_markup=model_keyboard(status["model_pref"], status["model_choice"])
+    )
 
 
 @router.callback_query(F.data.startswith("model:"))
 async def cb_model(callback: CallbackQuery) -> None:
-    choice = callback.data.split(":")[1]
-    db.set_model_pref(callback.from_user.id, callback.from_user.username, choice)
-    await callback.answer(f"Модель: {MODEL_NAMES[choice]}")
-    await _edit_or_send(callback, "Выберите модель:", model_keyboard(choice))
+    _, tier, choice = callback.data.split(":")
+    db.set_model_pref(callback.from_user.id, callback.from_user.username, tier, choice)
+    label = MODEL_OPTIONS[(tier, choice)]["label"]
+    await callback.answer(f"Модель: {label}")
+    await _edit_or_send(callback, MODEL_MENU_TEXT, model_keyboard(tier, choice))
 
 
 @router.message(Command("reset"))
@@ -775,10 +856,8 @@ async def _answer_text_query(
         await message.answer(quota_denied_text(status))
         return
 
-    if status["model_pref"] == "premium":
-        model, reasoning_effort = PREMIUM_MODEL, PREMIUM_REASONING_EFFORT
-    else:
-        model, reasoning_effort = FAST_MODEL, FAST_REASONING_EFFORT
+    opt = _model_option(status)
+    model, reasoning_effort = opt["model"], opt["reasoning"]
     notes = [content for _id, content in db.list_notes(user_id)]
 
     data = await state.get_data()
@@ -828,6 +907,27 @@ async def _process_text_query(message: Message, state: FSMContext, text: str) ->
             return
 
     await _answer_text_query(message, state, text, message.from_user.id, message.from_user.username)
+
+
+@router.callback_query(F.data == "qa:share")
+async def cb_share(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    data = await state.get_data()
+    history = data.get("history", [])
+    if not history or history[-1]["role"] != "assistant":
+        await callback.message.answer("Нечего делиться — сначала задай вопрос.")
+        return
+
+    username = await _get_bot_username(callback.bot)
+    link = f"https://t.me/{username}?start=ref_{callback.from_user.id}"
+    share_text = (
+        f"{history[-1]['content']}\n\n"
+        f"—\n"
+        f"🤖 Решено с помощью @{username} — бесплатный AI-ассистент в Telegram: "
+        f"текст, фото, голос, PDF.\n"
+        f"Попробуй: {link}"
+    )
+    await _send_long(callback.message, share_text)
 
 
 @router.callback_query(F.data.startswith("qa:"))
@@ -921,10 +1021,8 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
         f"{doc_text}\n\n---\nЗадача: {caption}"
     )
 
-    if status["model_pref"] == "premium":
-        model, reasoning_effort = PREMIUM_MODEL, PREMIUM_REASONING_EFFORT
-    else:
-        model, reasoning_effort = FAST_MODEL, FAST_REASONING_EFFORT
+    opt = _model_option(status)
+    model, reasoning_effort = opt["model"], opt["reasoning"]
     notes = [content for _id, content in db.list_notes(user_id)]
 
     data = await state.get_data()
@@ -992,6 +1090,8 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     history = data.get("history", [])
 
     await message.bot.send_chat_action(message.chat.id, "typing")
+    status_msg = await message.answer("🔍 <i>Распознаю задание...</i>")
+    t0 = time.monotonic()
 
     # Stage 1 — pure perception: get an accurate, literal description of
     # what's on the photo (text/problem AND general visual content — the
@@ -1021,8 +1121,13 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     try:
         vision_text = await ai.ask_ai([], transcription_request, VISION_MODEL, max_tokens=3000)
     except ai.AIError as e:
-        await message.answer(e.user_message)
+        await status_msg.edit_text(e.user_message)
         return
+
+    try:
+        await status_msg.edit_text("🧠 <i>Решаю...</i>")
+    except TelegramBadRequest:
+        pass
 
     # Stage 2 — actual solving/answering, always handed to the strongest
     # reasoning model regardless of the user's fast/premium chat preference:
@@ -1031,15 +1136,24 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     solve_prompt = (
         f"Вот описание фото, которое прислал пользователь:\n\n{vision_text}\n\n---\n"
         f"Запрос пользователя: {caption}\n\n"
-        f"Ответь точно и по существу. Если это учебное задание — реши по шагам."
+        f"Ответь точно и по существу. Если это учебное задание — реши по шагам, а в конце "
+        f"добавь короткий раздел «✅ Проверка:» с быстрой самопроверкой результата (например, "
+        f"подстановкой ответа обратно в условие или другим способом решения). Если это не "
+        f"вычислительная/логическая задача, а просто вопрос о содержимом фото — раздел "
+        f"«Проверка» не нужен."
     )
     try:
         reply_text = await ai.ask_ai(
             history, solve_prompt, PREMIUM_MODEL, notes=notes, reasoning_effort="high", max_tokens=6144
         )
     except ai.AIError as e:
-        await message.answer(e.user_message)
+        await status_msg.edit_text(e.user_message)
         return
+
+    try:
+        await status_msg.delete()
+    except TelegramBadRequest:
+        pass
 
     db.log_message(user_id, username, "user", f"[фото] {caption}")
     db.log_message(user_id, username, "assistant", reply_text)
@@ -1056,4 +1170,8 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     history = history[-(2 * 10):]
     await state.update_data(history=history)
 
-    await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
+    elapsed = time.monotonic() - t0
+    has_check = "✅ Проверка" in reply_text or "Проверка:" in reply_text
+    stage_label = "распознано → решено → проверено" if has_check else "распознано → решено"
+    footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · 🔬 {stage_label}</i>"
+    await _send_long(message, reply_text + footer, reply_markup=quick_actions_keyboard())

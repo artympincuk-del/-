@@ -57,6 +57,10 @@ _ensure_column("players", "premium_messages_used_today", "INTEGER NOT NULL DEFAU
 _ensure_column("players", "last_active_at", "TEXT")
 _ensure_column("players", "unlimited_until", "TEXT")
 _ensure_column("players", "referred_by", "INTEGER")
+# Which specific engine to use within the chosen tier (model_pref stays
+# 'fast'/'premium' purely for quota billing — model_choice picks the actual
+# Groq model, e.g. 'gptoss' vs 'llama', independent of that billing tier).
+_ensure_column("players", "model_choice", "TEXT NOT NULL DEFAULT 'gptoss'")
 
 
 def _now() -> str:
@@ -108,24 +112,26 @@ def get_status(user_id: int, username: str | None) -> dict:
         _reset_if_new_day(user_id)
         cur = _conn.execute(
             "SELECT messages_used_today, premium_messages_used_today, bonus_credits, "
-            "model_pref, unlimited_until FROM players WHERE user_id = ?",
+            "model_pref, unlimited_until, model_choice FROM players WHERE user_id = ?",
             (user_id,),
         )
-        used, premium_used, bonus, model_pref, unlimited_until = cur.fetchone()
+        used, premium_used, bonus, model_pref, unlimited_until, model_choice = cur.fetchone()
         return {
             "used_today": used,
             "premium_used_today": premium_used,
             "bonus_credits": bonus,
             "model_pref": model_pref,
             "unlimited_until": _active_unlimited_until(unlimited_until),
+            "model_choice": model_choice,
         }
 
 
-def set_model_pref(user_id: int, username: str | None, model_pref: str) -> None:
+def set_model_pref(user_id: int, username: str | None, model_pref: str, model_choice: str) -> None:
     with _lock:
         _ensure_player(user_id, username)
         _conn.execute(
-            "UPDATE players SET model_pref = ? WHERE user_id = ?", (model_pref, user_id)
+            "UPDATE players SET model_pref = ?, model_choice = ? WHERE user_id = ?",
+            (model_pref, model_choice, user_id),
         )
         _conn.commit()
 
@@ -149,10 +155,10 @@ def try_consume_message(
         _reset_if_new_day(user_id)
         cur = _conn.execute(
             "SELECT messages_used_today, premium_messages_used_today, bonus_credits, "
-            "model_pref, unlimited_until FROM players WHERE user_id = ?",
+            "model_pref, unlimited_until, model_choice FROM players WHERE user_id = ?",
             (user_id,),
         )
-        used, premium_used, bonus, model_pref, unlimited_raw = cur.fetchone()
+        used, premium_used, bonus, model_pref, unlimited_raw, model_choice = cur.fetchone()
         unlimited_until = _active_unlimited_until(unlimited_raw)
 
         def status(used=used, premium_used=premium_used, bonus=bonus) -> dict:
@@ -162,6 +168,7 @@ def try_consume_message(
                 "bonus_credits": bonus,
                 "model_pref": model_pref,
                 "unlimited_until": unlimited_until,
+                "model_choice": model_choice,
             }
 
         if unlimited_until:
