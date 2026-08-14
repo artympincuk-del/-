@@ -53,6 +53,14 @@ GROQ_MAX_CONCURRENT = int(os.environ.get("GROQ_MAX_CONCURRENT", "5"))
 # time, which is confusing for a bot whose users are mostly there.
 QUOTA_TZ = os.environ.get("QUOTA_TZ", "Europe/Moscow")
 
+# Monthly Stars subscription price. Unlike PACKAGES/TIME_PACKAGES (kept in
+# payments.py on purpose — see PRICE_VERSION there), this one lives in
+# config because it was explicitly asked for as an env-tunable setting.
+# Changing it still requires bumping PRICE_VERSION in payments.py in the
+# same deploy, same as any other price change, so an invoice created under
+# the old price gets rejected at pre-checkout rather than under-charging.
+SUBSCRIPTION_PRICE_STARS = int(os.environ.get("SUBSCRIPTION_PRICE_STARS", "499"))
+
 ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()
 }

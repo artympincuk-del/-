@@ -101,6 +101,22 @@ _conn.execute(
 _conn.execute(
     "CREATE INDEX IF NOT EXISTS idx_referrals_referrer_id ON referrals (referrer_id)"
 )
+# Funnel analytics — see log_event()/get_funnel_stats(). Deliberately just
+# (user_id, event, created_at): no extra metadata columns, so the funnel
+# query stays a simple COUNT(DISTINCT user_id) per event per time window.
+_conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        event TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """
+)
+_conn.execute(
+    "CREATE INDEX IF NOT EXISTS idx_events_event_created_at ON events (event, created_at)"
+)
 _conn.commit()
 
 MAX_NOTES_PER_USER = 30
@@ -122,6 +138,27 @@ _ensure_column("players", "referred_by", "INTEGER")
 # 'fast'/'premium' purely for quota billing — model_choice picks the actual
 # Groq model, e.g. 'gptoss' vs 'llama', independent of that billing tier).
 _ensure_column("players", "model_choice", "TEXT NOT NULL DEFAULT 'gptoss'")
+
+# Monthly Stars subscription (separate from the one-off unlimited_until time
+# passes above): subscription_until is the same "active until" idea but
+# tracked independently since a subscription auto-renews and can be
+# canceled; subscription_status distinguishes a live-and-renewing
+# subscription from one the user canceled (still active until the period
+# ends, just won't renew) from never-subscribed. subscription_charge_id is
+# the most recent renewal's charge id, required by Telegram's
+# editUserStarSubscription to act on the subscription.
+_ensure_column("players", "subscription_until", "TEXT")
+_ensure_column("players", "subscription_status", "TEXT NOT NULL DEFAULT 'none'")
+_ensure_column("players", "subscription_charge_id", "TEXT")
+
+# Opt-in daily "come back" reminder — off by default, only ever sent if the
+# user explicitly enabled it and picked an hour themselves (see
+# handlers.py's reminder menu). reminder_last_sent_date guards against
+# sending twice in the same local day if the background check runs more
+# than once during that hour.
+_ensure_column("players", "reminder_enabled", "INTEGER NOT NULL DEFAULT 0")
+_ensure_column("players", "reminder_hour", "INTEGER")
+_ensure_column("players", "reminder_last_sent_date", "TEXT")
 
 # telegram_payment_charge_id is what makes crediting idempotent: Telegram can
 # redeliver a successful_payment update (e.g. bot restarted mid-delivery), and
@@ -226,10 +263,14 @@ def get_status(user_id: int, username: str | None) -> dict:
         _reset_if_new_day(user_id)
         cur = _conn.execute(
             "SELECT messages_used_today, premium_messages_used_today, bonus_credits, "
-            "model_pref, unlimited_until, model_choice FROM players WHERE user_id = ?",
+            "model_pref, unlimited_until, model_choice, subscription_until, subscription_status "
+            "FROM players WHERE user_id = ?",
             (user_id,),
         )
-        used, premium_used, bonus, model_pref, unlimited_until, model_choice = cur.fetchone()
+        (
+            used, premium_used, bonus, model_pref, unlimited_until, model_choice,
+            subscription_until, subscription_status,
+        ) = cur.fetchone()
         return {
             "used_today": used,
             "premium_used_today": premium_used,
@@ -237,6 +278,8 @@ def get_status(user_id: int, username: str | None) -> dict:
             "model_pref": model_pref,
             "unlimited_until": _active_unlimited_until(unlimited_until),
             "model_choice": model_choice,
+            "subscription_until": _active_unlimited_until(subscription_until),
+            "subscription_status": subscription_status,
         }
 
 
@@ -269,11 +312,16 @@ def try_consume_message(
         _reset_if_new_day(user_id)
         cur = _conn.execute(
             "SELECT messages_used_today, premium_messages_used_today, bonus_credits, "
-            "model_pref, unlimited_until, model_choice FROM players WHERE user_id = ?",
+            "model_pref, unlimited_until, model_choice, subscription_until, subscription_status "
+            "FROM players WHERE user_id = ?",
             (user_id,),
         )
-        used, premium_used, bonus, model_pref, unlimited_raw, model_choice = cur.fetchone()
+        (
+            used, premium_used, bonus, model_pref, unlimited_raw, model_choice,
+            subscription_raw, subscription_status,
+        ) = cur.fetchone()
         unlimited_until = _active_unlimited_until(unlimited_raw)
+        subscription_until = _active_unlimited_until(subscription_raw)
 
         def status(used=used, premium_used=premium_used, bonus=bonus) -> dict:
             return {
@@ -283,10 +331,12 @@ def try_consume_message(
                 "model_pref": model_pref,
                 "unlimited_until": unlimited_until,
                 "model_choice": model_choice,
+                "subscription_until": subscription_until,
+                "subscription_status": subscription_status,
             }
 
-        if unlimited_until:
-            # Active time pass: no quota/credits touched at all.
+        if unlimited_until or subscription_until:
+            # Active time pass or subscription: no quota/credits touched at all.
             return True, status()
 
         if model_pref == "premium":
@@ -589,15 +639,22 @@ def record_payment_and_credit(
     a redelivered successful_payment update (e.g. Telegram retrying after a
     restart) can never double-credit — it just reports "duplicate".
 
-    `kind` is 'messages' or 'unlimited'; `amount` is the messages count or
-    minutes to grant, matching `kind` (also stored as credited_amount so a
-    later refund can reverse exactly this, even if PACKAGES prices change
-    in the meantime).
+    `kind` is 'messages', 'unlimited' or 'subscription'; `amount` is the
+    messages count / minutes / days to grant, matching `kind` (also stored
+    as credited_amount so a later refund can reverse exactly this, even if
+    prices change in the meantime).
+
+    Each subscription renewal arrives as a genuinely new charge_id (Telegram
+    mints one per period), so it's never treated as a duplicate — it just
+    stacks another `amount` days onto subscription_until, same as buying a
+    second time pass before the first expires, and (re)marks the
+    subscription 'active' with this charge_id (needed later to cancel it).
 
     Returns (outcome, result):
       "duplicate" -> charge_id already processed, nothing changed, result None
-      "credited"  -> result is the new bonus_credits balance (messages) or
-                     the new unlimited_until timestamp (unlimited)
+      "credited"  -> result is the new bonus_credits balance (messages), the
+                     new unlimited_until timestamp (unlimited), or the new
+                     subscription_until timestamp (subscription)
     """
     with _lock:
         _ensure_player(user_id, username)
@@ -629,6 +686,24 @@ def record_payment_and_credit(
                 _conn.commit()
                 return "credited", new_expiry
 
+            if kind == "subscription":
+                cur = _conn.execute(
+                    "SELECT subscription_until FROM players WHERE user_id = ?", (user_id,)
+                )
+                (current_raw,) = cur.fetchone()
+                base = _utcnow_naive()
+                active = _active_unlimited_until(current_raw)
+                if active:
+                    base = datetime.datetime.fromisoformat(active)
+                new_expiry = (base + datetime.timedelta(days=amount)).isoformat(timespec="seconds")
+                _conn.execute(
+                    "UPDATE players SET subscription_until = ?, subscription_status = 'active', "
+                    "subscription_charge_id = ? WHERE user_id = ?",
+                    (new_expiry, charge_id, user_id),
+                )
+                _conn.commit()
+                return "credited", new_expiry
+
             _conn.execute(
                 "UPDATE players SET bonus_credits = bonus_credits + ? WHERE user_id = ?",
                 (amount, user_id),
@@ -639,6 +714,36 @@ def record_payment_and_credit(
         except Exception:
             _conn.rollback()
             raise
+
+
+def get_active_subscription_charge_id(user_id: int) -> str | None:
+    """The charge_id needed to call Telegram's editUserStarSubscription —
+    only returned while the subscription is still within its paid period
+    (canceled-but-not-yet-expired counts; fully lapsed doesn't, since
+    Telegram would reject acting on a subscription that's already over)."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT subscription_until, subscription_charge_id FROM players WHERE user_id = ?",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        until_raw, charge_id = row
+        if not charge_id or not _active_unlimited_until(until_raw):
+            return None
+        return charge_id
+
+
+def set_subscription_status(user_id: int, status: str) -> None:
+    """Persists 'active'/'canceled' after a successful
+    editUserStarSubscription call — doesn't touch subscription_until
+    (cancellation stops renewal, it doesn't cut the current period short)."""
+    with _lock:
+        _conn.execute(
+            "UPDATE players SET subscription_status = ? WHERE user_id = ?", (status, user_id)
+        )
+        _conn.commit()
 
 
 def get_payment(payment_id: int) -> dict | None:
@@ -784,6 +889,38 @@ def get_admin_stats() -> dict:
         }
 
 
+FUNNEL_EVENTS = ("buy_opened", "invoice_sent", "paid")
+
+
+def log_event(user_id: int, event: str) -> None:
+    with _lock:
+        _conn.execute(
+            "INSERT INTO events (user_id, event, created_at) VALUES (?, ?, ?)",
+            (user_id, event, _now()),
+        )
+        _conn.commit()
+
+
+def get_funnel_stats() -> dict:
+    """Purchase funnel — how many distinct users hit each stage, for today
+    and the last 7 days. Pricing was otherwise being tuned blind."""
+    with _lock:
+        today_start = _today_start_utc()
+        week_ago = (_utcnow_naive() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
+
+        def counts_since(since: str) -> dict:
+            result = {}
+            for event in FUNNEL_EVENTS:
+                cur = _conn.execute(
+                    "SELECT COUNT(DISTINCT user_id) FROM events WHERE event = ? AND created_at >= ?",
+                    (event, since),
+                )
+                result[event] = cur.fetchone()[0]
+            return result
+
+        return {"today": counts_since(today_start), "week": counts_since(week_ago)}
+
+
 def set_referrer(user_id: int, referrer_id: int) -> bool:
     """Records who referred this user, but only the first time and never for
     self-referrals. Returns True iff this call actually set it (i.e. a
@@ -898,6 +1035,52 @@ def try_credit_referral_message(
             "referee_id": user_id,
             "referrer_balance": referrer_balance,
         }
+
+
+def get_reminder_status(user_id: int) -> dict:
+    with _lock:
+        cur = _conn.execute(
+            "SELECT reminder_enabled, reminder_hour FROM players WHERE user_id = ?", (user_id,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            return {"enabled": False, "hour": None}
+        enabled, hour = row
+        return {"enabled": bool(enabled), "hour": hour}
+
+
+def set_reminder(user_id: int, username: str | None, enabled: bool, hour: int | None) -> None:
+    """User-driven only — called from the reminder menu, never on the bot's
+    own initiative. Turning it off clears reminder_hour too, so re-enabling
+    later always requires picking a time again rather than silently
+    resuming an old one."""
+    with _lock:
+        _ensure_player(user_id, username)
+        _conn.execute(
+            "UPDATE players SET reminder_enabled = ?, reminder_hour = ? WHERE user_id = ?",
+            (1 if enabled else 0, hour if enabled else None, user_id),
+        )
+        _conn.commit()
+
+
+def get_users_due_for_reminder(hour: int, today: str) -> list[int]:
+    """Users who opted in, picked this hour (in QUOTA_TZ), and haven't
+    already gotten today's reminder — checked by the background loop."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT user_id FROM players WHERE reminder_enabled = 1 AND reminder_hour = ? "
+            "AND (reminder_last_sent_date IS NULL OR reminder_last_sent_date != ?)",
+            (hour, today),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def mark_reminder_sent(user_id: int, today: str) -> None:
+    with _lock:
+        _conn.execute(
+            "UPDATE players SET reminder_last_sent_date = ? WHERE user_id = ?", (today, user_id)
+        )
+        _conn.commit()
 
 
 def close() -> None:

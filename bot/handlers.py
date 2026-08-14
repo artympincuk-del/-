@@ -47,7 +47,15 @@ from bot.config import (
     REFERRAL_SIGNUP_BONUS,
     VISION_MODEL,
 )
-from bot.payments import PACKAGES, PRICE_VERSION, TIME_PACKAGES, packages_keyboard, resolve_package
+from bot.payments import (
+    PACKAGES,
+    PRICE_VERSION,
+    SUBSCRIPTION,
+    SUBSCRIPTION_PERIOD_SECONDS,
+    TIME_PACKAGES,
+    packages_keyboard,
+    resolve_package,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +107,7 @@ BTN_IMAGE = "🎨 Картинка"
 BTN_INVITE = "🎁 Пригласить друга"
 BTN_RESET = "🔄 Сбросить диалог"
 BTN_HELP = "❓ Помощь"
+BTN_REMINDER = "🔔 Напоминания"
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -117,6 +126,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text=BTN_RESET, callback_data="menu:reset"),
             ],
             [
+                InlineKeyboardButton(text=BTN_REMINDER, callback_data="menu:reminder"),
                 InlineKeyboardButton(text=BTN_HELP, callback_data="menu:help"),
             ],
         ]
@@ -451,6 +461,10 @@ HELP_TEXT = (
     "после перезапуска. Список — кнопка «Заметки» в меню, удалить — /forget &lt;номер&gt;.\n"
     "• ⏱ Безлимит на время: в разделе «Баланс» можно купить безлимит на 30 минут, час "
     "или день — удобно, если нужно решить много задач подряд и не считать сообщения.\n"
+    f"• ⭐ Подписка на месяц ({SUBSCRIPTION['stars']} ⭐) — безлимит с автопродлением, "
+    "отменить можно в любой момент в «Баланс».\n"
+    "• 🔔 Напоминания (кнопка в меню) — по желанию, раз в сутки в выбранное время. "
+    "По умолчанию выключены, никаких рассылок без явного включения.\n"
     "• Под каждым ответом есть кнопки «Подробнее» / «Проще» / «Пример» — не нужно "
     "переписывать вопрос, чтобы уточнить ответ.\n"
     f"• Пригласи друга (кнопка в меню) — он сразу получит {REFERRAL_SIGNUP_BONUS} "
@@ -489,9 +503,19 @@ def _balance_text(user_id: int, username: str | None) -> str:
     if status["unlimited_until"]:
         until_local = _format_local_time(status["unlimited_until"])
         unlimited_line = f"⏱ <b>Безлимит активен до {until_local}</b> — лимиты ниже не расходуются.\n\n"
+    subscription_line = ""
+    if status["subscription_until"]:
+        until_local = _format_local_time(status["subscription_until"])
+        if status["subscription_status"] == "canceled":
+            subscription_line = (
+                f"⭐ <b>Подписка отменена, доступ до {until_local}</b> — дальше не продлится.\n\n"
+            )
+        else:
+            subscription_line = f"⭐ <b>Подписка активна, продлится {until_local}</b>.\n\n"
     return (
         f"📊 <b>Баланс</b>\n\n"
         f"{unlimited_line}"
+        f"{subscription_line}"
         f"Модель: {model_name}\n"
         f"Быстрая, бесплатных сегодня: {status['used_today']}/{DAILY_FREE_MESSAGES}\n"
         f"Премиум, бесплатных сегодня: {status['premium_used_today']}/{DAILY_FREE_PREMIUM_MESSAGES}\n"
@@ -500,29 +524,44 @@ def _balance_text(user_id: int, username: str | None) -> str:
     )
 
 
+def _balance_keyboard(user_id: int, username: str | None) -> InlineKeyboardMarkup:
+    status = db.get_status(user_id, username)
+    kb = packages_keyboard()
+    if status["subscription_until"]:
+        is_canceled = status["subscription_status"] == "canceled"
+        text = "🔄 Возобновить подписку" if is_canceled else "❌ Отменить подписку"
+        kb.inline_keyboard.insert(
+            -1, [InlineKeyboardButton(text=text, callback_data="subscription:toggle")]
+        )
+    return kb
+
+
 @router.message(Command("balance"))
 async def cmd_balance(message: Message) -> None:
+    db.log_event(message.from_user.id, "buy_opened")
     await message.answer(
         _balance_text(message.from_user.id, message.from_user.username),
-        reply_markup=packages_keyboard(),
+        reply_markup=_balance_keyboard(message.from_user.id, message.from_user.username),
     )
 
 
 @router.callback_query(F.data == "menu:balance")
 async def cb_menu_balance(callback: CallbackQuery) -> None:
     await callback.answer()
+    db.log_event(callback.from_user.id, "buy_opened")
     await _edit_or_send(
         callback,
         _balance_text(callback.from_user.id, callback.from_user.username),
-        packages_keyboard(),
+        _balance_keyboard(callback.from_user.id, callback.from_user.username),
     )
 
 
 @router.message(F.text == BTN_BALANCE)
 async def btn_balance_text(message: Message) -> None:
+    db.log_event(message.from_user.id, "buy_opened")
     await message.answer(
         _balance_text(message.from_user.id, message.from_user.username),
-        reply_markup=packages_keyboard(),
+        reply_markup=_balance_keyboard(message.from_user.id, message.from_user.username),
     )
 
 
@@ -620,22 +659,92 @@ async def btn_invite_text(message: Message) -> None:
     await message.answer(await _invite_text(message.bot, message.from_user.id))
 
 
+REMINDER_HOURS = [9, 12, 15, 18, 21]
+REMINDER_MESSAGE_TEXT = (
+    "👋 <i>Напоминание:</i> я всегда тут, если нужна помощь с домашкой — фото, "
+    "текст или голосовое, отвечу за пару секунд.\n\nОткрыть меню — /menu."
+)
+
+
+def _reminder_text(status: dict) -> str:
+    if status["enabled"]:
+        return (
+            "🔔 <b>Напоминания</b>\n\n"
+            f"Включены, приходят раз в сутки в <b>{status['hour']:02d}:00</b> "
+            f"({QUOTA_TZ}).\n\nНикаких других рассылок — только это, и только если сам включил."
+        )
+    return (
+        "🔔 <b>Напоминания</b>\n\n"
+        "Сейчас выключены. Можно включить ежедневное напоминание в выбранное время "
+        f"({QUOTA_TZ}) — просто короткое сообщение раз в день, ничего больше.\n\n"
+        "Выбери время:"
+    )
+
+
+def _reminder_keyboard(status: dict) -> InlineKeyboardMarkup:
+    if status["enabled"]:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔕 Выключить напоминания", callback_data="reminder:off")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")],
+            ]
+        )
+    hour_buttons = [
+        InlineKeyboardButton(text=f"{h:02d}:00", callback_data=f"reminder:set:{h}")
+        for h in REMINDER_HOURS
+    ]
+    rows = [hour_buttons[i : i + 3] for i in range(0, len(hour_buttons), 3)]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "menu:reminder")
+async def cb_menu_reminder(callback: CallbackQuery) -> None:
+    await callback.answer()
+    status = db.get_reminder_status(callback.from_user.id)
+    await _edit_or_send(callback, _reminder_text(status), _reminder_keyboard(status))
+
+
+@router.message(F.text == BTN_REMINDER)
+async def btn_reminder_text(message: Message) -> None:
+    status = db.get_reminder_status(message.from_user.id)
+    await message.answer(_reminder_text(status), reply_markup=_reminder_keyboard(status))
+
+
+@router.callback_query(F.data.startswith("reminder:"))
+async def cb_reminder_action(callback: CallbackQuery) -> None:
+    await callback.answer()
+    action = callback.data.split(":")[1]
+    user_id = callback.from_user.id
+    username = callback.from_user.username
+    if action == "off":
+        db.set_reminder(user_id, username, False, None)
+    elif action == "set":
+        hour = int(callback.data.split(":")[2])
+        db.set_reminder(user_id, username, True, hour)
+    status = db.get_reminder_status(user_id)
+    await _edit_or_send(callback, _reminder_text(status), _reminder_keyboard(status))
+
+
 BUY_TEXT = "💎 <b>Купить сообщения за Telegram Stars</b>\n\nВыберите пакет:"
 
 
 @router.message(Command("buy"))
 async def cmd_buy(message: Message) -> None:
+    db.log_event(message.from_user.id, "buy_opened")
     await message.answer(BUY_TEXT, reply_markup=packages_keyboard())
 
 
 @router.callback_query(F.data == "menu:buy")
 async def cb_menu_buy(callback: CallbackQuery) -> None:
     await callback.answer()
+    db.log_event(callback.from_user.id, "buy_opened")
     await _edit_or_send(callback, BUY_TEXT, packages_keyboard())
 
 
 @router.message(F.text == BTN_BUY)
 async def btn_buy_text(message: Message) -> None:
+    db.log_event(message.from_user.id, "buy_opened")
     await message.answer(BUY_TEXT, reply_markup=packages_keyboard())
 
 
@@ -655,6 +764,7 @@ async def cb_buy(callback: CallbackQuery) -> None:
         prices=[LabeledPrice(label=f"{pkg['messages']} сообщений", amount=pkg["stars"])],
         provider_token="",
     )
+    db.log_event(callback.from_user.id, "invoice_sent")
 
 
 @router.callback_query(F.data.startswith("buytime:"))
@@ -669,6 +779,37 @@ async def cb_buy_time(callback: CallbackQuery) -> None:
         currency="XTR",
         prices=[LabeledPrice(label=f"Безлимит {pkg['label']}", amount=pkg["stars"])],
         provider_token="",
+    )
+    db.log_event(callback.from_user.id, "invoice_sent")
+
+
+@router.callback_query(F.data.startswith("buysub:"))
+async def cb_buy_subscription(callback: CallbackQuery) -> None:
+    await callback.answer()
+    # Telegram Stars subscriptions can only be created via createInvoiceLink
+    # (send_invoice/answer_invoice has no subscription_period parameter at
+    # all) — the link is then handed to the user as a "Pay" button rather
+    # than opening the payment sheet directly like the one-off invoices above.
+    link = await callback.bot.create_invoice_link(
+        title="Подписка на месяц",
+        description="Безлимитный доступ ко всем сообщениям на 30 дней, автопродление через Telegram Stars.",
+        payload=f"subscription:{PRICE_VERSION}:0",
+        currency="XTR",
+        prices=[LabeledPrice(label="Подписка на месяц", amount=SUBSCRIPTION["stars"])],
+        subscription_period=SUBSCRIPTION_PERIOD_SECONDS,
+        provider_token="",
+    )
+    db.log_event(callback.from_user.id, "invoice_sent")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"⭐ Оплатить {SUBSCRIPTION['stars']}", url=link)]
+        ]
+    )
+    await callback.message.answer(
+        f"⭐ <b>Подписка на месяц — {SUBSCRIPTION['stars']} ⭐/мес</b>\n\n"
+        "Безлимитный доступ ко всем сообщениям, автопродление каждые 30 дней. "
+        "Отменить в любой момент можно в «Баланс».",
+        reply_markup=kb,
     )
 
 
@@ -729,7 +870,12 @@ async def process_successful_payment(message: Message) -> None:
         return
 
     kind = parsed[0]
-    amount = pkg["messages"] if kind == "messages" else pkg["minutes"]
+    if kind == "messages":
+        amount = pkg["messages"]
+    elif kind == "unlimited":
+        amount = pkg["minutes"]
+    else:
+        amount = pkg["days"]
     outcome, result = db.record_payment_and_credit(user_id, username, kind, stars, charge_id, amount)
 
     if outcome == "duplicate":
@@ -739,6 +885,8 @@ async def process_successful_payment(message: Message) -> None:
         await message.answer("Этот платёж уже был обработан ранее — повторного начисления не будет.")
         return
 
+    db.log_event(user_id, "paid")
+
     if kind == "unlimited":
         until_local = _format_local_time(result)
         await message.answer(
@@ -747,9 +895,52 @@ async def process_successful_payment(message: Message) -> None:
         )
         return
 
+    if kind == "subscription":
+        until_local = _format_local_time(result)
+        await message.answer(
+            f"✅ Подписка активирована! Действует до <b>{until_local}</b>, дальше продлится "
+            f"автоматически. Отменить можно в любой момент в «Баланс»."
+        )
+        return
+
     await message.answer(
         f"✅ Оплата получена! Начислено <b>{amount}</b> сообщений.\n"
         f"Доступно докупленных сообщений: <b>{result}</b>."
+    )
+
+
+@router.callback_query(F.data == "subscription:toggle")
+async def cb_subscription_toggle(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    username = callback.from_user.username
+    status = db.get_status(user_id, username)
+    if not status["subscription_until"]:
+        await callback.answer("Подписка сейчас не активна.", show_alert=True)
+        return
+
+    charge_id = db.get_active_subscription_charge_id(user_id)
+    if not charge_id:
+        await callback.answer(
+            "Не найден платёж этой подписки — обратись в поддержку.", show_alert=True
+        )
+        return
+
+    want_cancel = status["subscription_status"] != "canceled"
+    try:
+        ok = await callback.bot.edit_user_star_subscription(
+            user_id=user_id, telegram_payment_charge_id=charge_id, is_canceled=want_cancel
+        )
+    except TelegramBadRequest as e:
+        await callback.answer(f"Telegram отклонил запрос: {e}", show_alert=True)
+        return
+    if not ok:
+        await callback.answer("Telegram вернул отказ по запросу.", show_alert=True)
+        return
+
+    db.set_subscription_status(user_id, "canceled" if want_cancel else "active")
+    await callback.answer("Подписка отменена." if want_cancel else "Подписка возобновлена.")
+    await _edit_or_send(
+        callback, _balance_text(user_id, username), _balance_keyboard(user_id, username)
     )
 
 
@@ -911,6 +1102,7 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
+            [InlineKeyboardButton(text="📈 Воронка покупок", callback_data="admin:funnel")],
             [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users:0")],
         ]
     )
@@ -955,6 +1147,43 @@ async def cb_admin_stats(callback: CallbackQuery) -> None:
         inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin:menu")]]
     )
     await _edit_or_send(callback, _admin_stats_text(), kb)
+
+
+def _admin_funnel_text() -> str:
+    stats = db.get_funnel_stats()
+
+    def pct(part: int, whole: int) -> str:
+        return f"{part / whole * 100:.0f}%" if whole else "—"
+
+    def block(label: str, counts: dict) -> str:
+        opened = counts["buy_opened"]
+        invoiced = counts["invoice_sent"]
+        paid = counts["paid"]
+        return (
+            f"<b>{label}</b>\n"
+            f"Открыли покупку: <b>{opened}</b>\n"
+            f"Получили инвойс: <b>{invoiced}</b> ({pct(invoiced, opened)} от открывших)\n"
+            f"Оплатили: <b>{paid}</b> ({pct(paid, invoiced)} от получивших инвойс, "
+            f"{pct(paid, opened)} от открывших)\n"
+        )
+
+    return (
+        "📈 <b>Воронка покупок</b> (уникальные пользователи)\n\n"
+        f"{block('Сегодня', stats['today'])}\n"
+        f"{block('За 7 дней', stats['week'])}"
+    )
+
+
+@router.callback_query(F.data == "admin:funnel")
+async def cb_admin_funnel(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.answer()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin:menu")]]
+    )
+    await _edit_or_send(callback, _admin_funnel_text(), kb)
 
 
 def admin_users_keyboard(page: int, total: int, users: list[tuple]) -> InlineKeyboardMarkup:
