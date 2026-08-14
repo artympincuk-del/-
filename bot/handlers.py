@@ -45,6 +45,8 @@ from bot.config import (
     REFERRAL_DAILY_CAP,
     REFERRAL_MIN_MESSAGES,
     REFERRAL_SIGNUP_BONUS,
+    SUBSCRIPTION_DAILY_MESSAGES,
+    SUBSCRIPTION_DAILY_PREMIUM_MESSAGES,
     VISION_MODEL,
 )
 from bot.payments import (
@@ -317,6 +319,21 @@ def model_keyboard(current_pref: str, current_choice: str) -> InlineKeyboardMark
 
 
 def quota_denied_text(status: dict) -> str:
+    if status.get("limit_source") == "subscription":
+        tz_abbr = datetime.datetime.now(_QUOTA_TZINFO).strftime("%Z")
+        if status["model_pref"] == "premium":
+            return (
+                f"Дневной лимит подписки на премиум-запросы исчерпан "
+                f"({status['premium_used_today']}/{SUBSCRIPTION_DAILY_PREMIUM_MESSAGES}), "
+                f"а докупленных сообщений не хватает. Обновится в 00:00 {tz_abbr}. "
+                "Можно докупить пакет сообщений или час безлимита: /buy — либо "
+                "переключиться на быструю модель: /model"
+            )
+        return (
+            f"Дневной лимит подписки исчерпан ({status['used_today']}/{SUBSCRIPTION_DAILY_MESSAGES} "
+            f"запросов). Обновится в 00:00 {tz_abbr}. Можно докупить пакет сообщений "
+            "или час безлимита: /buy."
+        )
     if status["model_pref"] == "premium":
         return (
             f"Бесплатные премиум-запросы на сегодня закончились "
@@ -358,25 +375,30 @@ async def _apply_referral(message: Message) -> None:
 
 
 async def _credit_referral_progress(bot, user_id: int) -> None:
-    """Call after each real (quota-approved) message a user sends. Bumps
-    their pending-referral progress and pays out the deferred bonus to both
-    sides once REFERRAL_MIN_MESSAGES is reached — gated by
-    REFERRAL_DAILY_CAP per referrer, so a farm of fake accounts can only
-    cash in a handful of referrals per day no matter how many it creates."""
-    result = db.try_credit_referral_message(
-        user_id, REFERRAL_MIN_MESSAGES, REFERRAL_DAILY_CAP, REFERRAL_BONUS_MESSAGES
-    )
-    if result is None:
-        return
+    """Call after each real (quota-approved) message a user sends, and only
+    after the reply has already been sent to that user — this is secondary
+    accounting, never allowed to cost the user their answer. Bumps their
+    pending-referral progress and pays out the deferred bonus to both sides
+    once REFERRAL_MIN_MESSAGES is reached — gated by REFERRAL_DAILY_CAP per
+    referrer, so a farm of fake accounts can only cash in a handful of
+    referrals per day no matter how many it creates."""
     try:
-        await bot.send_message(
-            result["referrer_id"],
-            f"🎉 Приглашённый тобой пользователь написал боту {REFERRAL_MIN_MESSAGES} "
-            f"сообщения(-ий) — начислено <b>{REFERRAL_BONUS_MESSAGES}</b> сообщений! "
-            f"Баланс: {result['referrer_balance']}.",
+        result = db.try_credit_referral_message(
+            user_id, REFERRAL_MIN_MESSAGES, REFERRAL_DAILY_CAP, REFERRAL_BONUS_MESSAGES
         )
+        if result is None:
+            return
+        try:
+            await bot.send_message(
+                result["referrer_id"],
+                f"🎉 Приглашённый тобой пользователь написал боту {REFERRAL_MIN_MESSAGES} "
+                f"сообщения(-ий) — начислено <b>{REFERRAL_BONUS_MESSAGES}</b> сообщений! "
+                f"Баланс: {result['referrer_balance']}.",
+            )
+        except Exception:
+            pass  # referrer may have blocked the bot
     except Exception:
-        pass  # referrer may have blocked the bot
+        logger.exception("Referral credit failed for user_id=%s", user_id)
 
 
 @router.message(Command("start"))
@@ -459,10 +481,11 @@ HELP_TEXT = (
     "решаю, когда стоит поискать в сети, и использую это в ответе.\n"
     "• Заметки: напиши «Запомни: ...» — я буду учитывать это в каждом ответе, даже "
     "после перезапуска. Список — кнопка «Заметки» в меню, удалить — /forget &lt;номер&gt;.\n"
-    "• ⏱ Безлимит на время: в разделе «Баланс» можно купить безлимит на 30 минут, час "
-    "или день — удобно, если нужно решить много задач подряд и не считать сообщения.\n"
-    f"• ⭐ Подписка на месяц ({SUBSCRIPTION['stars']} ⭐) — безлимит с автопродлением, "
-    "отменить можно в любой момент в «Баланс».\n"
+    "• ⏱ Безлимит на время: в разделе «Баланс» можно купить безлимит на 1 час — удобно, "
+    "если нужно решить много задач подряд и не считать сообщения.\n"
+    f"• ⭐ Подписка на месяц ({SUBSCRIPTION['stars']} ⭐) — до {SUBSCRIPTION_DAILY_MESSAGES} "
+    f"быстрых и {SUBSCRIPTION_DAILY_PREMIUM_MESSAGES} премиум-запросов в день, "
+    "автопродление, отменить можно в любой момент в «Баланс».\n"
     "• 🔔 Напоминания (кнопка в меню) — по желанию, раз в сутки в выбранное время. "
     "По умолчанию выключены, никаких рассылок без явного включения.\n"
     "• Под каждым ответом есть кнопки «Подробнее» / «Проще» / «Пример» — не нужно "
@@ -512,13 +535,24 @@ def _balance_text(user_id: int, username: str | None) -> str:
             )
         else:
             subscription_line = f"⭐ <b>Подписка активна, продлится {until_local}</b>.\n\n"
+
+    # An active subscription draws from its own (bigger, but not unlimited)
+    # daily allowance rather than the free tier's — show usage against
+    # whichever one actually applies, not always the free-tier numbers.
+    if status["subscription_until"]:
+        daily_cap, daily_premium_cap = SUBSCRIPTION_DAILY_MESSAGES, SUBSCRIPTION_DAILY_PREMIUM_MESSAGES
+        usage_label = "по подписке сегодня"
+    else:
+        daily_cap, daily_premium_cap = DAILY_FREE_MESSAGES, DAILY_FREE_PREMIUM_MESSAGES
+        usage_label = "бесплатных сегодня"
+
     return (
         f"📊 <b>Баланс</b>\n\n"
         f"{unlimited_line}"
         f"{subscription_line}"
         f"Модель: {model_name}\n"
-        f"Быстрая, бесплатных сегодня: {status['used_today']}/{DAILY_FREE_MESSAGES}\n"
-        f"Премиум, бесплатных сегодня: {status['premium_used_today']}/{DAILY_FREE_PREMIUM_MESSAGES}\n"
+        f"Быстрая, {usage_label}: {status['used_today']}/{daily_cap}\n"
+        f"Премиум, {usage_label}: {status['premium_used_today']}/{daily_premium_cap}\n"
         f"Докупленные сообщения: <b>{status['bonus_credits']}</b>\n\n"
         f"Пополнить прямо здесь — выбери пакет ниже:"
     )
@@ -792,7 +826,10 @@ async def cb_buy_subscription(callback: CallbackQuery) -> None:
     # than opening the payment sheet directly like the one-off invoices above.
     link = await callback.bot.create_invoice_link(
         title="Подписка на месяц",
-        description="Безлимитный доступ ко всем сообщениям на 30 дней, автопродление через Telegram Stars.",
+        description=(
+            f"До {SUBSCRIPTION_DAILY_MESSAGES} быстрых и {SUBSCRIPTION_DAILY_PREMIUM_MESSAGES} "
+            "премиум-запросов в день на 30 дней, автопродление через Telegram Stars."
+        ),
         payload=f"subscription:{PRICE_VERSION}:0",
         currency="XTR",
         prices=[LabeledPrice(label="Подписка на месяц", amount=SUBSCRIPTION["stars"])],
@@ -807,7 +844,8 @@ async def cb_buy_subscription(callback: CallbackQuery) -> None:
     )
     await callback.message.answer(
         f"⭐ <b>Подписка на месяц — {SUBSCRIPTION['stars']} ⭐/мес</b>\n\n"
-        "Безлимитный доступ ко всем сообщениям, автопродление каждые 30 дней. "
+        f"До {SUBSCRIPTION_DAILY_MESSAGES} быстрых и {SUBSCRIPTION_DAILY_PREMIUM_MESSAGES} "
+        "премиум-запросов в день, автопродление каждые 30 дней. "
         "Отменить в любой момент можно в «Баланс».",
         reply_markup=kb,
     )
@@ -1490,18 +1528,31 @@ async def _answer_text_query(
         reply_text = await ai.ask_ai(
             history, text, model, notes=notes, reasoning_effort=reasoning_effort, enable_search=True
         )
+        elapsed = time.monotonic() - t0
+
+        db.log_message(user_id, username, "user", text)
+        db.log_message(user_id, username, "assistant", reply_text)
+        db.append_dialog_turn(user_id, text, reply_text, MAX_HISTORY_TURNS)
+
+        footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · {opt['label']}</i>"
+        await _send_long(message, reply_text + footer, reply_markup=quick_actions_keyboard())
     except ai.AIError as e:
+        # The request already cost a message/credit above — an error means
+        # the user got nothing for it, so give it back rather than making
+        # them pay again to retry.
+        db.refund_consumed_message(user_id, status["consumed"])
         await message.answer(e.user_message)
         return
-    elapsed = time.monotonic() - t0
+    except Exception:
+        db.refund_consumed_message(user_id, status["consumed"])
+        raise
 
-    db.log_message(user_id, username, "user", text)
-    db.log_message(user_id, username, "assistant", reply_text)
-    db.append_dialog_turn(user_id, text, reply_text, MAX_HISTORY_TURNS)
-    await _credit_referral_progress(message.bot, user_id)
-
-    footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · {opt['label']}</i>"
-    await _send_long(message, reply_text + footer, reply_markup=quick_actions_keyboard())
+    # Referral bonus accounting is secondary to the reply above — a bug here
+    # must never eat the response the user already paid a message for.
+    try:
+        await _credit_referral_progress(message.bot, user_id)
+    except Exception:
+        logger.exception("Referral credit progress failed for user_id=%s", user_id)
 
 
 async def _process_text_query(message: Message, state: FSMContext, text: str) -> None:
@@ -1640,10 +1691,12 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
             reader = PdfReader(file_buf)
             doc_text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
         except Exception:
+            db.refund_consumed_message(user_id, status["consumed"])
             await message.answer("Не удалось прочитать PDF. Возможно, файл повреждён.")
             return
 
         if not doc_text:
+            db.refund_consumed_message(user_id, status["consumed"])
             await message.answer(
                 "В этом PDF нет текстового слоя (похоже на скан без OCR). "
                 "Пришлите страницы как фото — так я смогу распознать текст."
@@ -1672,23 +1725,36 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
             reply_text = await ai.ask_ai(
                 history, prompt, model, notes=notes, reasoning_effort=reasoning_effort
             )
+
+            short_ref = f"[документ «{filename}»] {caption}"
+            db.log_message(user_id, username, "user", short_ref)
+            db.log_message(user_id, username, "assistant", reply_text)
+
+            # Keep a capped excerpt (not the full doc — history gets replayed
+            # on every future turn) so follow-up questions about the same
+            # PDF still have some content to work with without re-uploading it.
+            MAX_DOC_HISTORY_CHARS = 2000
+            history_entry = f"[Документ «{filename}»] {caption}\n\n{doc_text[:MAX_DOC_HISTORY_CHARS]}"
+            db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
+
+            await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
         except ai.AIError as e:
+            # The request already cost a message/credit above — an error
+            # means the user got nothing for it, so give it back rather than
+            # making them pay again to retry.
+            db.refund_consumed_message(user_id, status["consumed"])
             await message.answer(e.user_message)
             return
+        except Exception:
+            db.refund_consumed_message(user_id, status["consumed"])
+            raise
 
-        short_ref = f"[документ «{filename}»] {caption}"
-        db.log_message(user_id, username, "user", short_ref)
-        db.log_message(user_id, username, "assistant", reply_text)
-
-        # Keep a capped excerpt (not the full doc — history gets replayed on
-        # every future turn) so follow-up questions about the same PDF still
-        # have some content to work with without re-uploading it.
-        MAX_DOC_HISTORY_CHARS = 2000
-        history_entry = f"[Документ «{filename}»] {caption}\n\n{doc_text[:MAX_DOC_HISTORY_CHARS]}"
-        db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
-        await _credit_referral_progress(message.bot, user_id)
-
-        await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
+        # Referral bonus accounting is secondary to the reply above — a bug
+        # here must never eat the response the user already paid a message for.
+        try:
+            await _credit_referral_progress(message.bot, user_id)
+        except Exception:
+            logger.exception("Referral credit progress failed for user_id=%s", user_id)
 
 
 @router.message(F.photo)
@@ -1723,6 +1789,7 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
     try:
         image_bytes = _prepare_image(file_buf.read())
     except Exception:
+        db.refund_consumed_message(user_id, status["consumed"])
         await message.answer("Не удалось обработать изображение. Попробуйте другое фото.")
         return
     image_b64 = base64.b64encode(image_bytes).decode()
@@ -1762,6 +1829,10 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
     try:
         vision_text = await ai.ask_ai([], transcription_request, VISION_MODEL, max_tokens=3000)
     except ai.AIError as e:
+        # The request already cost a message/credit above — an error means
+        # the user got nothing for it, so give it back rather than making
+        # them pay again to retry.
+        db.refund_consumed_message(user_id, status["consumed"])
         await status_msg.edit_text(e.user_message)
         return
 
@@ -1788,6 +1859,7 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
             history, solve_prompt, PREMIUM_MODEL, notes=notes, reasoning_effort="high", max_tokens=6144
         )
     except ai.AIError as e:
+        db.refund_consumed_message(user_id, status["consumed"])
         await status_msg.edit_text(e.user_message)
         return
 
@@ -1796,19 +1868,32 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
     except TelegramBadRequest:
         pass
 
-    db.log_message(user_id, username, "user", f"[фото] {caption}")
-    db.log_message(user_id, username, "assistant", reply_text)
+    try:
+        db.log_message(user_id, username, "user", f"[фото] {caption}")
+        db.log_message(user_id, username, "assistant", reply_text)
 
-    # Store the actual description (not just the caption) so a follow-up
-    # text question like "а второе задание?" still has something to work
-    # with — vision_text is already short (stage 1 is tuned for brevity),
-    # so it's safe to keep in full rather than just a placeholder.
-    history_entry = f"[Фото] {caption}\n\nСодержимое фото: {vision_text}"
-    db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
-    await _credit_referral_progress(message.bot, user_id)
+        # Store the actual description (not just the caption) so a follow-up
+        # text question like "а второе задание?" still has something to
+        # work with — vision_text is already short (stage 1 is tuned for
+        # brevity), so it's safe to keep in full rather than just a placeholder.
+        history_entry = f"[Фото] {caption}\n\nСодержимое фото: {vision_text}"
+        db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
 
-    elapsed = time.monotonic() - t0
-    has_check = "✅ Проверка" in reply_text or "Проверка:" in reply_text
-    stage_label = "распознано → решено → проверено" if has_check else "распознано → решено"
-    footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · 🔬 {stage_label}</i>"
-    await _send_long(message, reply_text + footer, reply_markup=quick_actions_keyboard())
+        elapsed = time.monotonic() - t0
+        has_check = "✅ Проверка" in reply_text or "Проверка:" in reply_text
+        stage_label = "распознано → решено → проверено" if has_check else "распознано → решено"
+        footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · 🔬 {stage_label}</i>"
+        await _send_long(message, reply_text + footer, reply_markup=quick_actions_keyboard())
+    except Exception:
+        # Both AI stages already succeeded at this point, but the reply
+        # never actually reached the user — still a wasted request from
+        # their side, so it still gets refunded.
+        db.refund_consumed_message(user_id, status["consumed"])
+        raise
+
+    # Referral bonus accounting is secondary to the reply above — a bug here
+    # must never eat the response the user already paid a message for.
+    try:
+        await _credit_referral_progress(message.bot, user_id)
+    except Exception:
+        logger.exception("Referral credit progress failed for user_id=%s", user_id)

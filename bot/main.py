@@ -7,11 +7,13 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, MenuButtonDefault
+from aiogram.types import BotCommand, ErrorEvent, MenuButtonDefault
 
 from bot import ai, db
 from bot.config import BOT_TOKEN, CHATLOG_RETENTION_DAYS, QUOTA_TZ
 from bot.handlers import REMINDER_MESSAGE_TEXT, router
+
+logger = logging.getLogger(__name__)
 
 _QUOTA_TZINFO = ZoneInfo(QUOTA_TZ)
 
@@ -75,12 +77,57 @@ async def _reminder_loop(bot: Bot) -> None:
             logging.exception("Reminder loop failed")
 
 
+ERROR_USER_MESSAGE = (
+    "⚠️ Что-то пошло не так, попробуй ещё раз. Если повторяется, напиши администратору."
+)
+
+
+async def on_error(event: ErrorEvent) -> None:
+    """Global safety net: without this, any exception that escapes a
+    handler (a bug, a transient failure — anything not already caught
+    where it happened) just vanishes into the log and the user gets no
+    reply at all. ai.AIError is never expected to reach here — every call
+    site that can raise it already catches it locally and shows its own
+    user_message, so this only ever sees genuinely unhandled exceptions.
+    Wrapped so this handler itself can never raise and take the bot down."""
+    try:
+        update = event.update
+        try:
+            update_type = update.event_type
+        except Exception:
+            update_type = "unknown"
+
+        message = update.message
+        callback = update.callback_query
+        user = message.from_user if message is not None else None
+        if user is None and callback is not None:
+            user = callback.from_user
+
+        logger.exception(
+            "Unhandled exception processing update_type=%s user_id=%s",
+            update_type,
+            user.id if user else None,
+            exc_info=event.exception,
+        )
+
+        try:
+            if message is not None:
+                await message.answer(ERROR_USER_MESSAGE)
+            elif callback is not None:
+                await callback.answer(ERROR_USER_MESSAGE, show_alert=True)
+        except Exception:
+            pass  # best-effort — the user just won't get the notice this time
+    except Exception:
+        logger.exception("Error handler itself failed")
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    dp.errors.register(on_error)
 
     await bot.set_my_commands(BOT_COMMANDS)
     await bot.set_chat_menu_button(menu_button=MenuButtonDefault())

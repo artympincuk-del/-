@@ -59,7 +59,17 @@ QUOTA_TZ = os.environ.get("QUOTA_TZ", "Europe/Moscow")
 # Changing it still requires bumping PRICE_VERSION in payments.py in the
 # same deploy, same as any other price change, so an invoice created under
 # the old price gets rejected at pre-checkout rather than under-charging.
-SUBSCRIPTION_PRICE_STARS = int(os.environ.get("SUBSCRIPTION_PRICE_STARS", "499"))
+SUBSCRIPTION_PRICE_STARS = int(os.environ.get("SUBSCRIPTION_PRICE_STARS", "199"))
+
+# An active subscription is NOT unlimited — it draws from its own daily
+# quota (bigger than the free tier, but still a cap), so one heavy user on
+# a flat monthly price can't eat the whole margin. Once this is exhausted
+# for the day, a subscriber falls back to spending bonus_credits like
+# anyone else, same as the free tier does.
+SUBSCRIPTION_DAILY_MESSAGES = int(os.environ.get("SUBSCRIPTION_DAILY_MESSAGES", "30"))
+SUBSCRIPTION_DAILY_PREMIUM_MESSAGES = int(
+    os.environ.get("SUBSCRIPTION_DAILY_PREMIUM_MESSAGES", "15")
+)
 
 ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()

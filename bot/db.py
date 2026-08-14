@@ -3,7 +3,12 @@ import sqlite3
 import threading
 from zoneinfo import ZoneInfo
 
-from bot.config import DB_PATH, QUOTA_TZ
+from bot.config import (
+    DB_PATH,
+    QUOTA_TZ,
+    SUBSCRIPTION_DAILY_MESSAGES,
+    SUBSCRIPTION_DAILY_PREMIUM_MESSAGES,
+)
 
 _QUOTA_TZINFO = ZoneInfo(QUOTA_TZ)
 
@@ -302,10 +307,23 @@ def try_consume_message(
 ) -> tuple[bool, dict]:
     """Atomically consumes quota for one message, based on the player's model_pref.
 
-    'fast' model: free daily quota first, then 1 bonus credit.
-    'premium' model: free daily premium quota first, then `premium_cost` bonus credits.
+    Checked in this order:
+      1. Active time-based unlimited pass (bought by the hour) — genuinely
+         unlimited, nothing touched, since it's already bounded by time.
+      2. Active subscription — draws from the same counters as the free
+         tier, but compared against SUBSCRIPTION_DAILY_MESSAGES /
+         SUBSCRIPTION_DAILY_PREMIUM_MESSAGES instead of `daily_limit` /
+         `daily_premium_limit` (a subscription is a bigger daily allowance,
+         not true unlimited — one heavy user shouldn't eat the whole
+         margin on a flat monthly price). Falls back to bonus_credits once
+         that's exhausted, same as the free tier does.
+      3. Free tier — free daily quota first (`daily_limit`/
+         `daily_premium_limit`), then bonus_credits.
 
-    Returns (allowed, status) where status mirrors get_status's shape after the attempt.
+    Returns (allowed, status) where status mirrors get_status's shape after
+    the attempt, plus "consumed" (what was taken, for refund_consumed_message)
+    and "limit_source" ("subscription" or "free" — which daily allowance
+    was actually being checked, for quota_denied_text).
     """
     with _lock:
         _ensure_player(user_id, username)
@@ -323,7 +341,9 @@ def try_consume_message(
         unlimited_until = _active_unlimited_until(unlimited_raw)
         subscription_until = _active_unlimited_until(subscription_raw)
 
-        def status(used=used, premium_used=premium_used, bonus=bonus) -> dict:
+        def status(
+            used=used, premium_used=premium_used, bonus=bonus, consumed=None, limit_source="free"
+        ) -> dict:
             return {
                 "used_today": used,
                 "premium_used_today": premium_used,
@@ -333,38 +353,67 @@ def try_consume_message(
                 "model_choice": model_choice,
                 "subscription_until": subscription_until,
                 "subscription_status": subscription_status,
+                # What this call actually took, so a failed request (no
+                # answer produced) can be refunded via refund_consumed_message
+                # instead of silently costing the user a wasted message.
+                "consumed": consumed,
+                # Which daily allowance was actually checked ("subscription"
+                # or "free") — quota_denied_text needs this to explain the
+                # right thing when a subscriber (not a free user) is denied.
+                "limit_source": limit_source,
             }
 
-        if unlimited_until or subscription_until:
-            # Active time pass or subscription: no quota/credits touched at all.
+        if unlimited_until:
+            # Active time pass: no quota/credits touched at all.
             return True, status()
 
+        if subscription_until:
+            effective_daily_limit = SUBSCRIPTION_DAILY_MESSAGES
+            effective_daily_premium_limit = SUBSCRIPTION_DAILY_PREMIUM_MESSAGES
+            limit_source = "subscription"
+        else:
+            effective_daily_limit = daily_limit
+            effective_daily_premium_limit = daily_premium_limit
+            limit_source = "free"
+
         if model_pref == "premium":
-            if premium_used < daily_premium_limit:
+            if premium_used < effective_daily_premium_limit:
                 _conn.execute(
                     "UPDATE players SET premium_messages_used_today = premium_messages_used_today + 1 "
                     "WHERE user_id = ?",
                     (user_id,),
                 )
                 _conn.commit()
-                return True, status(premium_used=premium_used + 1)
+                return True, status(
+                    premium_used=premium_used + 1,
+                    consumed={"bucket": "premium_quota", "amount": 1},
+                    limit_source=limit_source,
+                )
 
             if bonus < premium_cost:
-                return False, status()
+                return False, status(limit_source=limit_source)
             _conn.execute(
                 "UPDATE players SET bonus_credits = bonus_credits - ? WHERE user_id = ?",
                 (premium_cost, user_id),
             )
             _conn.commit()
-            return True, status(bonus=bonus - premium_cost)
+            return True, status(
+                bonus=bonus - premium_cost,
+                consumed={"bucket": "bonus_credits", "amount": premium_cost},
+                limit_source=limit_source,
+            )
 
-        if used < daily_limit:
+        if used < effective_daily_limit:
             _conn.execute(
                 "UPDATE players SET messages_used_today = messages_used_today + 1 WHERE user_id = ?",
                 (user_id,),
             )
             _conn.commit()
-            return True, status(used=used + 1)
+            return True, status(
+                used=used + 1,
+                consumed={"bucket": "fast_quota", "amount": 1},
+                limit_source=limit_source,
+            )
 
         if bonus > 0:
             _conn.execute(
@@ -372,9 +421,43 @@ def try_consume_message(
                 (user_id,),
             )
             _conn.commit()
-            return True, status(bonus=bonus - 1)
+            return True, status(
+                bonus=bonus - 1,
+                consumed={"bucket": "bonus_credits", "amount": 1},
+                limit_source=limit_source,
+            )
 
-        return False, status()
+        return False, status(limit_source=limit_source)
+
+
+def refund_consumed_message(user_id: int, consumed: dict | None) -> None:
+    """Reverses exactly what a try_consume_message() call took, for a
+    request that consumed quota/credits but failed before producing an
+    answer — so a Groq error, a bug, or any other failure doesn't cost the
+    user a message they got nothing for. No-op if nothing was actually
+    consumed (e.g. the user was on an active unlimited pass/subscription)."""
+    if not consumed:
+        return
+    bucket, amount = consumed["bucket"], consumed["amount"]
+    with _lock:
+        if bucket == "fast_quota":
+            _conn.execute(
+                "UPDATE players SET messages_used_today = MAX(0, messages_used_today - ?) "
+                "WHERE user_id = ?",
+                (amount, user_id),
+            )
+        elif bucket == "premium_quota":
+            _conn.execute(
+                "UPDATE players SET premium_messages_used_today = "
+                "MAX(0, premium_messages_used_today - ?) WHERE user_id = ?",
+                (amount, user_id),
+            )
+        elif bucket == "bonus_credits":
+            _conn.execute(
+                "UPDATE players SET bonus_credits = bonus_credits + ? WHERE user_id = ?",
+                (amount, user_id),
+            )
+        _conn.commit()
 
 
 def add_bonus_credits(user_id: int, username: str | None, amount: int) -> int:
@@ -1017,7 +1100,7 @@ def try_credit_referral_message(
                 "INSERT INTO players (user_id, username, quota_date, messages_used_today, "
                 "bonus_credits, model_pref, last_active_at) VALUES (?, NULL, ?, 0, 0, 'fast', ?) "
                 "ON CONFLICT(user_id) DO NOTHING",
-                (uid, today, now),
+                (uid, _today(), now),
             )
         _conn.execute(
             "UPDATE players SET bonus_credits = bonus_credits + ? WHERE user_id = ?",
