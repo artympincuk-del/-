@@ -36,6 +36,18 @@ REFERRAL_DAILY_CAP = int(os.environ.get("REFERRAL_DAILY_CAP", "5"))
 DB_PATH = os.environ.get("DB_PATH", "assistant.db")
 MAX_HISTORY_TURNS = 10
 
+# Caps how many Groq requests (chat/vision/STT/image-prompt-translation — all
+# of them, from every user) can be in flight at once, so one user firing off
+# ten messages in a row can't burn through the whole free-tier rate limit by
+# itself. Free tier is 30 RPM; a handful of concurrent requests is plenty for
+# normal multi-user load without needlessly serializing everything.
+GROQ_MAX_CONCURRENT = int(os.environ.get("GROQ_MAX_CONCURRENT", "5"))
+
+# Timezone the daily free-message quota resets in, and unlimited-until times
+# are displayed in — IANA name for zoneinfo. UTC would reset at 3am Moscow
+# time, which is confusing for a bot whose users are mostly there.
+QUOTA_TZ = os.environ.get("QUOTA_TZ", "Europe/Moscow")
+
 ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()
 }

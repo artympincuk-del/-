@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import re
 import urllib.parse
 
@@ -7,7 +8,16 @@ import aiohttp
 import groq
 from ddgs import DDGS
 
-from bot.config import FAST_MODEL, GROQ_API_KEY, STT_MODEL
+from bot.config import (
+    FAST_MODEL,
+    GROQ_API_KEY,
+    GROQ_MAX_CONCURRENT,
+    PREMIUM_MODEL,
+    STT_MODEL,
+    VISION_MODEL,
+)
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "Ты дружелюбный и полезный AI-ассистент внутри Telegram-бота. "
@@ -54,6 +64,12 @@ SEARCH_TOOL_SCHEMA = [
 ]
 
 _client = groq.AsyncGroq(api_key=GROQ_API_KEY)
+# Guards every actual Groq API call in this module (chat completions, STT,
+# image-prompt translation) — a single user firing off several messages at
+# once can't run more than GROQ_MAX_CONCURRENT requests against Groq
+# simultaneously, which would otherwise burn through the shared free-tier
+# rate limit for everyone.
+_groq_semaphore = asyncio.Semaphore(GROQ_MAX_CONCURRENT)
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _UNCLOSED_THINK_RE = re.compile(r"<think>.*", re.DOTALL)
@@ -155,7 +171,8 @@ async def _complete_once(
     # model that keeps wanting to search can't loop forever.
     for _round in range(3):
         try:
-            response = await _client.chat.completions.create(**kwargs)
+            async with _groq_semaphore:
+                response = await _client.chat.completions.create(**kwargs)
         except groq.APIStatusError as e:
             if e.status_code == 413:
                 raise AIError(
@@ -246,11 +263,12 @@ async def ask_ai(
 
 async def transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
     try:
-        transcription = await _client.audio.transcriptions.create(
-            file=(filename, audio_bytes),
-            model=STT_MODEL,
-            response_format="text",
-        )
+        async with _groq_semaphore:
+            transcription = await _client.audio.transcriptions.create(
+                file=(filename, audio_bytes),
+                model=STT_MODEL,
+                response_format="text",
+            )
     except groq.APIStatusError as e:
         raise AIError(
             f"Groq STT error: {e.status_code}",
@@ -298,7 +316,8 @@ async def _translate_for_image(prompt: str) -> str:
         kwargs["reasoning_effort"] = "low"
         kwargs["include_reasoning"] = False
     try:
-        response = await _client.chat.completions.create(**kwargs)
+        async with _groq_semaphore:
+            response = await _client.chat.completions.create(**kwargs)
         translated = _strip_thinking(response.choices[0].message.content or "").strip()
         return translated or prompt
     except Exception:
@@ -327,3 +346,32 @@ async def generate_image(prompt: str, width: int = 1024, height: int = 1024) -> 
             f"Image gen connection error: {e}",
             user_message="Не удалось сгенерировать изображение. Попробуйте ещё раз.",
         ) from e
+
+
+async def check_configured_models() -> None:
+    """Queries Groq's model list once at startup and logs a clear warning
+    for any configured model id that Groq doesn't actually offer — without
+    this, a typo'd/decommissioned model id only surfaces at runtime, as a
+    confusing API error on the first photo or voice message that needs it
+    (STT_MODEL, VISION_MODEL) rather than at deploy time."""
+    configured = {
+        "FAST_MODEL": FAST_MODEL,
+        "PREMIUM_MODEL": PREMIUM_MODEL,
+        "VISION_MODEL": VISION_MODEL,
+        "STT_MODEL": STT_MODEL,
+    }
+    try:
+        response = await _client.models.list()
+    except Exception as e:
+        logger.warning("Could not verify model availability with Groq at startup: %s", e)
+        return
+
+    available = {m.id for m in response.data}
+    for setting_name, model_id in configured.items():
+        if model_id not in available:
+            logger.warning(
+                "Configured %s=%r is not in Groq's current model list — requests using it "
+                "will fail at runtime. Check for a typo or a decommissioned model id.",
+                setting_name,
+                model_id,
+            )

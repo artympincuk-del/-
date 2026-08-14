@@ -1,8 +1,11 @@
+import asyncio
 import base64
+import datetime
 import io
 import logging
 import re
 import time
+from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.enums import ChatMemberStatus
@@ -37,6 +40,7 @@ from bot.config import (
     PREMIUM_CREDIT_COST,
     PREMIUM_MODEL,
     PREMIUM_REASONING_EFFORT,
+    QUOTA_TZ,
     REFERRAL_BONUS_MESSAGES,
     REFERRAL_DAILY_CAP,
     REFERRAL_MIN_MESSAGES,
@@ -134,6 +138,34 @@ def persistent_keyboard() -> ReplyKeyboardMarkup:
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+_QUOTA_TZINFO = ZoneInfo(QUOTA_TZ)
+
+
+def _format_local_time(utc_iso: str) -> str:
+    """Converts a naive-UTC timestamp (as stored in the DB, e.g.
+    unlimited_until) to a QUOTA_TZ-local display string — previously shown
+    as raw UTC, which reads three hours off for Moscow-timezone users."""
+    dt_utc = datetime.datetime.fromisoformat(utc_iso).replace(tzinfo=datetime.timezone.utc)
+    return dt_utc.astimezone(_QUOTA_TZINFO).strftime("%Y-%m-%d %H:%M %Z")
+
+
+# Per-user lock so a user firing off several messages in a row gets them
+# processed one at a time instead of N concurrent Groq requests each — used
+# only at top-level message/callback entry points (never inside a shared
+# helper that's already called from behind one of these, or it'd deadlock:
+# asyncio.Lock isn't reentrant).
+_user_locks: dict[int, asyncio.Lock] = {}
+BUSY_TEXT = "⏳ Дождись ответа на предыдущее сообщение."
+
+
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    lock = _user_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_locks[user_id] = lock
+    return lock
 
 
 _bot_username_cache: str | None = None
@@ -451,8 +483,8 @@ def _balance_text(user_id: int, username: str | None) -> str:
     model_name = _model_option(status)["label"]
     unlimited_line = ""
     if status["unlimited_until"]:
-        until_local = status["unlimited_until"].replace("T", " ")
-        unlimited_line = f"⏱ <b>Безлимит активен до {until_local} (UTC)</b> — лимиты ниже не расходуются.\n\n"
+        until_local = _format_local_time(status["unlimited_until"])
+        unlimited_line = f"⏱ <b>Безлимит активен до {until_local}</b> — лимиты ниже не расходуются.\n\n"
     return (
         f"📊 <b>Баланс</b>\n\n"
         f"{unlimited_line}"
@@ -704,9 +736,9 @@ async def process_successful_payment(message: Message) -> None:
         return
 
     if kind == "unlimited":
-        until_local = result.replace("T", " ")
+        until_local = _format_local_time(result)
         await message.answer(
-            f"✅ Оплата получена! Безлимит активирован до <b>{until_local}</b> (UTC).\n"
+            f"✅ Оплата получена! Безлимит активирован до <b>{until_local}</b>.\n"
             f"Все сообщения без ограничений, пока безлимит активен."
         )
         return
@@ -816,7 +848,12 @@ async def btn_image_text(message: Message, state: FSMContext) -> None:
 @router.message(Form.waiting_for_image_prompt, F.text & ~F.text.startswith("/"))
 async def handle_image_prompt_state(message: Message, state: FSMContext) -> None:
     await state.set_state(None)  # clear pending state only, keep conversation history
-    await _process_image_request(message, message.text)
+    lock = _get_user_lock(message.from_user.id)
+    if lock.locked():
+        await message.answer(BUSY_TEXT)
+        return
+    async with lock:
+        await _process_image_request(message, message.text)
 
 
 @router.message(Command("remember"))
@@ -963,7 +1000,7 @@ def _admin_user_text(p: dict, payments: list[tuple]) -> str:
         f"Докупленных сообщений: <b>{p['bonus_credits']}</b>",
     ]
     if p["unlimited_until"]:
-        lines.append(f"Безлимит до: {p['unlimited_until'].replace('T', ' ')} (UTC)")
+        lines.append(f"Безлимит до: {_format_local_time(p['unlimited_until'])}")
     lines.append(f"Последняя активность: {p['last_active_at']}")
 
     if payments:
@@ -1283,9 +1320,14 @@ async def cb_quick_action(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     if not instruction:
         return
-    await _answer_text_query(
-        callback.message, state, instruction, callback.from_user.id, callback.from_user.username
-    )
+    lock = _get_user_lock(callback.from_user.id)
+    if lock.locked():
+        await callback.message.answer(BUSY_TEXT)
+        return
+    async with lock:
+        await _answer_text_query(
+            callback.message, state, instruction, callback.from_user.id, callback.from_user.username
+        )
 
 
 @router.message(F.text & ~F.text.startswith("/"))
@@ -1295,7 +1337,12 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
     text = await _strip_mention(message, message.text)
     if not text:
         return
-    await _process_text_query(message, state, text)
+    lock = _get_user_lock(message.from_user.id)
+    if lock.locked():
+        await message.answer(BUSY_TEXT)
+        return
+    async with lock:
+        await _process_text_query(message, state, text)
 
 
 @router.message(F.voice)
@@ -1303,20 +1350,26 @@ async def handle_voice_message(message: Message, state: FSMContext) -> None:
     if not await _should_respond_in_group(message):
         return
 
-    file_buf = await message.bot.download(message.voice.file_id)
-    try:
-        text = await ai.transcribe_audio(file_buf.read())
-    except ai.AIError as e:
-        await message.answer(e.user_message)
+    lock = _get_user_lock(message.from_user.id)
+    if lock.locked():
+        await message.answer(BUSY_TEXT)
         return
 
-    text = text.strip()
-    if not text:
-        await message.answer("Не удалось разобрать голосовое сообщение. Попробуйте ещё раз.")
-        return
+    async with lock:
+        file_buf = await message.bot.download(message.voice.file_id)
+        try:
+            text = await ai.transcribe_audio(file_buf.read())
+        except ai.AIError as e:
+            await message.answer(e.user_message)
+            return
 
-    await message.answer(f"🎙 <i>Распознано:</i> {text}")
-    await _process_text_query(message, state, text)
+        text = text.strip()
+        if not text:
+            await message.answer("Не удалось разобрать голосовое сообщение. Попробуйте ещё раз.")
+            return
+
+        await message.answer(f"🎙 <i>Распознано:</i> {text}")
+        await _process_text_query(message, state, text)
 
 
 MAX_PDF_CHARS = 20000
@@ -1336,74 +1389,88 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
         await message.answer("Пока умею читать только PDF. Пришлите документ в формате .pdf.")
         return
 
-    allowed, status = db.try_consume_message(
-        user_id, username, DAILY_FREE_MESSAGES, DAILY_FREE_PREMIUM_MESSAGES, PREMIUM_CREDIT_COST
-    )
-    if not allowed:
-        await message.answer(quota_denied_text(status))
+    lock = _get_user_lock(user_id)
+    if lock.locked():
+        await message.answer(BUSY_TEXT)
         return
 
-    file_buf = await message.bot.download(doc.file_id)
-    try:
-        reader = PdfReader(file_buf)
-        doc_text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
-    except Exception:
-        await message.answer("Не удалось прочитать PDF. Возможно, файл повреждён.")
-        return
-
-    if not doc_text:
-        await message.answer(
-            "В этом PDF нет текстового слоя (похоже на скан без OCR). "
-            "Пришлите страницы как фото — так я смогу распознать текст."
+    async with lock:
+        allowed, status = db.try_consume_message(
+            user_id, username, DAILY_FREE_MESSAGES, DAILY_FREE_PREMIUM_MESSAGES, PREMIUM_CREDIT_COST
         )
-        return
+        if not allowed:
+            await message.answer(quota_denied_text(status))
+            return
 
-    truncated = len(doc_text) > MAX_PDF_CHARS
-    doc_text = doc_text[:MAX_PDF_CHARS]
+        file_buf = await message.bot.download(doc.file_id)
+        try:
+            reader = PdfReader(file_buf)
+            doc_text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+        except Exception:
+            await message.answer("Не удалось прочитать PDF. Возможно, файл повреждён.")
+            return
 
-    caption = await _strip_mention(message, message.caption) or "Кратко перескажи документ и выдели главное."
-    prompt = (
-        f"Пользователь прислал PDF «{filename}» ({len(reader.pages)} стр."
-        f"{', показана только часть текста' if truncated else ''}). Содержимое документа:\n\n"
-        f"{doc_text}\n\n---\nЗадача: {caption}"
-    )
+        if not doc_text:
+            await message.answer(
+                "В этом PDF нет текстового слоя (похоже на скан без OCR). "
+                "Пришлите страницы как фото — так я смогу распознать текст."
+            )
+            return
 
-    opt = _model_option(status)
-    model, reasoning_effort = opt["model"], opt["reasoning"]
-    notes = [content for _id, content in db.list_notes(user_id)]
+        truncated = len(doc_text) > MAX_PDF_CHARS
+        doc_text = doc_text[:MAX_PDF_CHARS]
 
-    history = db.get_dialog_history(user_id, MAX_HISTORY_TURNS)
-
-    await message.bot.send_chat_action(message.chat.id, "typing")
-
-    try:
-        reply_text = await ai.ask_ai(
-            history, prompt, model, notes=notes, reasoning_effort=reasoning_effort
+        caption = await _strip_mention(message, message.caption) or "Кратко перескажи документ и выдели главное."
+        prompt = (
+            f"Пользователь прислал PDF «{filename}» ({len(reader.pages)} стр."
+            f"{', показана только часть текста' if truncated else ''}). Содержимое документа:\n\n"
+            f"{doc_text}\n\n---\nЗадача: {caption}"
         )
-    except ai.AIError as e:
-        await message.answer(e.user_message)
-        return
 
-    short_ref = f"[документ «{filename}»] {caption}"
-    db.log_message(user_id, username, "user", short_ref)
-    db.log_message(user_id, username, "assistant", reply_text)
+        opt = _model_option(status)
+        model, reasoning_effort = opt["model"], opt["reasoning"]
+        notes = [content for _id, content in db.list_notes(user_id)]
 
-    # Keep a capped excerpt (not the full doc — history gets replayed on
-    # every future turn) so follow-up questions about the same PDF still
-    # have some content to work with without re-uploading it.
-    MAX_DOC_HISTORY_CHARS = 2000
-    history_entry = f"[Документ «{filename}»] {caption}\n\n{doc_text[:MAX_DOC_HISTORY_CHARS]}"
-    db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
-    await _credit_referral_progress(message.bot, user_id)
+        history = db.get_dialog_history(user_id, MAX_HISTORY_TURNS)
 
-    await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
+        await message.bot.send_chat_action(message.chat.id, "typing")
+
+        try:
+            reply_text = await ai.ask_ai(
+                history, prompt, model, notes=notes, reasoning_effort=reasoning_effort
+            )
+        except ai.AIError as e:
+            await message.answer(e.user_message)
+            return
+
+        short_ref = f"[документ «{filename}»] {caption}"
+        db.log_message(user_id, username, "user", short_ref)
+        db.log_message(user_id, username, "assistant", reply_text)
+
+        # Keep a capped excerpt (not the full doc — history gets replayed on
+        # every future turn) so follow-up questions about the same PDF still
+        # have some content to work with without re-uploading it.
+        MAX_DOC_HISTORY_CHARS = 2000
+        history_entry = f"[Документ «{filename}»] {caption}\n\n{doc_text[:MAX_DOC_HISTORY_CHARS]}"
+        db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
+        await _credit_referral_progress(message.bot, user_id)
+
+        await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
 
 
 @router.message(F.photo)
 async def handle_photo_message(message: Message, state: FSMContext) -> None:
     if not await _should_respond_in_group(message):
         return
+    lock = _get_user_lock(message.from_user.id)
+    if lock.locked():
+        await message.answer(BUSY_TEXT)
+        return
+    async with lock:
+        await _handle_photo_message_locked(message, state)
 
+
+async def _handle_photo_message_locked(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     username = message.from_user.username
 

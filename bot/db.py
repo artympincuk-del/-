@@ -1,11 +1,22 @@
 import datetime
 import sqlite3
 import threading
+from zoneinfo import ZoneInfo
 
-from bot.config import DB_PATH
+from bot.config import DB_PATH, QUOTA_TZ
+
+_QUOTA_TZINFO = ZoneInfo(QUOTA_TZ)
 
 _lock = threading.Lock()
 _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+# WAL lets readers and the writer avoid blocking each other; busy_timeout
+# makes SQLite retry for up to 5s instead of raising "database is locked"
+# immediately on contention; synchronous=NORMAL is the standard safe
+# pairing with WAL (still durable across app crashes, just not against an
+# OS-level power loss mid-write, which is an acceptable tradeoff here).
+_conn.execute("PRAGMA journal_mode=WAL")
+_conn.execute("PRAGMA busy_timeout=5000")
+_conn.execute("PRAGMA synchronous=NORMAL")
 _conn.execute(
     """
     CREATE TABLE IF NOT EXISTS players (
@@ -130,12 +141,44 @@ _conn.execute(
 _conn.commit()
 
 
+def _utcnow_naive() -> datetime.datetime:
+    """datetime.utcnow() is deprecated (timezone-naive, easy to misuse) —
+    this gets the same value via the timezone-aware API and immediately
+    strips the tzinfo back off. Every timestamp stored/compared in this
+    file has always been a naive UTC ISO string; switching to storing
+    offset-aware strings would silently break comparisons against every
+    row written before this change (mixing naive and aware datetimes
+    raises TypeError), so the on-disk format stays exactly as it was."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
 def _now() -> str:
-    return datetime.datetime.utcnow().isoformat(timespec="seconds")
+    return _utcnow_naive().isoformat(timespec="seconds")
 
 
 def _today() -> str:
-    return datetime.date.today().isoformat()
+    """Calendar date in QUOTA_TZ, not UTC/system time — the daily message
+    quota rolls over at local midnight instead of e.g. 3am Moscow time
+    (which is what UTC midnight was silently doing before)."""
+    return datetime.datetime.now(_QUOTA_TZINFO).date().isoformat()
+
+
+def _today_start_utc() -> str:
+    """The UTC instant of today's midnight in QUOTA_TZ, as a naive-UTC ISO
+    string. Every timestamp column in this file (created_at, last_active_at,
+    paid_at, ...) is naive UTC — bounding a "since today" query with the
+    bare _today() date string would compare a QUOTA_TZ-local calendar day
+    against UTC-local timestamps and drift by the timezone offset near
+    midnight. This converts local midnight to the matching UTC instant so
+    "today" means the same day as _today() everywhere it's used."""
+    local_midnight = datetime.datetime.now(_QUOTA_TZINFO).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return (
+        local_midnight.astimezone(datetime.timezone.utc)
+        .replace(tzinfo=None)
+        .isoformat(timespec="seconds")
+    )
 
 
 def _ensure_player(user_id: int, username: str | None) -> None:
@@ -174,7 +217,7 @@ def _active_unlimited_until(raw: str | None) -> str | None:
         expiry = datetime.datetime.fromisoformat(raw)
     except ValueError:
         return None
-    return raw if expiry > datetime.datetime.utcnow() else None
+    return raw if expiry > _utcnow_naive() else None
 
 
 def get_status(user_id: int, username: str | None) -> dict:
@@ -502,7 +545,7 @@ def activate_unlimited(user_id: int, username: str | None, minutes: int) -> str:
         _ensure_player(user_id, username)
         cur = _conn.execute("SELECT unlimited_until FROM players WHERE user_id = ?", (user_id,))
         (current_raw,) = cur.fetchone()
-        now = datetime.datetime.utcnow()
+        now = _utcnow_naive()
         base = now
         active = _active_unlimited_until(current_raw)
         if active:
@@ -559,7 +602,7 @@ def record_payment_and_credit(
                     "SELECT unlimited_until FROM players WHERE user_id = ?", (user_id,)
                 )
                 (current_raw,) = cur.fetchone()
-                base = datetime.datetime.utcnow()
+                base = _utcnow_naive()
                 active = _active_unlimited_until(current_raw)
                 if active:
                     base = datetime.datetime.fromisoformat(active)
@@ -687,14 +730,14 @@ def refund_payment(charge_id: str) -> dict | None:
 
 def get_admin_stats() -> dict:
     with _lock:
-        today = _today()
-        week_ago = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
+        today_start = _today_start_utc()
+        week_ago = (_utcnow_naive() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
 
         cur = _conn.execute("SELECT COUNT(*) FROM players")
         (total_users,) = cur.fetchone()
 
         cur = _conn.execute(
-            "SELECT COUNT(*) FROM players WHERE last_active_at >= ?", (today,)
+            "SELECT COUNT(*) FROM players WHERE last_active_at >= ?", (today_start,)
         )
         (active_today,) = cur.fetchone()
 
@@ -708,7 +751,7 @@ def get_admin_stats() -> dict:
             )
             return cur.fetchone()
 
-        revenue_today, payments_today = revenue_since(today)
+        revenue_today, payments_today = revenue_since(today_start)
         revenue_7d, payments_7d = revenue_since(week_ago)
         revenue_all, payments_all = revenue_since("")
 
@@ -793,10 +836,10 @@ def try_credit_referral_message(
             _conn.commit()
             return None
 
-        today = _today()
+        today_start = _today_start_utc()
         cur = _conn.execute(
             "SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND status = 'paid' AND paid_at >= ?",
-            (referrer_id, today),
+            (referrer_id, today_start),
         )
         (paid_today,) = cur.fetchone()
         if paid_today >= daily_cap:
@@ -839,3 +882,12 @@ def try_credit_referral_message(
             "referee_id": user_id,
             "referrer_balance": referrer_balance,
         }
+
+
+def close() -> None:
+    """Flushes and closes the SQLite connection — call on graceful shutdown
+    so WAL checkpoint data isn't left stranded and the file lock is
+    released cleanly instead of relying on process teardown."""
+    with _lock:
+        _conn.commit()
+        _conn.close()

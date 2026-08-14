@@ -7,6 +7,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, MenuButtonDefault
 
+from bot import ai, db
 from bot.config import BOT_TOKEN
 from bot.handlers import router
 
@@ -31,9 +32,16 @@ async def main() -> None:
 
     await bot.set_my_commands(BOT_COMMANDS)
     await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+    await ai.check_configured_models()
 
     await bot.delete_webhook(drop_pending_updates=False)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Graceful shutdown: release the Telegram HTTP session and flush/close
+        # the SQLite connection instead of relying on process teardown.
+        await bot.session.close()
+        db.close()
 
 
 if __name__ == "__main__":
