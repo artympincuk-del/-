@@ -1051,13 +1051,22 @@ async def _process_image_request(
         return
 
     await message.bot.send_chat_action(message.chat.id, "upload_photo")
+    status_msg = await message.answer("🎨 <i>Генерирую картинку...</i>")
+    t0 = time.monotonic()
 
     try:
         image_bytes = await ai.generate_image(prompt)
     except ai.AIError as e:
         db.add_bonus_credits(user_id, username, IMAGE_CREDIT_COST)  # refund on failure
-        await message.answer(e.user_message)
+        await status_msg.edit_text(e.user_message)
         return
+
+    try:
+        await status_msg.delete()
+    except TelegramBadRequest:
+        pass
+
+    elapsed = time.monotonic() - t0
 
     db.log_message(user_id, username, "user", f"[генерация картинки] {prompt}")
     db.log_message(user_id, username, "assistant", "[изображение отправлено]")
@@ -1070,7 +1079,7 @@ async def _process_image_request(
 
     await message.answer_photo(
         BufferedInputFile(image_bytes, filename="image.jpg"),
-        caption=f"🎨 {prompt}",
+        caption=f"🎨 {prompt}\n\n⚡ <i>Готово за {elapsed:.1f} сек</i>",
         reply_markup=image_actions_keyboard(),
     )
 
