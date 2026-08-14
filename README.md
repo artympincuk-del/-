@@ -4,6 +4,47 @@ AI-ассистент для Telegram на aiogram 3, использующий G
 модели OpenAI GPT-OSS 20B/120B, плюс Qwen для фото). Есть дневной бесплатный
 лимит сообщений и докупка дополнительных сообщений за Telegram Stars.
 
+## Архитектура (для ИИ/разработчика — читай это вместо всего кода)
+
+Живой бот: `@Paknym_bot` на Railway (сервис `telegram-roulette-bot`, ветка
+`claude/telegram-bot-roulette-vhdyts`, автодеплой не настроен — нужен явный
+`railway service source connect ... && railway up`/пересборка после пуша).
+
+Файлы:
+- **`bot/main.py`** — точка входа: создаёт `Bot`/`Dispatcher` (parse_mode по
+  умолчанию HTML), регистрирует команды меню, запускает polling.
+- **`bot/handlers.py`** — весь Telegram-слой (самый большой файл, >1000
+  строк): все `@router` хендлеры — инлайн-меню, баланс/покупки, заметки,
+  фото/PDF/voice, реферальная система, групповые чаты, админ-панель
+  (`/admin`). Ключевые паттерны:
+  - `MODEL_OPTIONS[(tier, choice)]` — `tier` = `fast`/`premium` (тариф
+    биллинга/квоты), `choice` = `gptoss`/`llama` (какой именно движок
+    Groq); `_model_option(status)` резолвит текущий выбор пользователя.
+  - `_edit_or_send()` — все инлайн-меню редактируют сообщение на месте
+    (не спамят новыми), `parse_mode=None` передаётся явно для экранов с
+    сырым пользовательским текстом (чатлог), чтобы `<`/`&` не ломали HTML.
+  - Фото идёт в два прохода: `VISION_MODEL` (Qwen) только описывает
+    содержимое, затем `PREMIUM_MODEL` с `reasoning_effort="high"` решает —
+    это всегда сильнейшая модель, независимо от выбора пользователя в
+    `/model` (для точности).
+- **`bot/ai.py`** — вся логика Groq API: `ask_ai()` (с ретраем на меньший
+  `reasoning_effort` при обрезании ответа), `generate_image()` (Pollinations
+  + перевод промпта на английский), `transcribe_audio()` (Whisper), поиск в
+  интернете как tool-calling (`search_web`, DuckDuckGo с фолбэком бэкендов).
+- **`bot/db.py`** — SQLite (`players`, `notes`, `chat_log`, `payments`).
+  Важно: `get_status()`/`try_consume_message()` **упсертят** игрока и
+  обновляют `last_active_at` — для read-only админ-обращений использовать
+  `get_player()` (не трогает активность/username). `admin_add_bonus_credits()`
+  — для начислений от админа (не создаёт фантомных строк, не бьёт статистику
+  активности).
+- **`bot/config.py`** — все переменные окружения одним местом (модели,
+  лимиты, `ADMIN_IDS`, `DB_PATH`).
+- **`bot/payments.py`** — пакеты Stars (`PACKAGES` — сообщения,
+  `TIME_PACKAGES` — безлимит по времени) и их клавиатура.
+
+Хранилище — SQLite на Railway Volume (см. «Деплой на Railway» ниже); без
+Volume база сбрасывается при каждом деплое.
+
 ## Меню и команды
 
 Главное меню — инлайн-кнопки (открывается по `/start` или `/menu`):
