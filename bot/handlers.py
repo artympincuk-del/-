@@ -61,7 +61,7 @@ MODEL_OPTIONS = {
     ("fast", "llama"): {
         "model": "llama-3.1-8b-instant",
         "reasoning": None,
-        "label": "🦙 Llama 3.1 8B",
+        "label": "⚡🦙 Llama 3.1 8B",
     },
     ("premium", "gptoss"): {
         "model": PREMIUM_MODEL,
@@ -71,7 +71,7 @@ MODEL_OPTIONS = {
     ("premium", "llama"): {
         "model": "llama-3.3-70b-versatile",
         "reasoning": None,
-        "label": "🦙 Llama 3.3 70B",
+        "label": "💎🦙 Llama 3.3 70B",
     },
 }
 
@@ -454,8 +454,8 @@ async def btn_balance_text(message: Message) -> None:
 
 MODEL_MENU_TEXT = (
     "Выберите модель:\n\n"
-    "⚡/💎 — GPT-OSS (рекомендуется, точнее следует инструкциям)\n"
-    "🦙 — оригинальные модели Llama"
+    "⚡ — быстрый тариф, 💎 — премиум (глубже анализ, свой дневной лимит)\n"
+    "🦙 — оригинальные модели Llama (альтернатива GPT-OSS)"
 )
 
 
