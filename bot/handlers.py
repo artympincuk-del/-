@@ -258,10 +258,10 @@ def model_keyboard(current_pref: str, current_choice: str) -> InlineKeyboardMark
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=label("fast", "gptoss"), callback_data="model:fast:gptoss")],
             [InlineKeyboardButton(text=label("fast", "llama"), callback_data="model:fast:llama")],
-            [InlineKeyboardButton(text=label("premium", "gptoss"), callback_data="model:premium:gptoss")],
+            [InlineKeyboardButton(text=label("fast", "gptoss"), callback_data="model:fast:gptoss")],
             [InlineKeyboardButton(text=label("premium", "llama"), callback_data="model:premium:llama")],
+            [InlineKeyboardButton(text=label("premium", "gptoss"), callback_data="model:premium:gptoss")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")],
         ]
     )
@@ -865,6 +865,7 @@ async def _answer_text_query(
 
     await message.bot.send_chat_action(message.chat.id, "typing")
 
+    t0 = time.monotonic()
     try:
         reply_text = await ai.ask_ai(
             history, text, model, notes=notes, reasoning_effort=reasoning_effort, enable_search=True
@@ -872,6 +873,7 @@ async def _answer_text_query(
     except ai.AIError as e:
         await message.answer(e.user_message)
         return
+    elapsed = time.monotonic() - t0
 
     db.log_message(user_id, username, "user", text)
     db.log_message(user_id, username, "assistant", reply_text)
@@ -883,7 +885,8 @@ async def _answer_text_query(
     history = history[-(2 * 10):]
     await state.update_data(history=history)
 
-    await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
+    footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · {opt['label']}</i>"
+    await _send_long(message, reply_text + footer, reply_markup=quick_actions_keyboard())
 
 
 async def _process_text_query(message: Message, state: FSMContext, text: str) -> None:
