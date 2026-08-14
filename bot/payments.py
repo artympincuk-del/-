@@ -12,14 +12,11 @@ from bot.config import SUBSCRIPTION_DAILY_MESSAGES, SUBSCRIPTION_PRICE_STARS
 # (SUBSCRIPTION_PRICE_STARS itself is the one exception, kept in config.py
 # because it was explicitly asked for as an env-tunable setting — still
 # bump this version in the same deploy whenever that changes.)
-PRICE_VERSION = "v3"
+PRICE_VERSION = "v4"
 
 # Telegram Stars (XTR) packages. "stars" is charged to the user, "messages" is
 # credited to their bonus quota on successful payment.
 PACKAGES = [
-    # Cheapest option, mainly for testing the Stars payment flow end-to-end
-    # without spending much.
-    {"messages": 10, "stars": 10},
     {"messages": 25, "stars": 25},
     {"messages": 100, "stars": 75},
 ]
