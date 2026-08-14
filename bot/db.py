@@ -69,6 +69,27 @@ _conn.execute(
 _conn.execute(
     "CREATE INDEX IF NOT EXISTS idx_dialog_history_user_id ON dialog_history (user_id)"
 )
+# Tracks the deferred-payout state machine for referrals, separate from
+# players.referred_by (which just remembers who invited whom, forever, for
+# idempotency/anti-self-referral). One row per referred user: status starts
+# 'pending' and only flips to 'paid' once message_count clears
+# REFERRAL_MIN_MESSAGES *and* the referrer is still under REFERRAL_DAILY_CAP
+# for the day — see try_credit_referral_message().
+_conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS referrals (
+        user_id INTEGER PRIMARY KEY,
+        referrer_id INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        message_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        paid_at TEXT
+    )
+    """
+)
+_conn.execute(
+    "CREATE INDEX IF NOT EXISTS idx_referrals_referrer_id ON referrals (referrer_id)"
+)
 _conn.commit()
 
 MAX_NOTES_PER_USER = 30
@@ -706,8 +727,10 @@ def get_admin_stats() -> dict:
 
 def set_referrer(user_id: int, referrer_id: int) -> bool:
     """Records who referred this user, but only the first time and never for
-    self-referrals. Returns True iff this call actually set it (i.e. the
-    referral bonus should be paid out); False means already set/invalid."""
+    self-referrals. Returns True iff this call actually set it (i.e. a
+    pending referral should now be registered via register_referral());
+    False means already set/invalid. Doesn't pay anything by itself — see
+    register_referral() and try_credit_referral_message()."""
     if referrer_id == user_id:
         return False
     with _lock:
@@ -720,3 +743,99 @@ def set_referrer(user_id: int, referrer_id: int) -> bool:
         )
         _conn.commit()
         return True
+
+
+def register_referral(user_id: int, referrer_id: int) -> None:
+    """Opens the deferred-payout state for a referral, right after
+    set_referrer() succeeds. Pays nothing — a fake account that never sends
+    a real message never earns anything for its referrer."""
+    with _lock:
+        _conn.execute(
+            "INSERT OR IGNORE INTO referrals (user_id, referrer_id, status, message_count, created_at) "
+            "VALUES (?, ?, 'pending', 0, ?)",
+            (user_id, referrer_id, _now()),
+        )
+        _conn.commit()
+
+
+def try_credit_referral_message(
+    user_id: int, min_messages: int, daily_cap: int, bonus_messages: int
+) -> dict | None:
+    """Call after each real (quota-approved) message a user sends. If this
+    user has a pending referral, bumps its message counter; once it reaches
+    `min_messages`, pays `bonus_messages` to both the referee and the
+    referrer — but only if the referrer hasn't already had `daily_cap`
+    referrals paid out today (a farm of fake accounts can register any
+    number of pending referrals, but can only cash in `daily_cap` of them
+    per day no matter how many accounts it controls). If the cap is full,
+    the referral stays pending and is simply retried on this user's next
+    message — so it pays out naturally once the day rolls over or the
+    referrer's cap frees up, no background job needed.
+
+    Returns a dict describing the payout (for notifying the referrer) if
+    one just happened, else None.
+    """
+    with _lock:
+        cur = _conn.execute(
+            "SELECT referrer_id, message_count FROM referrals WHERE user_id = ? AND status = 'pending'",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        referrer_id, message_count = row
+        message_count += 1
+        _conn.execute(
+            "UPDATE referrals SET message_count = ? WHERE user_id = ?", (message_count, user_id)
+        )
+
+        if message_count < min_messages:
+            _conn.commit()
+            return None
+
+        today = _today()
+        cur = _conn.execute(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND status = 'paid' AND paid_at >= ?",
+            (referrer_id, today),
+        )
+        (paid_today,) = cur.fetchone()
+        if paid_today >= daily_cap:
+            _conn.commit()  # keep the counter bump; still pending, retried next message
+            return None
+
+        now = _now()
+        _conn.execute(
+            "UPDATE referrals SET status = 'paid', paid_at = ? WHERE user_id = ?", (now, user_id)
+        )
+        # Both sides are guaranteed to already have a players row in
+        # practice (the referee via the get_status() call in _apply_referral
+        # before set_referrer(); the referrer because they had to have
+        # started the bot themselves to get an /invite link). Ensured here
+        # defensively too, but via a plain INSERT-if-missing rather than
+        # _ensure_player() — this is a system-triggered credit, not
+        # something either user just did, so it must not bump their
+        # last_active_at the way _ensure_player() would (that would pollute
+        # the "active today" admin stat for the referrer in particular).
+        for uid in (user_id, referrer_id):
+            _conn.execute(
+                "INSERT INTO players (user_id, username, quota_date, messages_used_today, "
+                "bonus_credits, model_pref, last_active_at) VALUES (?, NULL, ?, 0, 0, 'fast', ?) "
+                "ON CONFLICT(user_id) DO NOTHING",
+                (uid, today, now),
+            )
+        _conn.execute(
+            "UPDATE players SET bonus_credits = bonus_credits + ? WHERE user_id = ?",
+            (bonus_messages, user_id),
+        )
+        _conn.execute(
+            "UPDATE players SET bonus_credits = bonus_credits + ? WHERE user_id = ?",
+            (bonus_messages, referrer_id),
+        )
+        _conn.commit()
+        cur = _conn.execute("SELECT bonus_credits FROM players WHERE user_id = ?", (referrer_id,))
+        referrer_balance = cur.fetchone()[0]
+        return {
+            "referrer_id": referrer_id,
+            "referee_id": user_id,
+            "referrer_balance": referrer_balance,
+        }

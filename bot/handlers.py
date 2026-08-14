@@ -38,6 +38,8 @@ from bot.config import (
     PREMIUM_MODEL,
     PREMIUM_REASONING_EFFORT,
     REFERRAL_BONUS_MESSAGES,
+    REFERRAL_DAILY_CAP,
+    REFERRAL_MIN_MESSAGES,
     VISION_MODEL,
 )
 from bot.payments import PACKAGES, PRICE_VERSION, TIME_PACKAGES, packages_keyboard, resolve_package
@@ -286,6 +288,10 @@ def quota_denied_text(status: dict) -> str:
 
 
 async def _apply_referral(message: Message) -> None:
+    """Registers the referral link, but pays nothing yet — anti-abuse: a
+    fake account started via a referral link earns its referrer nothing
+    until it sends REFERRAL_MIN_MESSAGES real messages (see
+    _credit_referral_progress, called from every real-message handler)."""
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].startswith("ref_"):
         return
@@ -297,16 +303,29 @@ async def _apply_referral(message: Message) -> None:
     db.get_status(user_id, message.from_user.username)  # ensure the row exists first
     if not db.set_referrer(user_id, referrer_id):
         return
-    db.add_bonus_credits(user_id, message.from_user.username, REFERRAL_BONUS_MESSAGES)
-    new_balance = db.add_bonus_credits(referrer_id, None, REFERRAL_BONUS_MESSAGES)
+    db.register_referral(user_id, referrer_id)
+
+
+async def _credit_referral_progress(bot, user_id: int) -> None:
+    """Call after each real (quota-approved) message a user sends. Bumps
+    their pending-referral progress and pays out the deferred bonus to both
+    sides once REFERRAL_MIN_MESSAGES is reached — gated by
+    REFERRAL_DAILY_CAP per referrer, so a farm of fake accounts can only
+    cash in a handful of referrals per day no matter how many it creates."""
+    result = db.try_credit_referral_message(
+        user_id, REFERRAL_MIN_MESSAGES, REFERRAL_DAILY_CAP, REFERRAL_BONUS_MESSAGES
+    )
+    if result is None:
+        return
     try:
-        await message.bot.send_message(
-            referrer_id,
-            f"🎉 По твоей ссылке присоединился новый пользователь — начислено "
-            f"<b>{REFERRAL_BONUS_MESSAGES}</b> сообщений! Баланс: {new_balance}.",
+        await bot.send_message(
+            result["referrer_id"],
+            f"🎉 Приглашённый тобой пользователь написал боту {REFERRAL_MIN_MESSAGES} "
+            f"сообщения(-ий) — начислено <b>{REFERRAL_BONUS_MESSAGES}</b> сообщений! "
+            f"Баланс: {result['referrer_balance']}.",
         )
     except Exception:
-        pass  # referrer may have blocked the bot — not worth failing /start over
+        pass  # referrer may have blocked the bot
 
 
 @router.message(Command("start"))
@@ -391,8 +410,8 @@ HELP_TEXT = (
     "или день — удобно, если нужно решить много задач подряд и не считать сообщения.\n"
     "• Под каждым ответом есть кнопки «Подробнее» / «Проще» / «Пример» — не нужно "
     "переписывать вопрос, чтобы уточнить ответ.\n"
-    f"• Пригласи друга (кнопка в меню) — когда он запустит бота по твоей ссылке, вы оба "
-    f"получите по {REFERRAL_BONUS_MESSAGES} сообщений.\n"
+    f"• Пригласи друга (кнопка в меню) — когда он напишет боту {REFERRAL_MIN_MESSAGES} "
+    f"сообщения(-ий), вы оба получите по {REFERRAL_BONUS_MESSAGES} сообщений.\n"
     "• В группах бот отвечает, только если его упомянуть (@username) или ответить на "
     "его сообщение — чтобы не отвечать на каждое сообщение в чате.\n\n"
     "Открыть меню в любой момент — /menu."
@@ -529,8 +548,10 @@ async def _invite_text(bot, user_id: int) -> str:
     link = f"https://t.me/{username}?start=ref_{user_id}"
     return (
         f"🎁 <b>Пригласи друга</b>\n\n"
-        f"Отправь эту ссылку другу — как только он запустит бота по ней, вы "
-        f"<b>оба</b> получите по {REFERRAL_BONUS_MESSAGES} бесплатных сообщений.\n\n"
+        f"Отправь эту ссылку другу. Бонус придёт не сразу: как только друг "
+        f"задаст боту {REFERRAL_MIN_MESSAGES} вопроса(-ов), вы <b>оба</b> получите "
+        f"по {REFERRAL_BONUS_MESSAGES} бесплатных сообщений — это защита от накрутки "
+        f"фейковыми аккаунтами.\n\n"
         f"<code>{link}</code>"
     )
 
@@ -1197,6 +1218,7 @@ async def _answer_text_query(
     db.log_message(user_id, username, "user", text)
     db.log_message(user_id, username, "assistant", reply_text)
     db.append_dialog_turn(user_id, text, reply_text, MAX_HISTORY_TURNS)
+    await _credit_referral_progress(message.bot, user_id)
 
     footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · {opt['label']}</i>"
     await _send_long(message, reply_text + footer, reply_markup=quick_actions_keyboard())
@@ -1362,6 +1384,7 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
     MAX_DOC_HISTORY_CHARS = 2000
     history_entry = f"[Документ «{filename}»] {caption}\n\n{doc_text[:MAX_DOC_HISTORY_CHARS]}"
     db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
+    await _credit_referral_progress(message.bot, user_id)
 
     await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
 
@@ -1472,6 +1495,7 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
     # so it's safe to keep in full rather than just a placeholder.
     history_entry = f"[Фото] {caption}\n\nСодержимое фото: {vision_text}"
     db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
+    await _credit_referral_progress(message.bot, user_id)
 
     elapsed = time.monotonic() - t0
     has_check = "✅ Проверка" in reply_text or "Проверка:" in reply_text
