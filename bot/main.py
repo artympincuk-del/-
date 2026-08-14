@@ -32,7 +32,7 @@ async def main() -> None:
     await bot.set_my_commands(BOT_COMMANDS)
     await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
 
-    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
 
 

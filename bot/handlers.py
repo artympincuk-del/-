@@ -1,5 +1,6 @@
 import base64
 import io
+import logging
 import re
 import time
 
@@ -38,7 +39,9 @@ from bot.config import (
     REFERRAL_BONUS_MESSAGES,
     VISION_MODEL,
 )
-from bot.payments import PACKAGES, TIME_PACKAGES, packages_keyboard
+from bot.payments import PACKAGES, PRICE_VERSION, TIME_PACKAGES, packages_keyboard, resolve_package
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -573,7 +576,10 @@ async def cb_buy(callback: CallbackQuery) -> None:
     await callback.message.answer_invoice(
         title=f"{pkg['messages']} сообщений",
         description="Пополнение лимита сообщений AI-ассистента.",
-        payload=f"messages:{pkg['messages']}",
+        # payload carries the price version + index (not the raw amount), so
+        # pre-checkout can look the package up in the *current* PACKAGES and
+        # reject the invoice if prices changed since it was created.
+        payload=f"messages:{PRICE_VERSION}:{idx}",
         currency="XTR",
         prices=[LabeledPrice(label=f"{pkg['messages']} сообщений", amount=pkg["stars"])],
         provider_token="",
@@ -588,42 +594,91 @@ async def cb_buy_time(callback: CallbackQuery) -> None:
     await callback.message.answer_invoice(
         title=f"Безлимит на {pkg['label']}",
         description="Без ограничения по количеству сообщений на выбранное время.",
-        payload=f"unlimited:{pkg['minutes']}",
+        payload=f"unlimited:{PRICE_VERSION}:{idx}",
         currency="XTR",
         prices=[LabeledPrice(label=f"Безлимит {pkg['label']}", amount=pkg["stars"])],
         provider_token="",
     )
 
 
+def _parse_payload(payload: str) -> tuple[str, str, int] | None:
+    parts = payload.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        return None
+    kind, version, idx_str = parts
+    return kind, version, int(idx_str)
+
+
 @router.pre_checkout_query()
 async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
+    parsed = _parse_payload(pre_checkout_query.invoice_payload)
+    if parsed is None:
+        await pre_checkout_query.answer(
+            ok=False, error_message="Некорректный платёж, оформите покупку заново."
+        )
+        return
+    kind, version, idx = parsed
+    pkg = resolve_package(kind, version, idx)
+    if pkg is None:
+        await pre_checkout_query.answer(
+            ok=False,
+            error_message="Этот пакет уже недействителен (изменились цены) — оформите покупку заново.",
+        )
+        return
+    if pre_checkout_query.total_amount != pkg["stars"]:
+        await pre_checkout_query.answer(
+            ok=False, error_message="Цена не совпадает, оформите покупку заново."
+        )
+        return
     await pre_checkout_query.answer(ok=True)
 
 
 @router.message(F.successful_payment)
 async def process_successful_payment(message: Message) -> None:
-    payload = message.successful_payment.invoice_payload
-    kind, _, value_str = payload.partition(":")
+    sp = message.successful_payment
     user_id = message.from_user.id
     username = message.from_user.username
-    stars = message.successful_payment.total_amount
-    db.log_payment(user_id, username, kind, stars)
+    stars = sp.total_amount
+    charge_id = sp.telegram_payment_charge_id
+
+    # pre_checkout already validated the payload against current PACKAGES, so
+    # this should always resolve — but re-validate defensively rather than
+    # trust a payload blindly this far into the money-already-moved path.
+    parsed = _parse_payload(sp.invoice_payload)
+    pkg = resolve_package(*parsed) if parsed else None
+    if pkg is None:
+        logger.warning(
+            "successful_payment with unresolvable payload=%r charge_id=%s user_id=%s",
+            sp.invoice_payload, charge_id, user_id,
+        )
+        await message.answer(
+            "✅ Оплата получена, но пакет не удалось определить автоматически. "
+            f"Сообщи администратору этот номер платежа: <code>{charge_id}</code>"
+        )
+        return
+
+    kind = parsed[0]
+    amount = pkg["messages"] if kind == "messages" else pkg["minutes"]
+    outcome, result = db.record_payment_and_credit(user_id, username, kind, stars, charge_id, amount)
+
+    if outcome == "duplicate":
+        logger.warning(
+            "Duplicate successful_payment ignored: charge_id=%s user_id=%s", charge_id, user_id
+        )
+        await message.answer("Этот платёж уже был обработан ранее — повторного начисления не будет.")
+        return
 
     if kind == "unlimited":
-        minutes = int(value_str)
-        expiry = db.activate_unlimited(user_id, username, minutes)
-        until_local = expiry.replace("T", " ")
+        until_local = result.replace("T", " ")
         await message.answer(
             f"✅ Оплата получена! Безлимит активирован до <b>{until_local}</b> (UTC).\n"
             f"Все сообщения без ограничений, пока безлимит активен."
         )
         return
 
-    count = int(value_str)
-    new_balance = db.add_bonus_credits(user_id, username, count)
     await message.answer(
-        f"✅ Оплата получена! Начислено <b>{count}</b> сообщений.\n"
-        f"Доступно докупленных сообщений: <b>{new_balance}</b>."
+        f"✅ Оплата получена! Начислено <b>{amount}</b> сообщений.\n"
+        f"Доступно докупленных сообщений: <b>{result}</b>."
     )
 
 
@@ -772,7 +827,7 @@ ADMIN_PAGE_SIZE = 8
 ADMIN_MENU_TEXT = (
     "🔑 <b>Админ-панель</b>\n\n"
     "Команды по-прежнему работают: /grant, /users, /chatlog "
-    "&lt;user_id или @username&gt;."
+    "&lt;user_id или @username&gt;, /refund &lt;telegram_payment_charge_id&gt;."
 )
 
 
@@ -860,7 +915,10 @@ async def cb_admin_users(callback: CallbackQuery) -> None:
     await _edit_or_send(callback, text, admin_users_keyboard(page, total, users))
 
 
-def _admin_user_text(p: dict) -> str:
+ADMIN_RECENT_PAYMENTS = 5
+
+
+def _admin_user_text(p: dict, payments: list[tuple]) -> str:
     name = f"@{p['username']}" if p["username"] else str(p["user_id"])
     lines = [
         f"👤 <b>{name}</b> (id <code>{p['user_id']}</code>)\n",
@@ -872,21 +930,37 @@ def _admin_user_text(p: dict) -> str:
     if p["unlimited_until"]:
         lines.append(f"Безлимит до: {p['unlimited_until'].replace('T', ' ')} (UTC)")
     lines.append(f"Последняя активность: {p['last_active_at']}")
+
+    if payments:
+        lines.append("\n💳 <b>Последние платежи:</b>")
+        for pid, kind, stars, credited, charge_id, status, created_at in payments:
+            mark = "✅" if status == "paid" else "↩️"
+            cid = charge_id or "нет charge_id (платёж до миграции — возврат недоступен)"
+            lines.append(f"#{pid} {mark} {kind} · {stars}⭐ · {created_at}\n   {cid}")
     return "\n".join(lines)
 
 
-def admin_user_keyboard(uid: int, page: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="+10", callback_data=f"admin:grant:{uid}:10:{page}"),
-                InlineKeyboardButton(text="+50", callback_data=f"admin:grant:{uid}:50:{page}"),
-                InlineKeyboardButton(text="-10", callback_data=f"admin:grant:{uid}:-10:{page}"),
-            ],
-            [InlineKeyboardButton(text="💬 Чатлог", callback_data=f"admin:chatlog:{uid}:{page}")],
-            [InlineKeyboardButton(text="◀️ К списку", callback_data=f"admin:users:{page}")],
-        ]
-    )
+def admin_user_keyboard(uid: int, page: int, payments: list[tuple]) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="+10", callback_data=f"admin:grant:{uid}:10:{page}"),
+            InlineKeyboardButton(text="+50", callback_data=f"admin:grant:{uid}:50:{page}"),
+            InlineKeyboardButton(text="-10", callback_data=f"admin:grant:{uid}:-10:{page}"),
+        ],
+        [InlineKeyboardButton(text="💬 Чатлог", callback_data=f"admin:chatlog:{uid}:{page}")],
+    ]
+    for pid, kind, stars, credited, charge_id, status, created_at in payments:
+        if status == "paid" and charge_id:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"↩️ Возврат #{pid} ({stars}⭐)",
+                        callback_data=f"admin:refund:{pid}:{page}",
+                    )
+                ]
+            )
+    rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data=f"admin:users:{page}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.callback_query(F.data.startswith("admin:user:"))
@@ -901,7 +975,8 @@ async def cb_admin_user(callback: CallbackQuery) -> None:
     if p is None:
         await _edit_or_send(callback, "Пользователь не найден.", admin_menu_keyboard())
         return
-    await _edit_or_send(callback, _admin_user_text(p), admin_user_keyboard(uid, page))
+    payments = db.list_recent_payments(uid, ADMIN_RECENT_PAYMENTS)
+    await _edit_or_send(callback, _admin_user_text(p, payments), admin_user_keyboard(uid, page, payments))
 
 
 @router.callback_query(F.data.startswith("admin:grant:"))
@@ -917,7 +992,76 @@ async def cb_admin_grant(callback: CallbackQuery) -> None:
         return
     await callback.answer(f"Готово: {new_balance} сообщений")
     p = db.get_player(uid)
-    await _edit_or_send(callback, _admin_user_text(p), admin_user_keyboard(uid, page))
+    payments = db.list_recent_payments(uid, ADMIN_RECENT_PAYMENTS)
+    await _edit_or_send(callback, _admin_user_text(p, payments), admin_user_keyboard(uid, page, payments))
+
+
+async def _do_refund(bot, charge_id: str) -> str:
+    """Shared by /refund and the admin-card refund button. Calls Telegram's
+    Stars refund API first — only if that actually succeeds do we reverse
+    the credit locally, so a Telegram-side failure can't leave the user
+    stripped of messages they never got refunded for."""
+    payment = db.get_payment_by_charge_id(charge_id)
+    if payment is None:
+        return f"Платёж с charge_id <code>{charge_id}</code> не найден."
+    if payment["status"] != "paid":
+        return f"Платёж #{payment['id']} уже в статусе «{payment['status']}» — повторный возврат не нужен."
+
+    try:
+        ok = await bot.refund_star_payment(
+            user_id=payment["user_id"], telegram_payment_charge_id=charge_id
+        )
+    except TelegramBadRequest as e:
+        return f"Telegram отклонил возврат: {e}"
+    if not ok:
+        return "Telegram вернул отказ по возврату (ok=False, без текста ошибки)."
+
+    result = db.refund_payment(charge_id)
+    if result is None:
+        return (
+            "⚠️ Возврат прошёл в Telegram, но локально платёж уже был помечен "
+            "как возвращённый — сверь баланс пользователя вручную."
+        )
+    unit = "сообщений" if result["kind"] == "messages" else "мин. безлимита"
+    return (
+        f"✅ Возврат выполнен: {payment['amount_stars']}⭐, "
+        f"списано {result['credited_amount']} {unit} у пользователя {result['user_id']}."
+    )
+
+
+@router.callback_query(F.data.startswith("admin:refund:"))
+async def cb_admin_refund(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    _, _, pid_str, page_str = callback.data.split(":")
+    pid, page = int(pid_str), int(page_str)
+    await callback.answer("Выполняю возврат…")
+    payment = db.get_payment(pid)
+    if payment is None or not payment["charge_id"]:
+        await callback.message.answer("Платёж не найден или у него нет charge_id.")
+        return
+    result_text = await _do_refund(callback.bot, payment["charge_id"])
+    await callback.message.answer(result_text)
+
+    uid = payment["user_id"]
+    p = db.get_player(uid)
+    if p is not None:
+        payments = db.list_recent_payments(uid, ADMIN_RECENT_PAYMENTS)
+        await _edit_or_send(
+            callback, _admin_user_text(p, payments), admin_user_keyboard(uid, page, payments)
+        )
+
+
+@router.message(Command("refund"))
+async def cmd_refund(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /refund &lt;telegram_payment_charge_id&gt;")
+        return
+    await message.answer(await _do_refund(message.bot, parts[1]))
 
 
 def _chatlog_text(target_label: str, rows: list[tuple]) -> str:

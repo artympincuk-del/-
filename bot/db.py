@@ -74,6 +74,23 @@ _ensure_column("players", "referred_by", "INTEGER")
 # Groq model, e.g. 'gptoss' vs 'llama', independent of that billing tier).
 _ensure_column("players", "model_choice", "TEXT NOT NULL DEFAULT 'gptoss'")
 
+# telegram_payment_charge_id is what makes crediting idempotent: Telegram can
+# redeliver a successful_payment update (e.g. bot restarted mid-delivery), and
+# without this we'd credit the same purchase twice. It's also required to
+# issue a refund later. status distinguishes a refunded payment from a live
+# one so its credit isn't counted twice in stats or reversible twice.
+_ensure_column("payments", "telegram_payment_charge_id", "TEXT")
+_ensure_column("payments", "status", "TEXT NOT NULL DEFAULT 'paid'")
+# credited_amount is the messages/minutes actually granted for this payment
+# (independent of PACKAGES possibly changing later), so a refund can reverse
+# exactly what was given regardless of subsequent price changes.
+_ensure_column("payments", "credited_amount", "INTEGER")
+_conn.execute(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_charge_id "
+    "ON payments (telegram_payment_charge_id)"
+)
+_conn.commit()
+
 
 def _now() -> str:
     return datetime.datetime.utcnow().isoformat(timespec="seconds")
@@ -410,13 +427,174 @@ def activate_unlimited(user_id: int, username: str | None, minutes: int) -> str:
         return new_expiry
 
 
-def log_payment(user_id: int, username: str | None, kind: str, amount_stars: int) -> None:
+def record_payment_and_credit(
+    user_id: int,
+    username: str | None,
+    kind: str,
+    amount_stars: int,
+    charge_id: str,
+    amount: int,
+) -> tuple[str, str | int | None]:
+    """Records a Stars payment and applies its credit as a single unit: if
+    granting the credit fails after the payment row is inserted, the whole
+    thing rolls back rather than leaving a payment marked 'paid' with no
+    credit applied. Guarded by telegram_payment_charge_id's unique index, so
+    a redelivered successful_payment update (e.g. Telegram retrying after a
+    restart) can never double-credit — it just reports "duplicate".
+
+    `kind` is 'messages' or 'unlimited'; `amount` is the messages count or
+    minutes to grant, matching `kind` (also stored as credited_amount so a
+    later refund can reverse exactly this, even if PACKAGES prices change
+    in the meantime).
+
+    Returns (outcome, result):
+      "duplicate" -> charge_id already processed, nothing changed, result None
+      "credited"  -> result is the new bonus_credits balance (messages) or
+                     the new unlimited_until timestamp (unlimited)
+    """
     with _lock:
-        _conn.execute(
-            "INSERT INTO payments (user_id, username, kind, amount_stars, created_at) VALUES (?, ?, ?, ?, ?)",
-            (user_id, username, kind, amount_stars, _now()),
+        _ensure_player(user_id, username)
+        try:
+            _conn.execute(
+                "INSERT INTO payments (user_id, username, kind, amount_stars, created_at, "
+                "telegram_payment_charge_id, credited_amount, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'paid')",
+                (user_id, username, kind, amount_stars, _now(), charge_id, amount),
+            )
+        except sqlite3.IntegrityError:
+            _conn.rollback()
+            return "duplicate", None
+
+        try:
+            if kind == "unlimited":
+                cur = _conn.execute(
+                    "SELECT unlimited_until FROM players WHERE user_id = ?", (user_id,)
+                )
+                (current_raw,) = cur.fetchone()
+                base = datetime.datetime.utcnow()
+                active = _active_unlimited_until(current_raw)
+                if active:
+                    base = datetime.datetime.fromisoformat(active)
+                new_expiry = (base + datetime.timedelta(minutes=amount)).isoformat(timespec="seconds")
+                _conn.execute(
+                    "UPDATE players SET unlimited_until = ? WHERE user_id = ?", (new_expiry, user_id)
+                )
+                _conn.commit()
+                return "credited", new_expiry
+
+            _conn.execute(
+                "UPDATE players SET bonus_credits = bonus_credits + ? WHERE user_id = ?",
+                (amount, user_id),
+            )
+            _conn.commit()
+            cur = _conn.execute("SELECT bonus_credits FROM players WHERE user_id = ?", (user_id,))
+            return "credited", cur.fetchone()[0]
+        except Exception:
+            _conn.rollback()
+            raise
+
+
+def get_payment(payment_id: int) -> dict | None:
+    with _lock:
+        cur = _conn.execute(
+            "SELECT id, user_id, username, kind, amount_stars, credited_amount, "
+            "telegram_payment_charge_id, status, created_at FROM payments WHERE id = ?",
+            (payment_id,),
         )
+        row = cur.fetchone()
+        return _payment_row_to_dict(row)
+
+
+def get_payment_by_charge_id(charge_id: str) -> dict | None:
+    with _lock:
+        cur = _conn.execute(
+            "SELECT id, user_id, username, kind, amount_stars, credited_amount, "
+            "telegram_payment_charge_id, status, created_at FROM payments "
+            "WHERE telegram_payment_charge_id = ?",
+            (charge_id,),
+        )
+        row = cur.fetchone()
+        return _payment_row_to_dict(row)
+
+
+def _payment_row_to_dict(row: tuple | None) -> dict | None:
+    if row is None:
+        return None
+    pid, uid, uname, kind, stars, credited_amount, charge_id, status, created_at = row
+    return {
+        "id": pid,
+        "user_id": uid,
+        "username": uname,
+        "kind": kind,
+        "amount_stars": stars,
+        "credited_amount": credited_amount,
+        "charge_id": charge_id,
+        "status": status,
+        "created_at": created_at,
+    }
+
+
+def list_recent_payments(user_id: int, limit: int = 5) -> list[tuple]:
+    with _lock:
+        cur = _conn.execute(
+            "SELECT id, kind, amount_stars, credited_amount, telegram_payment_charge_id, "
+            "status, created_at FROM payments WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        )
+        return cur.fetchall()
+
+
+def refund_payment(charge_id: str) -> dict | None:
+    """Marks a 'paid' payment 'refunded' and reverses its credit: bonus
+    credits are clamped at 0 (never taken negative — if the user already
+    spent them, the rest just isn't clawed back), and unlimited-time minutes
+    are subtracted from unlimited_until the same way activate_unlimited adds
+    them, which can naturally push it into the past (i.e. no longer active).
+    Returns what was reversed, or None if the charge_id is unknown or the
+    payment isn't in 'paid' status (already refunded, so calling again is a
+    no-op rather than double-reversing)."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT user_id, kind, credited_amount, status FROM payments "
+            "WHERE telegram_payment_charge_id = ?",
+            (charge_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        user_id, kind, credited_amount, status = row
+        if status != "paid":
+            return None
+
+        _conn.execute(
+            "UPDATE payments SET status = 'refunded' WHERE telegram_payment_charge_id = ?",
+            (charge_id,),
+        )
+
+        if credited_amount:
+            if kind == "messages":
+                _conn.execute(
+                    "UPDATE players SET bonus_credits = MAX(0, bonus_credits - ?) WHERE user_id = ?",
+                    (credited_amount, user_id),
+                )
+            elif kind == "unlimited":
+                cur = _conn.execute(
+                    "SELECT unlimited_until FROM players WHERE user_id = ?", (user_id,)
+                )
+                current_row = cur.fetchone()
+                if current_row and current_row[0]:
+                    try:
+                        current_dt = datetime.datetime.fromisoformat(current_row[0])
+                        new_dt = current_dt - datetime.timedelta(minutes=credited_amount)
+                        _conn.execute(
+                            "UPDATE players SET unlimited_until = ? WHERE user_id = ?",
+                            (new_dt.isoformat(timespec="seconds"), user_id),
+                        )
+                    except ValueError:
+                        pass
+
         _conn.commit()
+        return {"user_id": user_id, "kind": kind, "credited_amount": credited_amount}
 
 
 def get_admin_stats() -> dict:
