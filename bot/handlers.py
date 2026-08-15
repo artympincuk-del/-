@@ -2173,6 +2173,38 @@ async def cmd_backup(message: Message) -> None:
             pass  # admin may have blocked the bot, chat deleted, etc.
 
 
+# Photo/PDF tasks are meant to be self-sufficient (photograph a problem, get
+# an answer) — dialog history normally isn't sent along with them, so a long
+# chat history can't push an already-big recognized problem past Groq's
+# per-minute token limit. The one exception is a caption that explicitly
+# refers back to earlier conversation ("а тут так же?", "как в прошлый раз",
+# "продолжи") — checked here with plain substring matching, no model call.
+# Extend this list as new phrasings show up in practice.
+HISTORY_REFERENCE_PHRASES = (
+    "так же",
+    "такое же",
+    "тот же",
+    "та же",
+    "то же",
+    "как раньше",
+    "как выше",
+    "как до этого",
+    "как в прошлый раз",
+    "прошлый раз",
+    "предыдущ",  # "предыдущее/-ий/-ему/..."
+    "продолжи",
+    "ещё раз",
+    "еще раз",
+    "аналогично",
+    "по аналогии",
+)
+
+
+def _caption_references_history(caption: str) -> bool:
+    lowered = caption.lower()
+    return any(phrase in lowered for phrase in HISTORY_REFERENCE_PHRASES)
+
+
 REMEMBER_PREFIXES = ("запомни:", "запомни,", "запомни ")
 
 
@@ -2393,7 +2425,11 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
         model, reasoning_effort = opt["model"], opt["reasoning"]
         notes = [content for _id, content in db.list_notes(user_id)]
 
-        history = db.get_dialog_history(user_id, MAX_HISTORY_TURNS)
+        history = (
+            db.get_dialog_history(user_id, MAX_HISTORY_TURNS)
+            if _caption_references_history(caption)
+            else []
+        )
 
         await message.bot.send_chat_action(message.chat.id, "typing")
 
@@ -2471,7 +2507,11 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
     image_b64 = base64.b64encode(image_bytes).decode()
     data_url = f"data:image/jpeg;base64,{image_b64}"
 
-    history = db.get_dialog_history(user_id, MAX_HISTORY_TURNS)
+    history = (
+        db.get_dialog_history(user_id, MAX_HISTORY_TURNS)
+        if _caption_references_history(caption)
+        else []
+    )
 
     await message.bot.send_chat_action(message.chat.id, "typing")
     status_msg = await message.answer("🔍 <i>Распознаю задание...</i>")
