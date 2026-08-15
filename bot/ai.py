@@ -351,6 +351,32 @@ async def generate_image(prompt: str, width: int = 1024, height: int = 1024) -> 
         ) from e
 
 
+async def describe_image_for_generation(image_bytes: bytes) -> str:
+    """Literal visual description of a photo — the free fallback for
+    'editing' when POLLINATIONS_API_KEY isn't configured (see
+    handlers._process_image_edit_request): describe the photo, hand that
+    description plus the user's edit instruction to generate_image (flux,
+    free). This draws a NEW similar-looking image from the description, not
+    a pixel edit of the actual photo — a real difference in fidelity, but
+    zero-cost, unlike edit_image (kontext, paid)."""
+    image_b64 = base64.b64encode(image_bytes).decode()
+    data_url = f"data:image/jpeg;base64,{image_b64}"
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "Describe exactly what is in this image in enough visual detail "
+                "(main subject, appearance, pose, colors, background, style) that "
+                "an image generation model could redraw something similar from "
+                "your description alone, with no other context. Be concise but "
+                "specific — no commentary, just the description."
+            ),
+        },
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]
+    return await ask_ai([], content, VISION_MODEL, max_tokens=500)
+
+
 IMAGE_EDIT_URL = "https://gen.pollinations.ai/v1/images/edits"
 
 

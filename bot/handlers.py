@@ -565,8 +565,10 @@ if POLLINATIONS_API_KEY:
 else:
     _HELP_IMAGE_BULLET = (
         "• <b>Картинки</b> — кнопка «Картинка» в меню (или «нарисуй ...») рисует "
-        "с нуля. Кнопки «Ещё раз» / «Изменить» под готовой картинкой — повторить "
-        "или доработать.\n"
+        "с нуля; фото с подписью там же — нарисует похожую картинку с учётом "
+        "правки (не точное редактирование пикселей, а новая картинка по "
+        "описанию фото). Кнопки «Ещё раз» / «Изменить» под готовой картинкой — "
+        "повторить или доработать.\n"
     )
 
 HELP_TEXT = (
@@ -591,8 +593,8 @@ HELP_TEXT = (
     f"{DAILY_FREE_PREMIUM_MESSAGES} бесплатных в день, дальше по "
     f"{PREMIUM_CREDIT_COST} сообщения из пакета.\n"
     "• <b>Фото/голос/PDF</b> — как обычное сообщение выбранной модели.\n"
-    f"• <b>Картинка</b>{' (генерация и редактирование)' if POLLINATIONS_API_KEY else ''} — "
-    f"свой лимит, {DAILY_FREE_IMAGE_MESSAGES} бесплатных в день, дальше по "
+    f"• <b>Картинка</b> (генерация и редактирование) — свой лимит, "
+    f"{DAILY_FREE_IMAGE_MESSAGES} бесплатных в день, дальше по "
     f"{PREMIUM_CREDIT_COST} сообщения из пакета.\n"
     f"• <b>Безлимит на {TIME_PACKAGES[0]['label']}</b> — {TIME_PACKAGES[0]['stars']} ⭐, "
     "сообщения не считаются, пока активен.\n"
@@ -1200,16 +1202,18 @@ async def btn_notes_text(message: Message) -> None:
     await message.answer(_notes_text(message.from_user.id))
 
 
-# Photo editing needs a paid Pollinations key (see ai.edit_image) — when
-# it's not configured, don't advertise a feature that's just going to fail
-# with "недоступно". Purely a text toggle: the F.photo handler underneath
-# still works either way and degrades gracefully on its own, so restoring
-# the key later (config only, no code change) brings the mention right back.
+# Wording depends on whether real photo editing (ai.edit_image, paid,
+# POLLINATIONS_API_KEY) or the free fallback (ai.describe_image_for_generation
+# + generate_image — a new similar image, not a literal pixel edit) is what
+# will actually run — see _process_image_edit_request. Purely a text toggle:
+# restoring the key later (config only) upgrades the wording automatically.
 _PHOTO_EDITING_MENTION = (
     "Или пришли фото с подписью, что в нём изменить (например: «добавь усы») — "
     "отредактирую именно это фото, а не нарисую новое.\n\n"
     if POLLINATIONS_API_KEY
-    else ""
+    else "Или пришли фото с подписью, что изменить (например: «добавь усы») — нарисую "
+    "похожую картинку с учётом правки (не точное редактирование, а новая картинка "
+    "по описанию фото).\n\n"
 )
 
 IMAGE_INTRO_TEXT = (
@@ -1300,12 +1304,18 @@ async def _process_image_request(
 async def _process_image_edit_request(
     message: Message, state: FSMContext, file_id: str, prompt: str, user_id: int, username: str | None
 ) -> None:
-    """Edits an actual photo (kontext model, via ai.edit_image) instead of
-    generating a new one from a text description — see _process_image_request
-    for that. Billed identically (same daily image pool, same refund-on-failure
-    pattern). last_image_file_id is updated to the RESULT's own file_id (not
-    the original), so "Ещё раз"/"Изменить" chain further edits onto the
-    latest version rather than always the first upload."""
+    """Edits an actual photo when POLLINATIONS_API_KEY is configured
+    (kontext model, via ai.edit_image — real pixel editing). Without a key,
+    falls back to a free approximation: describe the photo via Groq vision,
+    hand that description + the edit instruction to generate_image (flux,
+    free) — a NEW similar-looking image, not a literal edit of the original
+    pixels, but zero-cost. Either way this is distinct from
+    _process_image_request (from-scratch generation with no source photo).
+    Billed identically regardless of path (same daily image pool, same
+    refund-on-failure pattern). last_image_file_id is updated to the
+    RESULT's own file_id (not the original), so "Ещё раз"/"Изменить" chain
+    further edits onto the latest version rather than always the first
+    upload."""
     prompt = prompt.strip()
     if not prompt:
         await message.answer(IMAGE_INTRO_TEXT)
@@ -1318,14 +1328,21 @@ async def _process_image_edit_request(
         await message.answer(_image_quota_denied_text(status))
         return
 
+    real_edit = bool(POLLINATIONS_API_KEY)
     await message.bot.send_chat_action(message.chat.id, "upload_photo")
-    status_msg = await message.answer("🎨 <i>Редактирую фото...</i>")
+    status_msg = await message.answer(
+        "🎨 <i>Редактирую фото...</i>" if real_edit else "🎨 <i>Рисую похожую картинку с учётом правки...</i>"
+    )
     t0 = time.monotonic()
 
     try:
         file_buf = await message.bot.download(file_id)
         source_bytes = _prepare_image(file_buf.read())
-        edited_bytes = await ai.edit_image(source_bytes, prompt)
+        if real_edit:
+            edited_bytes = await ai.edit_image(source_bytes, prompt)
+        else:
+            description = await ai.describe_image_for_generation(source_bytes)
+            edited_bytes = await ai.generate_image(f"{description}, {prompt}")
     except ai.AIError as e:
         db.refund_consumed_message(user_id, status["consumed"])
         await status_msg.edit_text(e.user_message)
@@ -1345,9 +1362,13 @@ async def _process_image_edit_request(
         db.log_message(user_id, username, "user", f"[редактирование фото] {prompt}")
         db.log_message(user_id, username, "assistant", "[изображение отправлено]")
 
+        # Honest about the fallback not being a literal edit — the result
+        # can look meaningfully different from the original photo, and
+        # silently passing it off as "edited" would be misleading.
+        note = "" if real_edit else "\n<i>(новая похожая картинка по описанию, не редактирование пикселей)</i>"
         sent = await message.answer_photo(
             BufferedInputFile(edited_bytes, filename="image.jpg"),
-            caption=f"🎨 {prompt}\n\n⚡ <i>Готово за {elapsed:.1f} сек</i>",
+            caption=f"🎨 {prompt}{note}\n\n⚡ <i>Готово за {elapsed:.1f} сек</i>",
             reply_markup=image_actions_keyboard(),
         )
         # Chain further edits onto THIS result, not the original upload —
