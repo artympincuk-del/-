@@ -98,3 +98,11 @@ PROMO_BONUS_DAILY_PREMIUM_MESSAGES = int(
 ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()
 }
+
+# Hour (0-23, QUOTA_TZ) the daily DB backup is sent to every ADMIN_IDS
+# member — see main._backup_loop. Empty or "off" (case-insensitive)
+# disables the daily job; /backup still works on demand either way. Kept
+# as a raw string here (not int()'d) since "off" is a valid value and
+# validation/logging on a bad value belongs in main.py, after logging is
+# configured — this module loads too early for a warning to reliably show.
+BACKUP_HOUR = os.environ.get("BACKUP_HOUR", "4")

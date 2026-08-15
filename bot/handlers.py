@@ -3,7 +3,9 @@ import base64
 import datetime
 import io
 import logging
+import os
 import re
+import tempfile
 import time
 from zoneinfo import ZoneInfo
 
@@ -17,6 +19,7 @@ from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
     ChatMemberUpdated,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -1568,7 +1571,7 @@ ADMIN_MENU_TEXT = (
     "Команды по-прежнему работают: /grant, /users, /chatlog "
     "&lt;@username или id&gt;, /refund &lt;telegram_payment_charge_id&gt;, "
     "/promo_add, /promo_off, /promo_list, /promo_stat, /promo_owner "
-    "&lt;код&gt; &lt;@username или id&gt;, /promo_token."
+    "&lt;код&gt; &lt;@username или id&gt;, /promo_token, /backup."
 )
 
 
@@ -2099,6 +2102,75 @@ async def cmd_promo_token(message: Message) -> None:
         await message.answer(f"Промокод <code>{code}</code> не найден.")
         return
     await message.answer(f"Слово для <code>{code}</code>: <code>{token}</code>")
+
+
+# Telegram's bot-upload limit is 50 MB; stop short of it rather than let a
+# send attempt fail on a technicality right at the size boundary.
+BACKUP_MAX_BYTES = 45 * 1024 * 1024
+
+
+async def send_database_backup(bot, admin_id: int) -> None:
+    """Builds a consistent DB snapshot (db.backup_database — SQLite's own
+    backup API, not a raw file copy, safe under WAL and concurrent writes)
+    and DMs it to one admin. Never touches whatever chat the request came
+    from — callers always pass the admin's own user_id as the destination,
+    so this can never end up posted in a group.
+
+    The temp file lives in the OS temp directory (tempfile.mkstemp, no
+    explicit dir= — defaults to $TMPDIR / /tmp), never inside the project
+    / repo tree: that directory is what Railway wipes on every redeploy and
+    is never picked up by git, so there's no path by which a DB snapshot
+    could end up committed or survive longer than this one call needs it
+    to. Deleted in a finally, whether the send succeeds, fails, or the
+    backup itself blows up.
+
+    db.backup_database is a blocking sqlite3 call — run via asyncio.to_thread
+    so it can't stall the event loop / other message handling while it runs.
+
+    Raises on failure (callers decide what to log/tell the admin) — this
+    function itself doesn't swallow exceptions, callers do.
+    """
+    timestamp = datetime.datetime.now(_QUOTA_TZINFO).strftime("%Y-%m-%d-%H%M")
+    filename = f"backup-{timestamp}.db"
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        await asyncio.to_thread(db.backup_database, tmp_path)
+
+        size = os.path.getsize(tmp_path)
+        if size > BACKUP_MAX_BYTES:
+            await bot.send_message(
+                admin_id,
+                f"⚠️ Бэкап базы весит {size / 1024 / 1024:.1f} МБ — это больше, чем "
+                "Telegram разрешает загружать ботам. Нужен другой способ выгрузки, "
+                "например прямой доступ к volume через Railway.",
+            )
+            return
+
+        await bot.send_document(admin_id, FSInputFile(tmp_path, filename=filename))
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    admin_id = message.from_user.id
+    try:
+        await send_database_backup(message.bot, admin_id)
+    except Exception:
+        logger.exception("Manual /backup failed for admin_id=%s", admin_id)
+        try:
+            await message.bot.send_message(
+                admin_id, "⚠️ Не удалось сделать бэкап базы — подробности в логах бота."
+            )
+        except Exception:
+            pass  # admin may have blocked the bot, chat deleted, etc.
 
 
 REMEMBER_PREFIXES = ("запомни:", "запомни,", "запомни ")

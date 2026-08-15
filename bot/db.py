@@ -1697,6 +1697,34 @@ def list_promo_codes() -> list[dict]:
         return [{**_promo_code_row_to_dict(row), **_promo_stats(row[0])} for row in rows]
 
 
+def backup_database(dest_path: str) -> None:
+    """Consistent snapshot of the live database via SQLite's own backup API
+    (sqlite3.Connection.backup) — deliberately NOT a raw file copy. The DB
+    runs in WAL mode, where a plain copy of the main file can miss commits
+    still sitting in the -wal file, producing a corrupt or incomplete
+    snapshot; .backup() reads through SQLite's own consistency machinery
+    instead, so it's safe to call while other requests keep writing.
+
+    Runs synchronously (blocking) — callers are expected to invoke this via
+    asyncio.to_thread so it doesn't stall the event loop while it copies.
+
+    Deliberately does NOT hold _lock for the copy: this call is expected to
+    run from a background thread (see handlers.send_database_backup), and
+    holding a threading.Lock that every other db.py function also acquires
+    would block ALL message handling on the main thread for the whole
+    backup duration — exactly what running it off-thread is meant to avoid.
+    Safety here comes from SQLite's own serialized-mode thread safety
+    (check_same_thread=False was already opted into for this connection)
+    plus .backup()'s own purpose-built handling of a live, concurrently
+    written source — not from _lock.
+    """
+    dest_conn = sqlite3.connect(dest_path)
+    try:
+        _conn.backup(dest_conn, pages=100, sleep=0.05)
+    finally:
+        dest_conn.close()
+
+
 def close() -> None:
     """Flushes and closes the SQLite connection — call on graceful shutdown
     so WAL checkpoint data isn't left stranded and the file lock is

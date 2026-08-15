@@ -10,8 +10,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, ErrorEvent, MenuButtonDefault
 
 from bot import ai, db
-from bot.config import BOT_TOKEN, CHATLOG_RETENTION_DAYS, QUOTA_TZ
-from bot.handlers import REMINDER_MESSAGE_TEXT, router
+from bot.config import ADMIN_IDS, BACKUP_HOUR, BOT_TOKEN, CHATLOG_RETENTION_DAYS, QUOTA_TZ
+from bot.handlers import REMINDER_MESSAGE_TEXT, router, send_database_backup
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,51 @@ async def _reminder_loop(bot: Bot) -> None:
             logging.exception("Reminder loop failed")
 
 
+BACKUP_CHECK_INTERVAL_SECONDS = 30 * 60
+
+
+def _parse_backup_hour(raw: str) -> int | None:
+    """None means "daily backups disabled". Never raises — an invalid value
+    logs a warning and disables the job rather than crashing the bot at
+    startup; /backup still works on demand regardless of this setting."""
+    value = raw.strip().lower()
+    if value in ("", "off"):
+        return None
+    try:
+        hour = int(value)
+    except ValueError:
+        logging.warning("Invalid BACKUP_HOUR=%r, disabling automatic backups", raw)
+        return None
+    if not (0 <= hour <= 23):
+        logging.warning("BACKUP_HOUR=%r out of range 0-23, disabling automatic backups", raw)
+        return None
+    return hour
+
+
+async def _backup_loop(bot: Bot, hour: int) -> None:
+    """Sends a DB backup to every ADMIN_IDS member once a day at `hour`
+    (QUOTA_TZ) — only started when BACKUP_HOUR resolves to a real hour, see
+    _parse_backup_hour. Checked every 30 minutes rather than sleeping until
+    the exact minute (same pattern as _reminder_loop) so a restart near the
+    target hour still catches it instead of drifting past. A per-admin
+    failure is logged and doesn't stop the others or crash the loop."""
+    last_sent_date = None
+    while True:
+        await asyncio.sleep(BACKUP_CHECK_INTERVAL_SECONDS)
+        try:
+            now_local = datetime.datetime.now(_QUOTA_TZINFO)
+            today = now_local.date().isoformat()
+            if now_local.hour == hour and today != last_sent_date:
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await send_database_backup(bot, admin_id)
+                    except Exception:
+                        logging.exception("Automatic backup failed for admin_id=%s", admin_id)
+                last_sent_date = today
+        except Exception:
+            logging.exception("Backup loop failed")
+
+
 ERROR_USER_MESSAGE = (
     "⚠️ Что-то пошло не так, попробуй ещё раз. Если повторяется, напиши администратору."
 )
@@ -133,8 +178,13 @@ async def main() -> None:
     await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
     await ai.check_configured_models()
     _run_chatlog_retention()
-    retention_task = asyncio.create_task(_chatlog_retention_loop())
-    reminder_task = asyncio.create_task(_reminder_loop(bot))
+    background_tasks = [
+        asyncio.create_task(_chatlog_retention_loop()),
+        asyncio.create_task(_reminder_loop(bot)),
+    ]
+    backup_hour = _parse_backup_hour(BACKUP_HOUR)
+    if backup_hour is not None:
+        background_tasks.append(asyncio.create_task(_backup_loop(bot, backup_hour)))
 
     await bot.delete_webhook(drop_pending_updates=False)
     try:
@@ -143,7 +193,7 @@ async def main() -> None:
         # Graceful shutdown: stop the background tasks, release the Telegram
         # HTTP session, and flush/close the SQLite connection instead of
         # relying on process teardown.
-        for task in (retention_task, reminder_task):
+        for task in background_tasks:
             task.cancel()
             try:
                 await task
