@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -12,6 +13,7 @@ from bot.config import (
     FAST_MODEL,
     GROQ_API_KEY,
     GROQ_MAX_CONCURRENT,
+    POLLINATIONS_API_KEY,
     PREMIUM_MODEL,
     STT_MODEL,
     VISION_MODEL,
@@ -347,6 +349,62 @@ async def generate_image(prompt: str, width: int = 1024, height: int = 1024) -> 
             f"Image gen connection error: {e}",
             user_message="Не удалось сгенерировать изображение. Попробуйте ещё раз.",
         ) from e
+
+
+IMAGE_EDIT_URL = "https://gen.pollinations.ai/v1/images/edits"
+
+
+async def edit_image(image_bytes: bytes, prompt: str) -> bytes:
+    """Edits an existing image (the kontext model) via Pollinations'
+    OpenAI-Images-Edits-compatible endpoint — takes the image as raw bytes
+    over multipart POST, never as a URL, specifically so nothing here ever
+    needs to hand a third party a URL that could leak credentials (e.g. a
+    Telegram file link, which has BOT_TOKEN baked into it). Requires
+    POLLINATIONS_API_KEY; unlike generate_image, there's no free anonymous
+    tier for this endpoint."""
+    if not POLLINATIONS_API_KEY:
+        raise AIError(
+            "Image edit: POLLINATIONS_API_KEY not configured",
+            user_message="Редактирование фото сейчас недоступно.",
+        )
+    prompt = await _translate_for_image(prompt)
+    form = aiohttp.FormData()
+    form.add_field("image", image_bytes, filename="photo.jpg", content_type="image/jpeg")
+    form.add_field("prompt", prompt)
+    form.add_field("model", "kontext")
+    headers = {"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
+            async with session.post(IMAGE_EDIT_URL, data=form, headers=headers) as resp:
+                if resp.status == 402:
+                    raise AIError(
+                        "Image edit: 402 payment required (API key pollen balance exhausted)",
+                        user_message=(
+                            "Не удалось отредактировать фото — на API-ключе для редактирования "
+                            "закончился баланс. Сообщите администратору."
+                        ),
+                    )
+                if resp.status != 200:
+                    body = (await resp.text())[:300]
+                    raise AIError(
+                        f"Image edit error: {resp.status} {body}",
+                        user_message="Не удалось отредактировать фото. Попробуйте другое описание.",
+                    )
+                payload = await resp.json()
+    except aiohttp.ClientError as e:
+        raise AIError(
+            f"Image edit connection error: {e}",
+            user_message="Не удалось отредактировать фото. Попробуйте ещё раз.",
+        ) from e
+
+    try:
+        b64_data = payload["data"][0]["b64_json"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise AIError(
+            f"Image edit: unexpected response shape: {payload!r}",
+            user_message="Не удалось отредактировать фото. Попробуйте ещё раз.",
+        ) from e
+    return base64.b64decode(b64_data)
 
 
 async def check_configured_models() -> None:

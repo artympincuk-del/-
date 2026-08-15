@@ -35,7 +35,6 @@ from bot.config import (
     DAILY_FREE_PREMIUM_MESSAGES,
     FAST_MODEL,
     FAST_REASONING_EFFORT,
-    IMAGE_CREDIT_COST,
     MAX_HISTORY_TURNS,
     PREMIUM_CREDIT_COST,
     PREMIUM_MODEL,
@@ -390,6 +389,38 @@ def quota_denied_text(status: dict) -> str:
     )
 
 
+def _image_quota_denied_text(status: dict) -> str:
+    """Like quota_denied_text, but for image generation, which always bills
+    against the premium bucket regardless of the user's chat model
+    preference (see _process_image_request) — so this only ever needs the
+    premium-tier wording, and skips the "switch to the fast model" hint
+    that wouldn't make sense here."""
+    tz_abbr = datetime.datetime.now(_QUOTA_TZINFO).strftime("%Z")
+    if status.get("limit_source") == "promo":
+        _, premium_cap = db.promo_effective_limits(
+            True, status["promo_bonus_stacks"], status["subscription_until"] is not None
+        )
+        return (
+            f"Дневной лимит премиум-запросов по промо-бонусу исчерпан "
+            f"({status['premium_used_today']}/{premium_cap}), а на генерацию картинки не "
+            f"хватает докупленных сообщений ({PREMIUM_CREDIT_COST}). Бонус ещё действует, "
+            f"лимит обновится завтра в 00:00 {tz_abbr}. Пополните баланс: /buy."
+        )
+    if status.get("limit_source") == "subscription":
+        return (
+            f"Дневной лимит премиум-запросов подписки исчерпан "
+            f"({status['premium_used_today']}/{SUBSCRIPTION_DAILY_PREMIUM_MESSAGES}), а на "
+            f"генерацию картинки не хватает докупленных сообщений ({PREMIUM_CREDIT_COST}). "
+            f"Обновится в 00:00 {tz_abbr}. Пополните баланс: /buy."
+        )
+    return (
+        f"Бесплатный дневной лимит премиум-запросов исчерпан "
+        f"({status['premium_used_today']}/{DAILY_FREE_PREMIUM_MESSAGES}), а на генерацию "
+        f"картинки не хватает докупленных сообщений ({PREMIUM_CREDIT_COST}). "
+        "Пополните баланс: /buy — или дождитесь сброса в полночь."
+    )
+
+
 async def _apply_referral(message: Message) -> None:
     """Registers the referral link and pays the referee's small immediate
     signup bonus. The referrer's (larger) bonus is NOT paid here — anti-abuse:
@@ -543,45 +574,47 @@ async def cb_menu_back(callback: CallbackQuery, state: FSMContext) -> None:
 
 HELP_TEXT = (
     "🤖 <b>Что я умею</b>\n\n"
-    "• Текст, голосовые, фото и PDF — присылай как есть, отвечу.\n"
-    "• Фото: можно с подписью-вопросом, распознаю содержимое.\n"
-    "• Голосовые: распознаю речь и отвечу как на обычное сообщение.\n"
-    "• PDF-документы: прочитаю файл и отвечу по содержимому.\n"
-    "• Картинки: кнопка «Картинка» в меню (или напиши «нарисуй ...») — опиши, что "
-    "нарисовать, без команд. Под готовой картинкой — кнопки «Ещё раз» (сгенерировать "
-    "заново) и «Изменить» (описать правку и перегенерировать с её учётом).\n"
-    "• Поиск в интернете: для вопросов про свежие новости, курсы, актуальные факты — "
-    "сам решаю, когда стоит поискать в сети, и использую это в ответе.\n"
-    "• Заметки: напиши «Запомни: ...» — учитываю это в каждом ответе, даже после "
-    "перезапуска. Список — кнопка «Заметки» в меню, удалить — /forget &lt;номер&gt;.\n"
-    "• Под каждым ответом — кнопки «Подробнее» / «Проще» / «Пример», не нужно "
-    "переписывать вопрос, чтобы уточнить ответ.\n"
-    "• В группах отвечаю, только если меня упомянуть (@username) или ответить на моё "
-    "сообщение — чтобы не отвечать на каждое сообщение в чате.\n\n"
+    "• <b>Текст, голос, фото, PDF</b> — присылай как есть, отвечу.\n"
+    "• <b>Фото</b> — можно с подписью-вопросом, распознаю содержимое.\n"
+    "• <b>Голосовые</b> — распознаю речь и отвечу как на текст.\n"
+    "• <b>PDF</b> — прочитаю файл и отвечу по содержимому.\n"
+    "• <b>Картинки</b> — кнопка «Картинка» в меню (или «нарисуй ...») рисует "
+    "с нуля; фото с подписью там же — редактирует именно это фото (например: "
+    "«добавь усы»). Кнопки «Ещё раз» / «Изменить» под готовой картинкой — "
+    "повторить или доработать.\n"
+    "• <b>Поиск в интернете</b> — сам решаю, когда нужны свежие данные "
+    "(новости, курсы, факты).\n"
+    "• <b>Заметки</b> — «Запомни: ...», учитываю в каждом ответе. Список — "
+    "кнопка «Заметки», удалить — /forget &lt;номер&gt;.\n"
+    "• <b>Уточнить ответ</b> — кнопки «Подробнее» / «Проще» / «Пример» под "
+    "ответом, не нужно переписывать вопрос.\n"
+    "• <b>В группах</b> отвечаю только по упоминанию (@username) или ответом "
+    "на моё сообщение.\n\n"
     "💰 <b>Сколько это стоит</b>\n\n"
-    f"• Быстрая модель: {DAILY_FREE_MESSAGES} бесплатных сообщений в день, дальше — из "
-    "докупленного пакета.\n"
-    f"• Премиум модель (думает глубже, точнее на сложных вопросах): "
-    f"{DAILY_FREE_PREMIUM_MESSAGES} бесплатных сообщений в день, дальше каждое "
-    f"списывает {PREMIUM_CREDIT_COST} сообщений из докупленного пакета.\n"
-    "• Фото/голосовые/PDF списываются как обычное сообщение выбранной модели.\n"
-    f"• Картинка — {IMAGE_CREDIT_COST} докупленных сообщений за штуку.\n"
-    f"• ⏱ Безлимит на {TIME_PACKAGES[0]['label']} — {TIME_PACKAGES[0]['stars']} ⭐, не "
-    "считает отдельные сообщения, пока активен.\n"
-    f"• ⭐ Подписка на месяц ({SUBSCRIPTION['stars']} ⭐) — до {SUBSCRIPTION_DAILY_MESSAGES} "
-    f"быстрых и {SUBSCRIPTION_DAILY_PREMIUM_MESSAGES} премиум-запросов в день, "
-    "автопродление, отменить можно в любой момент в «Баланс».\n\n"
+    f"• <b>Быстрая модель</b> — {DAILY_FREE_MESSAGES} бесплатных в день, дальше "
+    "из докупленного пакета.\n"
+    f"• <b>Премиум модель</b> (глубже думает, точнее на сложном) — "
+    f"{DAILY_FREE_PREMIUM_MESSAGES} бесплатных в день, дальше по "
+    f"{PREMIUM_CREDIT_COST} сообщения из пакета.\n"
+    "• <b>Фото/голос/PDF</b> — как обычное сообщение выбранной модели.\n"
+    f"• <b>Картинка</b> — как премиум-запрос: из тех же {DAILY_FREE_PREMIUM_MESSAGES} "
+    f"бесплатных в день, дальше по {PREMIUM_CREDIT_COST} сообщения из пакета.\n"
+    f"• <b>Безлимит на {TIME_PACKAGES[0]['label']}</b> — {TIME_PACKAGES[0]['stars']} ⭐, "
+    "сообщения не считаются, пока активен.\n"
+    f"• <b>Подписка на месяц</b> — {SUBSCRIPTION['stars']} ⭐, до "
+    f"{SUBSCRIPTION_DAILY_MESSAGES} быстрых и {SUBSCRIPTION_DAILY_PREMIUM_MESSAGES} "
+    "премиум в день, автопродление (отменить — в «Баланс»).\n\n"
     "🎁 <b>Как получить больше бесплатно</b>\n\n"
-    f"• Пригласи друга (кнопка в меню) — он сразу получит {REFERRAL_SIGNUP_BONUS} "
-    f"сообщений, а тебе начислится {REFERRAL_BONUS_MESSAGES}, когда он напишет боту "
+    f"• <b>Пригласи друга</b> (кнопка в меню) — ему {REFERRAL_SIGNUP_BONUS} сообщений "
+    f"сразу, тебе {REFERRAL_BONUS_MESSAGES}, когда он напишет боту "
     f"{REFERRAL_MIN_MESSAGES} сообщения(-ий).\n"
-    f"• Промокод от блогера/партнёра — временный бонус (срок зависит от конкретной "
+    f"• <b>Промокод</b> от блогера/партнёра — временный бонус (срок зависит от "
     f"ссылки), пока активен — до {PROMO_BONUS_DAILY_MESSAGES} быстрых и "
-    f"{PROMO_BONUS_DAILY_PREMIUM_MESSAGES} премиум-запросов в день.\n"
-    "• 🔔 Напоминания (кнопка в меню) — по желанию, раз в сутки в выбранное время. По "
-    "умолчанию выключены, никаких рассылок без явного включения.\n\n"
-    "Переписка сохраняется и может просматриваться поддержкой при разборе обращений и "
-    "ошибок.\n\n"
+    f"{PROMO_BONUS_DAILY_PREMIUM_MESSAGES} премиум в день.\n"
+    "• <b>Напоминания</b> 🔔 (кнопка в меню) — по желанию, раз в сутки. Выключены "
+    "по умолчанию, без рассылок без явного включения.\n\n"
+    "Переписка сохраняется и может просматриваться поддержкой при разборе "
+    "обращений и ошибок.\n\n"
     "Открыть меню в любой момент — /menu."
 )
 
@@ -1175,8 +1208,11 @@ IMAGE_INTRO_TEXT = (
     f"🎨 <b>Генерация картинок</b>\n\n"
     f"Опиши следующим сообщением, что нарисовать (например: «закат над горами в стиле "
     f"акварели») — не нужна команда, просто напиши и отправь.\n\n"
-    f"Стоимость: {IMAGE_CREDIT_COST} докупленных сообщений за картинку (из бесплатного "
-    f"дневного лимита не списывается). Пополнить — кнопка «Баланс»."
+    f"Или пришли фото с подписью, что в нём изменить (например: «добавь усы») — "
+    f"отредактирую именно это фото, а не нарисую новое.\n\n"
+    f"Стоимость: как премиум-запрос — списывается из {DAILY_FREE_PREMIUM_MESSAGES} "
+    f"бесплатных премиум-запросов в день, а когда они кончатся — "
+    f"{PREMIUM_CREDIT_COST} докупленных сообщений за картинку. Пополнить — кнопка «Баланс»."
 )
 
 IMAGE_PREFIXES = ("нарисуй:", "нарисуй,", "нарисуй ", "сгенерируй картинку", "сгенерируй изображение")
@@ -1201,12 +1237,17 @@ async def _process_image_request(
         await message.answer(IMAGE_INTRO_TEXT)
         return
 
-    allowed, bonus = db.try_consume_bonus_credits(user_id, username, IMAGE_CREDIT_COST)
+    # Billed as a premium-tier request regardless of the user's fast/premium
+    # chat preference — generating an image is inherently premium-cost value.
+    # Reuses the exact same daily-quota machinery (free/subscription/promo
+    # tiers, bonus_credits fallback, refund-on-failure) as a normal premium
+    # chat message, just forced onto the premium bucket via force_premium.
+    allowed, status = db.try_consume_message(
+        user_id, username, DAILY_FREE_MESSAGES, DAILY_FREE_PREMIUM_MESSAGES, PREMIUM_CREDIT_COST,
+        force_premium=True,
+    )
     if not allowed:
-        await message.answer(
-            f"Генерация картинки стоит {IMAGE_CREDIT_COST} докупленных сообщений, а на "
-            f"балансе только {bonus}. Пополните баланс: /buy"
-        )
+        await message.answer(_image_quota_denied_text(status))
         return
 
     await message.bot.send_chat_action(message.chat.id, "upload_photo")
@@ -1216,31 +1257,109 @@ async def _process_image_request(
     try:
         image_bytes = await ai.generate_image(prompt)
     except ai.AIError as e:
-        db.add_bonus_credits(user_id, username, IMAGE_CREDIT_COST)  # refund on failure
+        db.refund_consumed_message(user_id, status["consumed"])
         await status_msg.edit_text(e.user_message)
         return
+    except Exception:
+        db.refund_consumed_message(user_id, status["consumed"])
+        raise
 
     try:
-        await status_msg.delete()
-    except TelegramBadRequest:
-        pass
+        try:
+            await status_msg.delete()
+        except TelegramBadRequest:
+            pass
 
-    elapsed = time.monotonic() - t0
+        elapsed = time.monotonic() - t0
 
-    db.log_message(user_id, username, "user", f"[генерация картинки] {prompt}")
-    db.log_message(user_id, username, "assistant", "[изображение отправлено]")
+        db.log_message(user_id, username, "user", f"[генерация картинки] {prompt}")
+        db.log_message(user_id, username, "assistant", "[изображение отправлено]")
 
-    # Remembered so "Ещё раз"/"Изменить" can regenerate without the user
-    # having to retype the description — this is prompt-level (Pollinations
-    # has no image-to-image/inpainting endpoint here), not literal pixel
-    # editing of the sent photo.
-    await state.update_data(last_image_prompt=prompt)
+        # Remembered so "Ещё раз"/"Изменить" can regenerate without the user
+        # having to retype the description. last_image_mode="generate" tells
+        # those buttons this was a from-scratch generation (prompt-level,
+        # via flux) rather than a photo edit (see _process_image_edit_request,
+        # which uses the kontext model on the actual image bytes instead).
+        await state.update_data(last_image_prompt=prompt, last_image_mode="generate")
 
-    await message.answer_photo(
-        BufferedInputFile(image_bytes, filename="image.jpg"),
-        caption=f"🎨 {prompt}\n\n⚡ <i>Готово за {elapsed:.1f} сек</i>",
-        reply_markup=image_actions_keyboard(),
+        await message.answer_photo(
+            BufferedInputFile(image_bytes, filename="image.jpg"),
+            caption=f"🎨 {prompt}\n\n⚡ <i>Готово за {elapsed:.1f} сек</i>",
+            reply_markup=image_actions_keyboard(),
+        )
+    except Exception:
+        # Image was already generated (the expensive/billable part
+        # succeeded) but never actually reached the user — still a wasted
+        # request from their side, so it still gets refunded.
+        db.refund_consumed_message(user_id, status["consumed"])
+        raise
+
+
+async def _process_image_edit_request(
+    message: Message, state: FSMContext, file_id: str, prompt: str, user_id: int, username: str | None
+) -> None:
+    """Edits an actual photo (kontext model, via ai.edit_image) instead of
+    generating a new one from a text description — see _process_image_request
+    for that. Billed identically (force_premium=True, same refund-on-failure
+    pattern). last_image_file_id is updated to the RESULT's own file_id (not
+    the original), so "Ещё раз"/"Изменить" chain further edits onto the
+    latest version rather than always the first upload."""
+    prompt = prompt.strip()
+    if not prompt:
+        await message.answer(IMAGE_INTRO_TEXT)
+        return
+
+    allowed, status = db.try_consume_message(
+        user_id, username, DAILY_FREE_MESSAGES, DAILY_FREE_PREMIUM_MESSAGES, PREMIUM_CREDIT_COST,
+        force_premium=True,
     )
+    if not allowed:
+        await message.answer(_image_quota_denied_text(status))
+        return
+
+    await message.bot.send_chat_action(message.chat.id, "upload_photo")
+    status_msg = await message.answer("🎨 <i>Редактирую фото...</i>")
+    t0 = time.monotonic()
+
+    try:
+        file_buf = await message.bot.download(file_id)
+        source_bytes = _prepare_image(file_buf.read())
+        edited_bytes = await ai.edit_image(source_bytes, prompt)
+    except ai.AIError as e:
+        db.refund_consumed_message(user_id, status["consumed"])
+        await status_msg.edit_text(e.user_message)
+        return
+    except Exception:
+        db.refund_consumed_message(user_id, status["consumed"])
+        raise
+
+    try:
+        try:
+            await status_msg.delete()
+        except TelegramBadRequest:
+            pass
+
+        elapsed = time.monotonic() - t0
+
+        db.log_message(user_id, username, "user", f"[редактирование фото] {prompt}")
+        db.log_message(user_id, username, "assistant", "[изображение отправлено]")
+
+        sent = await message.answer_photo(
+            BufferedInputFile(edited_bytes, filename="image.jpg"),
+            caption=f"🎨 {prompt}\n\n⚡ <i>Готово за {elapsed:.1f} сек</i>",
+            reply_markup=image_actions_keyboard(),
+        )
+        # Chain further edits onto THIS result, not the original upload —
+        # Telegram now hosts the sent photo too, so its own file_id works
+        # exactly like any other for the next download.
+        await state.update_data(
+            last_image_prompt=prompt,
+            last_image_mode="edit",
+            last_image_file_id=sent.photo[-1].file_id,
+        )
+    except Exception:
+        db.refund_consumed_message(user_id, status["consumed"])
+        raise
 
 
 @router.message(Command("image"))
@@ -1281,13 +1400,38 @@ async def handle_image_prompt_state(message: Message, state: FSMContext) -> None
         )
 
 
+@router.message(Form.waiting_for_image_prompt, F.photo)
+async def handle_image_prompt_photo_state(message: Message, state: FSMContext) -> None:
+    """A photo sent right after tapping "Картинка" is a request to edit
+    THAT photo (kontext model), not to generate a new one — distinct from
+    the default photo handler (handle_photo_message), which solves whatever
+    problem/question is on the photo instead."""
+    await state.set_state(None)  # clear pending state only, keep conversation history
+    caption = await _strip_mention(message, message.caption)
+    if not caption:
+        await message.answer(
+            "Опиши подписью к фото, что изменить (например: «добавь усы»), и пришли ещё раз."
+        )
+        return
+    lock = _get_user_lock(message.from_user.id)
+    if lock.locked():
+        await message.answer(BUSY_TEXT)
+        return
+    async with lock:
+        await _process_image_edit_request(
+            message, state, message.photo[-1].file_id, caption,
+            message.from_user.id, message.from_user.username,
+        )
+
+
 NO_LAST_IMAGE_TEXT = "Не помню, что генерировал в прошлый раз — опишите картинку заново."
 
 
 @router.callback_query(F.data == "img:retry")
 async def cb_image_retry(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
-    prompt = (await state.get_data()).get("last_image_prompt")
+    data = await state.get_data()
+    prompt = data.get("last_image_prompt")
     if not prompt:
         await callback.message.answer(NO_LAST_IMAGE_TEXT)
         return
@@ -1296,34 +1440,58 @@ async def cb_image_retry(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.message.answer(BUSY_TEXT)
         return
     async with lock:
-        await _process_image_request(
-            callback.message, state, prompt, callback.from_user.id, callback.from_user.username
-        )
+        if data.get("last_image_mode") == "edit":
+            await _process_image_edit_request(
+                callback.message, state, data["last_image_file_id"], prompt,
+                callback.from_user.id, callback.from_user.username,
+            )
+        else:
+            await _process_image_request(
+                callback.message, state, prompt, callback.from_user.id, callback.from_user.username
+            )
 
 
 @router.callback_query(F.data == "img:edit")
 async def cb_image_edit(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
-    if not (await state.get_data()).get("last_image_prompt"):
+    data = await state.get_data()
+    if not data.get("last_image_prompt"):
         await callback.message.answer(NO_LAST_IMAGE_TEXT)
         return
     await state.set_state(Form.waiting_for_image_edit)
-    await callback.message.answer(
-        "✏️ Опишите, что изменить (например: «сделай фон синим», «добавь очки») — "
-        "сгенерирую картинку заново с учётом правки."
-    )
+    if data.get("last_image_mode") == "edit":
+        await callback.message.answer(
+            "✏️ Опишите, что изменить ещё (например: «добавь очки») — применю поверх "
+            "текущей картинки."
+        )
+    else:
+        await callback.message.answer(
+            "✏️ Опишите, что изменить (например: «сделай фон синим», «добавь очки») — "
+            "сгенерирую картинку заново с учётом правки."
+        )
 
 
 @router.message(Form.waiting_for_image_edit, F.text & ~F.text.startswith("/"))
 async def handle_image_edit_state(message: Message, state: FSMContext) -> None:
-    base_prompt = (await state.get_data()).get("last_image_prompt")
+    data = await state.get_data()
     await state.set_state(None)  # clear pending state only, keep conversation history
-    prompt = f"{base_prompt}, {message.text.strip()}" if base_prompt else message.text
     lock = _get_user_lock(message.from_user.id)
     if lock.locked():
         await message.answer(BUSY_TEXT)
         return
     async with lock:
+        if data.get("last_image_mode") == "edit":
+            # Chains onto the current (already-edited) image with a fresh
+            # instruction — kontext takes one instruction per call, so this
+            # doesn't concatenate with the previous one the way the
+            # text-generation path below does.
+            await _process_image_edit_request(
+                message, state, data["last_image_file_id"], message.text.strip(),
+                message.from_user.id, message.from_user.username,
+            )
+            return
+        base_prompt = data.get("last_image_prompt")
+        prompt = f"{base_prompt}, {message.text.strip()}" if base_prompt else message.text
         await _process_image_request(
             message, state, prompt, message.from_user.id, message.from_user.username
         )

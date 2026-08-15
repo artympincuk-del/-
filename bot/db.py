@@ -392,8 +392,13 @@ def try_consume_message(
     daily_limit: int,
     daily_premium_limit: int,
     premium_cost: int,
+    force_premium: bool = False,
 ) -> tuple[bool, dict]:
-    """Atomically consumes quota for one message, based on the player's model_pref.
+    """Atomically consumes quota for one message, based on the player's
+    model_pref — unless force_premium is set, which bills against the
+    premium bucket regardless of model_pref (for features that are always
+    premium-tier value regardless of the user's chat model choice, e.g.
+    image generation).
 
     Checked in this order:
       1. Active time-based unlimited pass (bought by the hour) — genuinely
@@ -481,7 +486,7 @@ def try_consume_message(
             effective_daily_premium_limit = daily_premium_limit
             limit_source = "free"
 
-        if model_pref == "premium":
+        if force_premium or model_pref == "premium":
             if premium_used < effective_daily_premium_limit:
                 _conn.execute(
                     "UPDATE players SET premium_messages_used_today = premium_messages_used_today + 1 "
