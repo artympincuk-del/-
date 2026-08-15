@@ -50,6 +50,16 @@ REFERRAL_DAILY_CAP = int(os.environ.get("REFERRAL_DAILY_CAP", "5"))
 DB_PATH = os.environ.get("DB_PATH", "assistant.db")
 MAX_HISTORY_TURNS = 10
 
+# Rough ceiling (in estimated tokens, not real ones — see ai._estimate_tokens)
+# on how much dialog history rides along with a request, on top of the
+# MAX_HISTORY_TURNS count cap above. Exists so the common "long
+# photo-recognized problem + a chat history" case doesn't blow past Groq's
+# free-tier per-minute token budget and get flat-out refused (413) — history
+# gets trimmed newest-to-oldest to fit under this before every request. The
+# system prompt and the current message are never counted against/trimmed by
+# this budget, only history is.
+REQUEST_TOKEN_BUDGET = int(os.environ.get("REQUEST_TOKEN_BUDGET", "4000"))
+
 # How long chat_log (the admin support/audit trail — see /chatlog) keeps
 # messages before they're purged. Unlike dialog_history, chat_log has no
 # other cap, so without this it grows forever on Railway's disk.

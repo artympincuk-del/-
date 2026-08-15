@@ -15,6 +15,7 @@ from bot.config import (
     GROQ_MAX_CONCURRENT,
     POLLINATIONS_API_KEY,
     PREMIUM_MODEL,
+    REQUEST_TOKEN_BUDGET,
     STT_MODEL,
     VISION_MODEL,
 )
@@ -94,6 +95,20 @@ class AIError(Exception):
         self.user_message = user_message or "Не удалось получить ответ. Попробуйте ещё раз."
 
 
+class _PayloadTooLargeError(Exception):
+    """Internal-only signal for ask_ai's retry loop, raised by _complete_once
+    on a Groq 413 instead of AIError. Kept separate from AIError precisely so
+    it does NOT propagate as a user-facing failure on the first or second
+    occurrence — ask_ai catches it, shrinks the request (drop history, then
+    truncate the current message), and retries before ever giving up. Only
+    ask_ai's own final AIError (after exhausting retries) is meant to reach
+    callers outside this module."""
+
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
+
+
 # "auto" backend selection in ddgs can land on a flaky engine (startpage
 # timed out repeatedly in testing) with no fallback. Try a short list of
 # engines in order and use the first that actually returns results, instead
@@ -140,6 +155,106 @@ def _build_system_prompt(notes: list[str] | None) -> str:
     )
 
 
+# Rough, no-dependency token estimate — real tokenization would need a
+# tokenizer library we don't otherwise use. ~4 chars/token is the usual rule
+# of thumb for English text, but this bot's users write mostly Cyrillic,
+# which tends to run fewer chars per token — use a smaller divisor so the
+# estimate leans toward *overestimating* real usage rather than under.
+_CHARS_PER_TOKEN = 2.5
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, int(len(text) / _CHARS_PER_TOKEN))
+
+
+def _content_text(content) -> str:
+    """A message's `content` is either a plain string (text-only turn) or a
+    list of content blocks (e.g. text + image_url) for multimodal turns —
+    only the text blocks contribute meaningfully to the token estimate, an
+    image_url's data URL doesn't reflect real image-token cost either way."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
+def _estimate_message_tokens(content) -> int:
+    return _estimate_tokens(_content_text(content))
+
+
+def _trim_history_to_budget(
+    history: list[dict], system_content: str, user_content, budget: int
+) -> list[dict]:
+    """Keeps the newest turns, silently dropping the oldest ones once the
+    running estimated total would exceed REQUEST_TOKEN_BUDGET — a best-effort
+    guard against Groq's per-minute token cap (413) for the common "long
+    photo-recognized problem + long history" case. MAX_HISTORY_TURNS (applied
+    by callers via db.get_dialog_history) remains the hard cap on turn
+    *count*; this trims further, by estimated size, on top of that.
+
+    The system prompt and the current user_content are never trimmed here —
+    if they alone already fill the budget, history comes back empty and the
+    oversized message is sent on its own, letting Groq decide (a resulting
+    413 is handled separately by ask_ai's retry sequence, not here)."""
+    used = _estimate_tokens(system_content) + _estimate_message_tokens(user_content)
+    kept = []
+    for turn in reversed(history):
+        turn_tokens = _estimate_message_tokens(turn.get("content"))
+        if used + turn_tokens > budget:
+            break
+        used += turn_tokens
+        kept.append(turn)
+    kept.reverse()
+    return kept
+
+
+_TRUNCATION_NOTE = (
+    "[начало сообщения обрезано из-за технического ограничения размера запроса]\n\n"
+)
+
+
+def _truncate_content_half(content):
+    """Last resort before giving up on a 413 (see ask_ai): halves the
+    current message's text, keeping the END — callers by convention put the
+    actual question/instruction last, after any recognized/quoted text — and
+    prepends a short note so the model knows the start was cut, without ever
+    surfacing token/limit language to the user themselves."""
+    if isinstance(content, str):
+        half = len(content) // 2
+        return _TRUNCATION_NOTE + content[-half:] if half else content
+    if isinstance(content, list):
+        new_content = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "")
+                half = len(text) // 2
+                block = {
+                    **block,
+                    "text": (_TRUNCATION_NOTE + text[-half:]) if half else text,
+                }
+            new_content.append(block)
+        return new_content
+    return content
+
+
+def _extract_error_detail(e: "groq.APIStatusError") -> str:
+    """Best-effort pull of Groq's own explanation for a 413 (e.g. exact
+    token-limit numbers) for logging only — never shown to the user. Reads
+    only Groq's error response body, never any part of the request itself."""
+    body = e.body
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            return str(err.get("message", body))[:500]
+        return str(body)[:500]
+    return str(body)[:500] if body is not None else str(e)[:500]
+
+
 # Both gpt-oss models and qwen sit on Groq's free-tier 8000 TPM cap, so we
 # can't just raise max_tokens to avoid truncation — that risks a 413 instead.
 # The real fix is spending fewer tokens on reasoning when the first attempt
@@ -178,13 +293,10 @@ async def _complete_once(
                 response = await _client.chat.completions.create(**kwargs)
         except groq.APIStatusError as e:
             if e.status_code == 413:
-                raise AIError(
-                    "Groq API error: 413",
-                    user_message=(
-                        "Слишком много данных для бесплатного лимита модели за один запрос. "
-                        "Пришлите фото с меньшим количеством текста или задайте вопрос короче."
-                    ),
-                ) from e
+                # Not an immediate refusal — ask_ai's caller-side retry loop
+                # catches this, shrinks the request, and tries again before
+                # any user ever sees a failure. See _PayloadTooLargeError.
+                raise _PayloadTooLargeError(_extract_error_detail(e)) from e
             if e.status_code == 429:
                 raise AIError(
                     "Groq API error: 429",
@@ -230,6 +342,26 @@ async def _complete_once(
     return None
 
 
+async def _complete_with_effort_fallback(
+    messages: list[dict],
+    model: str,
+    max_tokens: int,
+    effort: str | None,
+    enable_search: bool,
+) -> str | None:
+    """Retries with a cheaper reasoning_effort while the model comes back
+    empty from running out of its token budget mid-reasoning (finish_reason
+    == "length") — a different failure mode from a 413 (request rejected
+    outright for being too big to even start). A _PayloadTooLargeError from
+    _complete_once is intentionally NOT caught here; it propagates to
+    ask_ai's own retry-on-413 sequence below."""
+    text = await _complete_once(messages, model, max_tokens, effort, enable_search)
+    while text is None and effort in _EFFORT_FALLBACK:
+        effort = _EFFORT_FALLBACK[effort]
+        text = await _complete_once(messages, model, max_tokens, effort, enable_search)
+    return text
+
+
 async def ask_ai(
     history: list[dict],
     user_content,
@@ -240,10 +372,19 @@ async def ask_ai(
     enable_search: bool = False,
 ) -> str:
     """`user_content` is either a plain string (text-only turn) or a list of
-    content blocks (e.g. text + image_url) for multimodal turns."""
-    messages = [{"role": "system", "content": _build_system_prompt(notes)}] + history + [
-        {"role": "user", "content": user_content}
-    ]
+    content blocks (e.g. text + image_url) for multimodal turns.
+
+    History is trimmed to REQUEST_TOKEN_BUDGET before the first attempt (see
+    _trim_history_to_budget), and if Groq still rejects the request as too
+    large (413) — e.g. a long photo-recognized problem plus history — this
+    retries up to two more times before ever giving up: first with history
+    dropped entirely, then with the current message's own text halved too.
+    Only a third 413 in a row produces a plain-language refusal; a success on
+    any attempt reaches the caller as an ordinary answer, no retry visible."""
+    system_content = _build_system_prompt(notes)
+    trimmed_history = _trim_history_to_budget(
+        history, system_content, user_content, REQUEST_TOKEN_BUDGET
+    )
 
     if reasoning_effort is not None:
         effort = reasoning_effort
@@ -254,14 +395,48 @@ async def ask_ai(
     else:
         effort = None
 
-    text = await _complete_once(messages, model, max_tokens, effort, enable_search)
-    while text is None and effort in _EFFORT_FALLBACK:
-        effort = _EFFORT_FALLBACK[effort]
-        text = await _complete_once(messages, model, max_tokens, effort, enable_search)
+    # attempt 1: budget-trimmed history, full message
+    # attempt 2 (only if attempt 1 gets a 413): no history, full message
+    # attempt 3 (only if attempt 2 also gets a 413): no history, halved message
+    attempts_history = [trimmed_history, [], []]
+    last_detail = ""
+    for attempt_num, hist in enumerate(attempts_history, start=1):
+        content = user_content if attempt_num < 3 else _truncate_content_half(user_content)
+        messages = [{"role": "system", "content": system_content}] + hist + [
+            {"role": "user", "content": content}
+        ]
+        try:
+            text = await _complete_with_effort_fallback(
+                messages, model, max_tokens, effort, enable_search
+            )
+        except _PayloadTooLargeError as e:
+            estimated_size = (
+                _estimate_tokens(system_content)
+                + sum(_estimate_message_tokens(m.get("content")) for m in hist)
+                + _estimate_message_tokens(content)
+            )
+            logger.warning(
+                "Groq 413 on attempt %d/3 (model=%s, estimated ~%d tokens): %s",
+                attempt_num,
+                model,
+                estimated_size,
+                e.detail,
+            )
+            last_detail = e.detail
+            continue
 
-    if text is not None:
-        return text
-    return "Ответ получился слишком длинным для обработки. Попробуйте задать вопрос короче."
+        if text is not None:
+            return text
+        return "Ответ получился слишком длинным для обработки. Попробуйте задать вопрос короче."
+
+    logger.warning("Groq 413 persisted after 3 attempts (model=%s): %s", model, last_detail)
+    raise AIError(
+        f"Groq API error: 413 (exhausted retries; last detail: {last_detail})",
+        user_message=(
+            "Запрос получился слишком большим, чтобы обработать его за один раз. "
+            "Пришлите, пожалуйста, один вопрос или один разворот текста за раз — так я смогу ответить."
+        ),
+    )
 
 
 async def transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
