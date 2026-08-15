@@ -24,6 +24,14 @@ PREMIUM_CREDIT_COST = int(os.environ.get("PREMIUM_CREDIT_COST", "3"))
 
 DAILY_FREE_MESSAGES = int(os.environ.get("DAILY_FREE_MESSAGES", "10"))
 DAILY_FREE_PREMIUM_MESSAGES = int(os.environ.get("DAILY_FREE_PREMIUM_MESSAGES", "5"))
+# Images (generate from scratch AND edit a photo) get their own separate
+# daily pool — NOT shared with the premium-chat quota above. Kept flat
+# across free/subscription/promo tiers on purpose (no elevated allowance
+# for paying tiers yet): generation itself is free (flux), but editing
+# costs real money per call (kontext, ~$0.04), so this is the one dial
+# that directly controls actual out-of-pocket spend, independent of
+# whatever the premium chat quota is tuned to.
+DAILY_FREE_IMAGE_MESSAGES = int(os.environ.get("DAILY_FREE_IMAGE_MESSAGES", "5"))
 REFERRAL_BONUS_MESSAGES = int(os.environ.get("REFERRAL_BONUS_MESSAGES", "20"))
 # Small immediate welcome gift for whoever clicks a referral link — paid
 # right away, unlike REFERRAL_BONUS_MESSAGES below. Not worth gating behind

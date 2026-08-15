@@ -186,6 +186,9 @@ def _generate_claim_token() -> str:
 
 
 _ensure_column("players", "premium_messages_used_today", "INTEGER NOT NULL DEFAULT 0")
+# Separate from messages_used_today/premium_messages_used_today — images
+# (generate + edit) have their own daily pool, see try_consume_image().
+_ensure_column("players", "images_used_today", "INTEGER NOT NULL DEFAULT 0")
 _ensure_column("players", "last_active_at", "TEXT")
 _ensure_column("players", "unlimited_until", "TEXT")
 _ensure_column("players", "referred_by", "INTEGER")
@@ -330,8 +333,8 @@ def _reset_if_new_day(user_id: int) -> None:
     row = cur.fetchone()
     if row and row[0] != today:
         _conn.execute(
-            "UPDATE players SET quota_date = ?, messages_used_today = 0, premium_messages_used_today = 0 "
-            "WHERE user_id = ?",
+            "UPDATE players SET quota_date = ?, messages_used_today = 0, "
+            "premium_messages_used_today = 0, images_used_today = 0 WHERE user_id = ?",
             (today, user_id),
         )
         _conn.commit()
@@ -354,13 +357,14 @@ def get_status(user_id: int, username: str | None) -> dict:
         cur = _conn.execute(
             "SELECT messages_used_today, premium_messages_used_today, bonus_credits, "
             "model_pref, unlimited_until, model_choice, subscription_until, subscription_status, "
-            "promo_bonus_until, promo_bonus_stacks "
+            "promo_bonus_until, promo_bonus_stacks, images_used_today "
             "FROM players WHERE user_id = ?",
             (user_id,),
         )
         (
             used, premium_used, bonus, model_pref, unlimited_until, model_choice,
             subscription_until, subscription_status, promo_bonus_until, promo_bonus_stacks,
+            images_used,
         ) = cur.fetchone()
         return {
             "used_today": used,
@@ -373,6 +377,7 @@ def get_status(user_id: int, username: str | None) -> dict:
             "subscription_status": subscription_status,
             "promo_bonus_until": _active_unlimited_until(promo_bonus_until),
             "promo_bonus_stacks": bool(promo_bonus_stacks),
+            "images_used_today": images_used,
         }
 
 
@@ -540,12 +545,74 @@ def try_consume_message(
         return False, status(limit_source=limit_source)
 
 
+def try_consume_image(
+    user_id: int, username: str | None, daily_limit: int, bonus_cost: int
+) -> tuple[bool, dict]:
+    """Separate quota from try_consume_message on purpose — images
+    (generate from scratch AND edit a photo) draw from their own
+    images_used_today counter, not messages_used_today/
+    premium_messages_used_today, so a picture never competes with premium
+    chat answers for the same daily slots. Flat across free/subscription/
+    promo tiers (no elevated allowance for paying tiers): editing costs
+    real per-call money (kontext), so this is the one dial that controls
+    actual spend directly, independent of how the chat quotas are tuned.
+    An active purchased unlimited pass still bypasses it entirely, same as
+    everything else it bypasses.
+
+    Returns (allowed, status) — status has the same "consumed"/refund shape
+    as try_consume_message (bucket "image_quota" or "bonus_credits"), plus
+    "images_used_today" for display.
+    """
+    with _lock:
+        _ensure_player(user_id, username)
+        _reset_if_new_day(user_id)
+        cur = _conn.execute(
+            "SELECT images_used_today, bonus_credits, unlimited_until FROM players WHERE user_id = ?",
+            (user_id,),
+        )
+        images_used, bonus, unlimited_raw = cur.fetchone()
+        unlimited_until = _active_unlimited_until(unlimited_raw)
+
+        def status(images_used=images_used, bonus=bonus, consumed=None) -> dict:
+            return {
+                "images_used_today": images_used,
+                "bonus_credits": bonus,
+                "consumed": consumed,
+            }
+
+        if unlimited_until:
+            return True, status()
+
+        if images_used < daily_limit:
+            _conn.execute(
+                "UPDATE players SET images_used_today = images_used_today + 1 WHERE user_id = ?",
+                (user_id,),
+            )
+            _conn.commit()
+            return True, status(
+                images_used=images_used + 1,
+                consumed={"bucket": "image_quota", "amount": 1},
+            )
+
+        if bonus < bonus_cost:
+            return False, status()
+        _conn.execute(
+            "UPDATE players SET bonus_credits = bonus_credits - ? WHERE user_id = ?",
+            (bonus_cost, user_id),
+        )
+        _conn.commit()
+        return True, status(
+            bonus=bonus - bonus_cost,
+            consumed={"bucket": "bonus_credits", "amount": bonus_cost},
+        )
+
+
 def refund_consumed_message(user_id: int, consumed: dict | None) -> None:
-    """Reverses exactly what a try_consume_message() call took, for a
-    request that consumed quota/credits but failed before producing an
-    answer — so a Groq error, a bug, or any other failure doesn't cost the
-    user a message they got nothing for. No-op if nothing was actually
-    consumed (e.g. the user was on an active unlimited pass/subscription)."""
+    """Reverses exactly what a try_consume_message()/try_consume_image() call
+    took, for a request that consumed quota/credits but failed before
+    producing an answer — so a Groq error, a bug, or any other failure
+    doesn't cost the user a message they got nothing for. No-op if nothing
+    was actually consumed (e.g. the user was on an active unlimited pass)."""
     if not consumed:
         return
     bucket, amount = consumed["bucket"], consumed["amount"]
@@ -560,6 +627,12 @@ def refund_consumed_message(user_id: int, consumed: dict | None) -> None:
             _conn.execute(
                 "UPDATE players SET premium_messages_used_today = "
                 "MAX(0, premium_messages_used_today - ?) WHERE user_id = ?",
+                (amount, user_id),
+            )
+        elif bucket == "image_quota":
+            _conn.execute(
+                "UPDATE players SET images_used_today = MAX(0, images_used_today - ?) "
+                "WHERE user_id = ?",
                 (amount, user_id),
             )
         elif bucket == "bonus_credits":

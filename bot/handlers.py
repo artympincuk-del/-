@@ -31,6 +31,7 @@ from pypdf import PdfReader
 from bot import ai, db
 from bot.config import (
     ADMIN_IDS,
+    DAILY_FREE_IMAGE_MESSAGES,
     DAILY_FREE_MESSAGES,
     DAILY_FREE_PREMIUM_MESSAGES,
     FAST_MODEL,
@@ -390,34 +391,15 @@ def quota_denied_text(status: dict) -> str:
 
 
 def _image_quota_denied_text(status: dict) -> str:
-    """Like quota_denied_text, but for image generation, which always bills
-    against the premium bucket regardless of the user's chat model
-    preference (see _process_image_request) — so this only ever needs the
-    premium-tier wording, and skips the "switch to the fast model" hint
-    that wouldn't make sense here."""
-    tz_abbr = datetime.datetime.now(_QUOTA_TZINFO).strftime("%Z")
-    if status.get("limit_source") == "promo":
-        _, premium_cap = db.promo_effective_limits(
-            True, status["promo_bonus_stacks"], status["subscription_until"] is not None
-        )
-        return (
-            f"Дневной лимит премиум-запросов по промо-бонусу исчерпан "
-            f"({status['premium_used_today']}/{premium_cap}), а на генерацию картинки не "
-            f"хватает докупленных сообщений ({PREMIUM_CREDIT_COST}). Бонус ещё действует, "
-            f"лимит обновится завтра в 00:00 {tz_abbr}. Пополните баланс: /buy."
-        )
-    if status.get("limit_source") == "subscription":
-        return (
-            f"Дневной лимит премиум-запросов подписки исчерпан "
-            f"({status['premium_used_today']}/{SUBSCRIPTION_DAILY_PREMIUM_MESSAGES}), а на "
-            f"генерацию картинки не хватает докупленных сообщений ({PREMIUM_CREDIT_COST}). "
-            f"Обновится в 00:00 {tz_abbr}. Пополните баланс: /buy."
-        )
+    """For _process_image_request/_process_image_edit_request — images have
+    their own flat daily pool (db.try_consume_image), separate from the
+    premium chat tiers, so this doesn't need any subscription/promo
+    branching the way quota_denied_text does."""
     return (
-        f"Бесплатный дневной лимит премиум-запросов исчерпан "
-        f"({status['premium_used_today']}/{DAILY_FREE_PREMIUM_MESSAGES}), а на генерацию "
-        f"картинки не хватает докупленных сообщений ({PREMIUM_CREDIT_COST}). "
-        "Пополните баланс: /buy — или дождитесь сброса в полночь."
+        f"Дневной лимит картинок исчерпан ({status['images_used_today']}/"
+        f"{DAILY_FREE_IMAGE_MESSAGES}), а докупленных сообщений не хватает "
+        f"({PREMIUM_CREDIT_COST} за картинку). Пополните баланс: /buy — или "
+        "дождитесь сброса в полночь."
     )
 
 
@@ -597,8 +579,9 @@ HELP_TEXT = (
     f"{DAILY_FREE_PREMIUM_MESSAGES} бесплатных в день, дальше по "
     f"{PREMIUM_CREDIT_COST} сообщения из пакета.\n"
     "• <b>Фото/голос/PDF</b> — как обычное сообщение выбранной модели.\n"
-    f"• <b>Картинка</b> — как премиум-запрос: из тех же {DAILY_FREE_PREMIUM_MESSAGES} "
-    f"бесплатных в день, дальше по {PREMIUM_CREDIT_COST} сообщения из пакета.\n"
+    f"• <b>Картинка</b> (генерация и редактирование) — свой лимит, "
+    f"{DAILY_FREE_IMAGE_MESSAGES} бесплатных в день, дальше по "
+    f"{PREMIUM_CREDIT_COST} сообщения из пакета.\n"
     f"• <b>Безлимит на {TIME_PACKAGES[0]['label']}</b> — {TIME_PACKAGES[0]['stars']} ⭐, "
     "сообщения не считаются, пока активен.\n"
     f"• <b>Подписка на месяц</b> — {SUBSCRIPTION['stars']} ⭐, до "
@@ -690,6 +673,7 @@ def _balance_text(user_id: int, username: str | None) -> str:
         f"Модель: {model_name}\n"
         f"Быстрая, {usage_label}: {status['used_today']}/{daily_cap}\n"
         f"Премиум, {usage_label}: {status['premium_used_today']}/{daily_premium_cap}\n"
+        f"Картинки сегодня: {status['images_used_today']}/{DAILY_FREE_IMAGE_MESSAGES}\n"
         f"Докупленные сообщения: <b>{status['bonus_credits']}</b>\n\n"
         f"Пополнить прямо здесь — выбери пакет ниже:"
     )
@@ -1210,8 +1194,8 @@ IMAGE_INTRO_TEXT = (
     f"акварели») — не нужна команда, просто напиши и отправь.\n\n"
     f"Или пришли фото с подписью, что в нём изменить (например: «добавь усы») — "
     f"отредактирую именно это фото, а не нарисую новое.\n\n"
-    f"Стоимость: как премиум-запрос — списывается из {DAILY_FREE_PREMIUM_MESSAGES} "
-    f"бесплатных премиум-запросов в день, а когда они кончатся — "
+    f"Стоимость: {DAILY_FREE_IMAGE_MESSAGES} бесплатных картинок в день (свой лимит, "
+    f"не общий с обычными сообщениями), а когда они кончатся — "
     f"{PREMIUM_CREDIT_COST} докупленных сообщений за картинку. Пополнить — кнопка «Баланс»."
 )
 
@@ -1237,14 +1221,9 @@ async def _process_image_request(
         await message.answer(IMAGE_INTRO_TEXT)
         return
 
-    # Billed as a premium-tier request regardless of the user's fast/premium
-    # chat preference — generating an image is inherently premium-cost value.
-    # Reuses the exact same daily-quota machinery (free/subscription/promo
-    # tiers, bonus_credits fallback, refund-on-failure) as a normal premium
-    # chat message, just forced onto the premium bucket via force_premium.
-    allowed, status = db.try_consume_message(
-        user_id, username, DAILY_FREE_MESSAGES, DAILY_FREE_PREMIUM_MESSAGES, PREMIUM_CREDIT_COST,
-        force_premium=True,
+    # Its own daily pool — separate from premium chat, see try_consume_image.
+    allowed, status = db.try_consume_image(
+        user_id, username, DAILY_FREE_IMAGE_MESSAGES, PREMIUM_CREDIT_COST
     )
     if not allowed:
         await message.answer(_image_quota_denied_text(status))
@@ -1300,7 +1279,7 @@ async def _process_image_edit_request(
 ) -> None:
     """Edits an actual photo (kontext model, via ai.edit_image) instead of
     generating a new one from a text description — see _process_image_request
-    for that. Billed identically (force_premium=True, same refund-on-failure
+    for that. Billed identically (same daily image pool, same refund-on-failure
     pattern). last_image_file_id is updated to the RESULT's own file_id (not
     the original), so "Ещё раз"/"Изменить" chain further edits onto the
     latest version rather than always the first upload."""
@@ -1309,9 +1288,8 @@ async def _process_image_edit_request(
         await message.answer(IMAGE_INTRO_TEXT)
         return
 
-    allowed, status = db.try_consume_message(
-        user_id, username, DAILY_FREE_MESSAGES, DAILY_FREE_PREMIUM_MESSAGES, PREMIUM_CREDIT_COST,
-        force_premium=True,
+    allowed, status = db.try_consume_image(
+        user_id, username, DAILY_FREE_IMAGE_MESSAGES, PREMIUM_CREDIT_COST
     )
     if not allowed:
         await message.answer(_image_quota_denied_text(status))
