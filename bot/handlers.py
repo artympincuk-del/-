@@ -38,6 +38,7 @@ from bot.config import (
     FAST_REASONING_EFFORT,
     MAX_HISTORY_TURNS,
     PREMIUM_CREDIT_COST,
+    POLLINATIONS_API_KEY,
     PREMIUM_MODEL,
     PREMIUM_REASONING_EFFORT,
     PROMO_BONUS_DAILY_MESSAGES,
@@ -554,16 +555,27 @@ async def cb_menu_back(callback: CallbackQuery, state: FSMContext) -> None:
     await _edit_or_send(callback, "📋 <b>Меню</b>", main_menu_keyboard())
 
 
+if POLLINATIONS_API_KEY:
+    _HELP_IMAGE_BULLET = (
+        "• <b>Картинки</b> — кнопка «Картинка» в меню (или «нарисуй ...») рисует "
+        "с нуля; фото с подписью там же — редактирует именно это фото (например: "
+        "«добавь усы»). Кнопки «Ещё раз» / «Изменить» под готовой картинкой — "
+        "повторить или доработать.\n"
+    )
+else:
+    _HELP_IMAGE_BULLET = (
+        "• <b>Картинки</b> — кнопка «Картинка» в меню (или «нарисуй ...») рисует "
+        "с нуля. Кнопки «Ещё раз» / «Изменить» под готовой картинкой — повторить "
+        "или доработать.\n"
+    )
+
 HELP_TEXT = (
     "🤖 <b>Что я умею</b>\n\n"
     "• <b>Текст, голос, фото, PDF</b> — присылай как есть, отвечу.\n"
     "• <b>Фото</b> — можно с подписью-вопросом, распознаю содержимое.\n"
     "• <b>Голосовые</b> — распознаю речь и отвечу как на текст.\n"
     "• <b>PDF</b> — прочитаю файл и отвечу по содержимому.\n"
-    "• <b>Картинки</b> — кнопка «Картинка» в меню (или «нарисуй ...») рисует "
-    "с нуля; фото с подписью там же — редактирует именно это фото (например: "
-    "«добавь усы»). Кнопки «Ещё раз» / «Изменить» под готовой картинкой — "
-    "повторить или доработать.\n"
+    f"{_HELP_IMAGE_BULLET}"
     "• <b>Поиск в интернете</b> — сам решаю, когда нужны свежие данные "
     "(новости, курсы, факты).\n"
     "• <b>Заметки</b> — «Запомни: ...», учитываю в каждом ответе. Список — "
@@ -579,8 +591,8 @@ HELP_TEXT = (
     f"{DAILY_FREE_PREMIUM_MESSAGES} бесплатных в день, дальше по "
     f"{PREMIUM_CREDIT_COST} сообщения из пакета.\n"
     "• <b>Фото/голос/PDF</b> — как обычное сообщение выбранной модели.\n"
-    f"• <b>Картинка</b> (генерация и редактирование) — свой лимит, "
-    f"{DAILY_FREE_IMAGE_MESSAGES} бесплатных в день, дальше по "
+    f"• <b>Картинка</b>{' (генерация и редактирование)' if POLLINATIONS_API_KEY else ''} — "
+    f"свой лимит, {DAILY_FREE_IMAGE_MESSAGES} бесплатных в день, дальше по "
     f"{PREMIUM_CREDIT_COST} сообщения из пакета.\n"
     f"• <b>Безлимит на {TIME_PACKAGES[0]['label']}</b> — {TIME_PACKAGES[0]['stars']} ⭐, "
     "сообщения не считаются, пока активен.\n"
@@ -1188,12 +1200,23 @@ async def btn_notes_text(message: Message) -> None:
     await message.answer(_notes_text(message.from_user.id))
 
 
+# Photo editing needs a paid Pollinations key (see ai.edit_image) — when
+# it's not configured, don't advertise a feature that's just going to fail
+# with "недоступно". Purely a text toggle: the F.photo handler underneath
+# still works either way and degrades gracefully on its own, so restoring
+# the key later (config only, no code change) brings the mention right back.
+_PHOTO_EDITING_MENTION = (
+    "Или пришли фото с подписью, что в нём изменить (например: «добавь усы») — "
+    "отредактирую именно это фото, а не нарисую новое.\n\n"
+    if POLLINATIONS_API_KEY
+    else ""
+)
+
 IMAGE_INTRO_TEXT = (
     f"🎨 <b>Генерация картинок</b>\n\n"
     f"Опиши следующим сообщением, что нарисовать (например: «закат над горами в стиле "
     f"акварели») — не нужна команда, просто напиши и отправь.\n\n"
-    f"Или пришли фото с подписью, что в нём изменить (например: «добавь усы») — "
-    f"отредактирую именно это фото, а не нарисую новое.\n\n"
+    f"{_PHOTO_EDITING_MENTION}"
     f"Стоимость: {DAILY_FREE_IMAGE_MESSAGES} бесплатных картинок в день (свой лимит, "
     f"не общий с обычными сообщениями), а когда они кончатся — "
     f"{PREMIUM_CREDIT_COST} докупленных сообщений за картинку. Пополнить — кнопка «Баланс»."
