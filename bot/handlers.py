@@ -40,6 +40,8 @@ from bot.config import (
     PREMIUM_CREDIT_COST,
     PREMIUM_MODEL,
     PREMIUM_REASONING_EFFORT,
+    PROMO_BONUS_DAILY_MESSAGES,
+    PROMO_BONUS_DAILY_PREMIUM_MESSAGES,
     QUOTA_TZ,
     REFERRAL_BONUS_MESSAGES,
     REFERRAL_DAILY_CAP,
@@ -343,8 +345,25 @@ def model_keyboard(current_pref: str, current_choice: str) -> InlineKeyboardMark
 
 
 def quota_denied_text(status: dict) -> str:
+    tz_abbr = datetime.datetime.now(_QUOTA_TZINFO).strftime("%Z")
+    if status.get("limit_source") == "promo":
+        fast_cap, premium_cap = db.promo_effective_limits(
+            True, status["promo_bonus_stacks"], status["subscription_until"] is not None
+        )
+        if status["model_pref"] == "premium":
+            return (
+                f"Дневной лимит бонуса по промокоду на премиум-запросы исчерпан "
+                f"({status['premium_used_today']}/{premium_cap}), а докупленных сообщений "
+                f"не хватает. Бонус ещё действует, лимит обновится завтра в 00:00 {tz_abbr}. "
+                "Можно докупить пакет сообщений или час безлимита: /buy — либо "
+                "переключиться на быструю модель: /model"
+            )
+        return (
+            f"Дневной лимит бонуса по промокоду исчерпан ({status['used_today']}/{fast_cap} "
+            f"запросов). Бонус ещё действует, лимит обновится завтра в 00:00 {tz_abbr}. "
+            "Можно докупить пакет сообщений или час безлимита: /buy."
+        )
     if status.get("limit_source") == "subscription":
-        tz_abbr = datetime.datetime.now(_QUOTA_TZINFO).strftime("%Z")
         if status["model_pref"] == "premium":
             return (
                 f"Дневной лимит подписки на премиум-запросы исчерпан "
@@ -420,13 +439,14 @@ async def _apply_promo(message: Message) -> None:
     if not db.record_promo_visit(user_id, code):
         return
     username = message.from_user.username
-    new_expiry = db.activate_unlimited(user_id, username, promo["bonus_minutes"])
+    new_expiry = db.activate_promo_bonus(user_id, username, promo["bonus_minutes"])
     db.log_event(user_id, "promo_join")
     until_local = _format_local_time(new_expiry)
     duration = _format_minutes_duration(promo["bonus_minutes"])
     await message.answer(
-        f"🎁 Бонус по промокоду — безлимит на <b>{duration}</b>! "
-        f"Действует до <b>{until_local}</b>."
+        f"🎁 Бонус по промокоду на <b>{duration}</b> — до "
+        f"{PROMO_BONUS_DAILY_MESSAGES} быстрых и {PROMO_BONUS_DAILY_PREMIUM_MESSAGES} "
+        f"премиум-запросов в день! Действует до <b>{until_local}</b>."
     )
 
 
@@ -522,40 +542,46 @@ async def cb_menu_back(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 HELP_TEXT = (
-    "🤖 <b>Как это работает</b>\n\n"
-    f"• Быстрая модель (GPT-OSS 20B): {DAILY_FREE_MESSAGES} бесплатных сообщений в день, "
-    "дальше — из докупленного пакета.\n"
-    f"• Премиум модель (GPT-OSS 120B): думает глубже и точнее отвечает на сложные "
-    f"вопросы — {DAILY_FREE_PREMIUM_MESSAGES} бесплатных сообщений в день, дальше каждое "
+    "🤖 <b>Что я умею</b>\n\n"
+    "• Текст, голосовые, фото и PDF — присылай как есть, отвечу.\n"
+    "• Фото: можно с подписью-вопросом, распознаю содержимое.\n"
+    "• Голосовые: распознаю речь и отвечу как на обычное сообщение.\n"
+    "• PDF-документы: прочитаю файл и отвечу по содержимому.\n"
+    "• Картинки: кнопка «Картинка» в меню (или напиши «нарисуй ...») — опиши, что "
+    "нарисовать, без команд. Под готовой картинкой — кнопки «Ещё раз» (сгенерировать "
+    "заново) и «Изменить» (описать правку и перегенерировать с её учётом).\n"
+    "• Поиск в интернете: для вопросов про свежие новости, курсы, актуальные факты — "
+    "сам решаю, когда стоит поискать в сети, и использую это в ответе.\n"
+    "• Заметки: напиши «Запомни: ...» — учитываю это в каждом ответе, даже после "
+    "перезапуска. Список — кнопка «Заметки» в меню, удалить — /forget &lt;номер&gt;.\n"
+    "• Под каждым ответом — кнопки «Подробнее» / «Проще» / «Пример», не нужно "
+    "переписывать вопрос, чтобы уточнить ответ.\n"
+    "• В группах отвечаю, только если меня упомянуть (@username) или ответить на моё "
+    "сообщение — чтобы не отвечать на каждое сообщение в чате.\n\n"
+    "💰 <b>Сколько это стоит</b>\n\n"
+    f"• Быстрая модель: {DAILY_FREE_MESSAGES} бесплатных сообщений в день, дальше — из "
+    "докупленного пакета.\n"
+    f"• Премиум модель (думает глубже, точнее на сложных вопросах): "
+    f"{DAILY_FREE_PREMIUM_MESSAGES} бесплатных сообщений в день, дальше каждое "
     f"списывает {PREMIUM_CREDIT_COST} сообщений из докупленного пакета.\n"
-    "• Фото: пришли картинку (можно с подписью-вопросом) — распознаю содержимое. "
-    "Списывается как обычное сообщение.\n"
-    "• Голосовые: пришли голосовое — распознаю речь и отвечу как на обычное сообщение.\n"
-    "• PDF-документы: пришли файл — прочитаю и отвечу по содержимому.\n"
-    f"• Картинки: кнопка «Картинка» в меню (или напиши «нарисуй ...») — опиши, что нарисовать, "
-    f"без всяких команд. Стоит {IMAGE_CREDIT_COST} докупленных сообщений за картинку. Под "
-    f"готовой картинкой — кнопки «Ещё раз» (сгенерировать заново) и «Изменить» (описать "
-    f"правку и перегенерировать с её учётом).\n"
-    "• Поиск в интернете: для вопросов про свежие новости, курсы, актуальные факты — сам "
-    "решаю, когда стоит поискать в сети, и использую это в ответе.\n"
-    "• Заметки: напиши «Запомни: ...» — я буду учитывать это в каждом ответе, даже "
-    "после перезапуска. Список — кнопка «Заметки» в меню, удалить — /forget &lt;номер&gt;.\n"
-    "• ⏱ Безлимит на время: в разделе «Баланс» можно купить безлимит на 1 час — удобно, "
-    "если нужно решить много задач подряд и не считать сообщения.\n"
+    "• Фото/голосовые/PDF списываются как обычное сообщение выбранной модели.\n"
+    f"• Картинка — {IMAGE_CREDIT_COST} докупленных сообщений за штуку.\n"
+    f"• ⏱ Безлимит на {TIME_PACKAGES[0]['label']} — {TIME_PACKAGES[0]['stars']} ⭐, не "
+    "считает отдельные сообщения, пока активен.\n"
     f"• ⭐ Подписка на месяц ({SUBSCRIPTION['stars']} ⭐) — до {SUBSCRIPTION_DAILY_MESSAGES} "
     f"быстрых и {SUBSCRIPTION_DAILY_PREMIUM_MESSAGES} премиум-запросов в день, "
-    "автопродление, отменить можно в любой момент в «Баланс».\n"
-    "• 🔔 Напоминания (кнопка в меню) — по желанию, раз в сутки в выбранное время. "
-    "По умолчанию выключены, никаких рассылок без явного включения.\n"
-    "• Под каждым ответом есть кнопки «Подробнее» / «Проще» / «Пример» — не нужно "
-    "переписывать вопрос, чтобы уточнить ответ.\n"
+    "автопродление, отменить можно в любой момент в «Баланс».\n\n"
+    "🎁 <b>Как получить больше бесплатно</b>\n\n"
     f"• Пригласи друга (кнопка в меню) — он сразу получит {REFERRAL_SIGNUP_BONUS} "
     f"сообщений, а тебе начислится {REFERRAL_BONUS_MESSAGES}, когда он напишет боту "
     f"{REFERRAL_MIN_MESSAGES} сообщения(-ий).\n"
-    "• В группах бот отвечает, только если его упомянуть (@username) или ответить на "
-    "его сообщение — чтобы не отвечать на каждое сообщение в чате.\n"
-    "• Переписка сохраняется и может просматриваться поддержкой при разборе "
-    "обращений и ошибок.\n\n"
+    f"• Промокод от блогера/партнёра — временный бонус (срок зависит от конкретной "
+    f"ссылки), пока активен — до {PROMO_BONUS_DAILY_MESSAGES} быстрых и "
+    f"{PROMO_BONUS_DAILY_PREMIUM_MESSAGES} премиум-запросов в день.\n"
+    "• 🔔 Напоминания (кнопка в меню) — по желанию, раз в сутки в выбранное время. По "
+    "умолчанию выключены, никаких рассылок без явного включения.\n\n"
+    "Переписка сохраняется и может просматриваться поддержкой при разборе обращений и "
+    "ошибок.\n\n"
     "Открыть меню в любой момент — /menu."
 )
 
@@ -585,6 +611,10 @@ def _balance_text(user_id: int, username: str | None) -> str:
     if status["unlimited_until"]:
         until_local = _format_local_time(status["unlimited_until"])
         unlimited_line = f"⏱ <b>Безлимит активен до {until_local}</b> — лимиты ниже не расходуются.\n\n"
+
+    # Subscription and promo bonus are shown as separate lines even when
+    # both are active at once — someone paying for a subscription should
+    # always see it on screen, never have it silently replaced by "bonus".
     subscription_line = ""
     if status["subscription_until"]:
         until_local = _format_local_time(status["subscription_until"])
@@ -595,10 +625,24 @@ def _balance_text(user_id: int, username: str | None) -> str:
         else:
             subscription_line = f"⭐ <b>Подписка активна, продлится {until_local}</b>.\n\n"
 
-    # An active subscription draws from its own (bigger, but not unlimited)
-    # daily allowance rather than the free tier's — show usage against
-    # whichever one actually applies, not always the free-tier numbers.
-    if status["subscription_until"]:
+    promo_bonus_line = ""
+    if status["promo_bonus_until"]:
+        until_local = _format_local_time(status["promo_bonus_until"])
+        promo_bonus_line = f"🎁 <b>Бонус по промокоду активен до {until_local}</b>.\n\n"
+
+    # Whichever allowance is actually being spent right now (see
+    # try_consume_message for the identical order of checks): promo bonus
+    # first (it expires, unlike a subscription), then subscription, then
+    # the free tier. When a promo bonus and a subscription are both active,
+    # promo_effective_limits() folds them into ONE number (summed or
+    # capped, per promo_bonus_stacks) rather than showing two separately —
+    # that's the actual number the person can use today.
+    if status["promo_bonus_until"]:
+        daily_cap, daily_premium_cap = db.promo_effective_limits(
+            True, status["promo_bonus_stacks"], status["subscription_until"] is not None
+        )
+        usage_label = "сегодня"
+    elif status["subscription_until"]:
         daily_cap, daily_premium_cap = SUBSCRIPTION_DAILY_MESSAGES, SUBSCRIPTION_DAILY_PREMIUM_MESSAGES
         usage_label = "по подписке сегодня"
     else:
@@ -609,6 +653,7 @@ def _balance_text(user_id: int, username: str | None) -> str:
         f"📊 <b>Баланс</b>\n\n"
         f"{unlimited_line}"
         f"{subscription_line}"
+        f"{promo_bonus_line}"
         f"Модель: {model_name}\n"
         f"Быстрая, {usage_label}: {status['used_today']}/{daily_cap}\n"
         f"Премиум, {usage_label}: {status['premium_used_today']}/{daily_premium_cap}\n"
@@ -777,13 +822,17 @@ def _promo_stats_text(stats: dict, admin_view: bool) -> str:
 @router.message(Command("promo"))
 async def cmd_promo(message: Message) -> None:
     parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("Использование: /promo &lt;код&gt;")
+    if len(parts) != 3:
+        await message.answer("Использование: /promo &lt;код&gt; &lt;слово&gt;")
         return
     code = parts[1].strip().lower()
-    result = db.set_promo_owner(code, message.from_user.id)
-    if result == "not_found":
-        await message.answer(f"Промокод <code>{code}</code> не найден.")
+    token = parts[2].strip()
+    result = db.claim_promo_code(code, token, message.from_user.id)
+    if result == "invalid":
+        # Deliberately the same message whether the code doesn't exist or
+        # the word is just wrong — telling those apart would let anyone
+        # probe which codes exist.
+        await message.answer("Код или слово для привязки неверные.")
     elif result == "already_owned":
         await message.answer(f"Промокод <code>{code}</code> уже привязан к другому аккаунту.")
     else:
@@ -940,7 +989,8 @@ async def cb_buy_subscription(callback: CallbackQuery) -> None:
         title="Подписка на месяц",
         description=(
             f"До {SUBSCRIPTION_DAILY_MESSAGES} быстрых и {SUBSCRIPTION_DAILY_PREMIUM_MESSAGES} "
-            "премиум-запросов в день на 30 дней, автопродление через Telegram Stars."
+            f"премиум-запросов в день на {SUBSCRIPTION['days']} дней, автопродление через "
+            "Telegram Stars."
         ),
         payload=f"subscription:{PRICE_VERSION}:0",
         currency="XTR",
@@ -957,7 +1007,7 @@ async def cb_buy_subscription(callback: CallbackQuery) -> None:
     await callback.message.answer(
         f"⭐ <b>Подписка на месяц — {SUBSCRIPTION['stars']} ⭐/мес</b>\n\n"
         f"До {SUBSCRIPTION_DAILY_MESSAGES} быстрых и {SUBSCRIPTION_DAILY_PREMIUM_MESSAGES} "
-        "премиум-запросов в день, автопродление каждые 30 дней. "
+        f"премиум-запросов в день, автопродление каждые {SUBSCRIPTION['days']} дней. "
         "Отменить в любой момент можно в «Баланс».",
         reply_markup=kb,
     )
@@ -1308,13 +1358,17 @@ async def cmd_whoami(message: Message) -> None:
 
 
 def _resolve_target(target: str) -> int | None:
-    """Accepts either a numeric Telegram ID or @username (username lookup
-    only works for users who have messaged the bot at least once)."""
-    if target.startswith("@"):
-        return db.find_user_id_by_username(target[1:])
+    """Accepts a numeric Telegram ID, @username, or a bare username with no
+    @ — case doesn't matter for usernames (find_user_id_by_username does a
+    case-insensitive lookup). Username lookup only works for users who have
+    messaged the bot at least once (that's the only way we learn it), and
+    always resolves against their most recently seen username — Telegram
+    usernames can change, and every message updates it in the DB, so this
+    needs no separate sync."""
     if target.isdigit():
         return int(target)
-    return None
+    username = target[1:] if target.startswith("@") else target
+    return db.find_user_id_by_username(username)
 
 
 ADMIN_PAGE_SIZE = 8
@@ -1322,7 +1376,9 @@ ADMIN_PAGE_SIZE = 8
 ADMIN_MENU_TEXT = (
     "🔑 <b>Админ-панель</b>\n\n"
     "Команды по-прежнему работают: /grant, /users, /chatlog "
-    "&lt;user_id или @username&gt;, /refund &lt;telegram_payment_charge_id&gt;."
+    "&lt;@username или id&gt;, /refund &lt;telegram_payment_charge_id&gt;, "
+    "/promo_add, /promo_off, /promo_list, /promo_stat, /promo_owner "
+    "&lt;код&gt; &lt;@username или id&gt;, /promo_token."
 )
 
 
@@ -1636,7 +1692,7 @@ async def cmd_grant(message: Message) -> None:
         return
     parts = message.text.split()
     if len(parts) != 3 or not parts[2].lstrip("-").isdigit():
-        await message.answer("Использование: /grant &lt;user_id или @username&gt; &lt;amount&gt;")
+        await message.answer("Использование: /grant &lt;@username или id&gt; &lt;amount&gt;")
         return
     target_id = _resolve_target(parts[1])
     if target_id is None:
@@ -1675,7 +1731,7 @@ async def cmd_chatlog(message: Message) -> None:
         return
     parts = message.text.split()
     if len(parts) < 2:
-        await message.answer("Использование: /chatlog &lt;user_id или @username&gt; [N]")
+        await message.answer("Использование: /chatlog &lt;@username или id&gt; [N]")
         return
     target_id = _resolve_target(parts[1])
     if target_id is None:
@@ -1728,7 +1784,8 @@ async def cmd_promo_add(message: Message) -> None:
     if not (0 <= revenue_share <= 100):
         await message.answer("Доля партнёра должна быть от 0 до 100.")
         return
-    if not db.create_promo_code(code, title, bonus_minutes, revenue_share, window_days):
+    token = db.create_promo_code(code, title, bonus_minutes, revenue_share, window_days)
+    if token is None:
         await message.answer(f"Промокод <code>{code}</code> уже существует.")
         return
     username = await _get_bot_username(message.bot)
@@ -1737,7 +1794,10 @@ async def cmd_promo_add(message: Message) -> None:
         f"✅ Промокод <code>{code}</code> создан для «{title}».\n"
         f"Бонус: {_format_minutes_duration(bonus_minutes)}, доля {revenue_share}%, "
         f"окно атрибуции {window_days} дн.\n\n"
-        f"Ссылка: <code>{link}</code>"
+        f"Отправь партнёру лично (слово нигде больше не показывается — если "
+        f"утечёт, перегенерируй: /promo_token {code} new):\n\n"
+        f"Твоя ссылка: {link}\n"
+        f"Привяжи её к себе командой боту: /promo {code} {token}"
     )
 
 
@@ -1795,6 +1855,60 @@ async def cmd_promo_stat(message: Message) -> None:
         await message.answer(f"Промокод <code>{code}</code> не найден.")
         return
     await _send_long(message, _promo_stats_text(stats, admin_view=True))
+
+
+@router.message(Command("promo_owner"))
+async def cmd_promo_owner(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.answer("Использование: /promo_owner &lt;код&gt; &lt;@username или id&gt;")
+        return
+    code = parts[1].strip().lower()
+    if db.get_promo_code(code) is None:
+        await message.answer(f"Промокод <code>{code}</code> не найден.")
+        return
+    if parts[2] == "0":
+        result = db.admin_set_promo_owner(code, None)
+        if result == "ok":
+            await message.answer(f"Владелец промокода <code>{code}</code> очищен.")
+        return
+    target_id = _resolve_target(parts[2])
+    if target_id is None:
+        await message.answer(
+            f"Пользователь {parts[2]} не найден — бот узнаёт username только у тех, кто "
+            "хотя бы раз ему писал, для остальных нужен числовой id."
+        )
+        return
+    db.admin_set_promo_owner(code, target_id)
+    await message.answer(f"Владелец промокода <code>{code}</code> назначен: {parts[2]}.")
+
+
+@router.message(Command("promo_token"))
+async def cmd_promo_token(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) not in (2, 3) or (len(parts) == 3 and parts[2] != "new"):
+        await message.answer("Использование: /promo_token &lt;код&gt; [new]")
+        return
+    code = parts[1].strip().lower()
+    if len(parts) == 3:
+        token = db.regenerate_promo_claim_token(code)
+        if token is None:
+            await message.answer(f"Промокод <code>{code}</code> не найден.")
+            return
+        await message.answer(
+            f"Новое слово для <code>{code}</code>: <code>{token}</code>\n"
+            "Старое больше не работает."
+        )
+        return
+    token = db.get_promo_claim_token(code)
+    if token is None:
+        await message.answer(f"Промокод <code>{code}</code> не найден.")
+        return
+    await message.answer(f"Слово для <code>{code}</code>: <code>{token}</code>")
 
 
 REMEMBER_PREFIXES = ("запомни:", "запомни,", "запомни ")

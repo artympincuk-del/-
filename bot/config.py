@@ -71,6 +71,16 @@ SUBSCRIPTION_DAILY_PREMIUM_MESSAGES = int(
     os.environ.get("SUBSCRIPTION_DAILY_PREMIUM_MESSAGES", "15")
 )
 
+# The promo-code time bonus (see db.activate_promo_bonus) is real time-boxed
+# access, but — like the subscription above — not truly unlimited within
+# that window. A promo link is public and Telegram accounts are free, so
+# without a daily cap here it would be an unmetered API-spend faucet for
+# anyone who finds the link, not just the partner's real subscribers.
+PROMO_BONUS_DAILY_MESSAGES = int(os.environ.get("PROMO_BONUS_DAILY_MESSAGES", "30"))
+PROMO_BONUS_DAILY_PREMIUM_MESSAGES = int(
+    os.environ.get("PROMO_BONUS_DAILY_PREMIUM_MESSAGES", "5")
+)
+
 ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()
 }

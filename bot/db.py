@@ -1,10 +1,14 @@
 import datetime
+import secrets
 import sqlite3
+import string
 import threading
 from zoneinfo import ZoneInfo
 
 from bot.config import (
     DB_PATH,
+    PROMO_BONUS_DAILY_MESSAGES,
+    PROMO_BONUS_DAILY_PREMIUM_MESSAGES,
     QUOTA_TZ,
     SUBSCRIPTION_DAILY_MESSAGES,
     SUBSCRIPTION_DAILY_PREMIUM_MESSAGES,
@@ -168,6 +172,19 @@ def _ensure_column(table: str, column: str, coldef: str) -> None:
         _conn.commit()
 
 
+# Excludes visually-similar characters (0/O/o, 1/l/I) so a partner reading
+# the word off a phone screen or hearing it dictated doesn't mistype it.
+_CLAIM_TOKEN_ALPHABET = "".join(
+    c for c in (string.digits + string.ascii_letters) if c not in "0Oo1lI"
+)
+
+
+def _generate_claim_token() -> str:
+    """8-character secret word gating who may claim a promo code's
+    ownership — secrets.choice (not random), so it isn't guessable."""
+    return "".join(secrets.choice(_CLAIM_TOKEN_ALPHABET) for _ in range(8))
+
+
 _ensure_column("players", "premium_messages_used_today", "INTEGER NOT NULL DEFAULT 0")
 _ensure_column("players", "last_active_at", "TEXT")
 _ensure_column("players", "unlimited_until", "TEXT")
@@ -219,6 +236,35 @@ _conn.execute(
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_charge_id "
     "ON payments (telegram_payment_charge_id)"
 )
+
+# Promo-code time bonus (see activate_promo_bonus) — deliberately its own
+# column, separate from unlimited_until (the genuinely-unlimited purchased
+# hourly pass, whose logic this must never touch).
+_ensure_column("players", "promo_bonus_until", "TEXT")
+# Snapshot taken the moment the bonus is granted: 1 if the user had no
+# active subscription yet (their daily limits later stack with a
+# subscription bought during the bonus window — see promo_effective_limits),
+# 0 if they were already subscribed (limits don't stack — an existing
+# subscriber can't double their allowance just by clicking a promo link).
+_ensure_column("players", "promo_bonus_stacks", "INTEGER NOT NULL DEFAULT 0")
+
+# Secret word gating who may claim a promo code's ownership via /promo
+# <code> <word> — the code itself is public (it's in the shareable link),
+# so ownership can't be "whoever asks first" the way it used to be.
+_ensure_column("promo_codes", "claim_token", "TEXT")
+# One-time backfill for codes created before claim_token existed — without
+# this they'd be permanently unclaimable (nobody has a word for them).
+_backfill_rows = _conn.execute(
+    "SELECT code FROM promo_codes WHERE claim_token IS NULL OR claim_token = ''"
+).fetchall()
+for (_backfill_code,) in _backfill_rows:
+    _conn.execute(
+        "UPDATE promo_codes SET claim_token = ? WHERE code = ?",
+        (_generate_claim_token(), _backfill_code),
+    )
+if _backfill_rows:
+    _conn.commit()
+
 _conn.commit()
 
 
@@ -307,13 +353,14 @@ def get_status(user_id: int, username: str | None) -> dict:
         _reset_if_new_day(user_id)
         cur = _conn.execute(
             "SELECT messages_used_today, premium_messages_used_today, bonus_credits, "
-            "model_pref, unlimited_until, model_choice, subscription_until, subscription_status "
+            "model_pref, unlimited_until, model_choice, subscription_until, subscription_status, "
+            "promo_bonus_until, promo_bonus_stacks "
             "FROM players WHERE user_id = ?",
             (user_id,),
         )
         (
             used, premium_used, bonus, model_pref, unlimited_until, model_choice,
-            subscription_until, subscription_status,
+            subscription_until, subscription_status, promo_bonus_until, promo_bonus_stacks,
         ) = cur.fetchone()
         return {
             "used_today": used,
@@ -324,6 +371,8 @@ def get_status(user_id: int, username: str | None) -> dict:
             "model_choice": model_choice,
             "subscription_until": _active_unlimited_until(subscription_until),
             "subscription_status": subscription_status,
+            "promo_bonus_until": _active_unlimited_until(promo_bonus_until),
+            "promo_bonus_stacks": bool(promo_bonus_stacks),
         }
 
 
@@ -349,36 +398,46 @@ def try_consume_message(
     Checked in this order:
       1. Active time-based unlimited pass (bought by the hour) — genuinely
          unlimited, nothing touched, since it's already bounded by time.
-      2. Active subscription — draws from the same counters as the free
+      2. Active promo-code bonus (time-boxed, from a partner's link) — draws
+         from the same counters as the free tier, but compared against a
+         daily cap of its own (see promo_effective_limits) that can stack
+         with an active subscription's cap or not, depending on
+         promo_bonus_stacks. Checked before the subscription on its own
+         (i.e. a promo bonus is never silently ignored just because a
+         subscription also exists) because it expires and the subscription
+         doesn't.
+      3. Active subscription — draws from the same counters as the free
          tier, but compared against SUBSCRIPTION_DAILY_MESSAGES /
          SUBSCRIPTION_DAILY_PREMIUM_MESSAGES instead of `daily_limit` /
          `daily_premium_limit` (a subscription is a bigger daily allowance,
          not true unlimited — one heavy user shouldn't eat the whole
          margin on a flat monthly price). Falls back to bonus_credits once
          that's exhausted, same as the free tier does.
-      3. Free tier — free daily quota first (`daily_limit`/
+      4. Free tier — free daily quota first (`daily_limit`/
          `daily_premium_limit`), then bonus_credits.
 
     Returns (allowed, status) where status mirrors get_status's shape after
     the attempt, plus "consumed" (what was taken, for refund_consumed_message)
-    and "limit_source" ("subscription" or "free" — which daily allowance
-    was actually being checked, for quota_denied_text).
+    and "limit_source" ("promo", "subscription" or "free" — which daily
+    allowance was actually being checked, for quota_denied_text).
     """
     with _lock:
         _ensure_player(user_id, username)
         _reset_if_new_day(user_id)
         cur = _conn.execute(
             "SELECT messages_used_today, premium_messages_used_today, bonus_credits, "
-            "model_pref, unlimited_until, model_choice, subscription_until, subscription_status "
+            "model_pref, unlimited_until, model_choice, subscription_until, subscription_status, "
+            "promo_bonus_until, promo_bonus_stacks "
             "FROM players WHERE user_id = ?",
             (user_id,),
         )
         (
             used, premium_used, bonus, model_pref, unlimited_raw, model_choice,
-            subscription_raw, subscription_status,
+            subscription_raw, subscription_status, promo_bonus_raw, promo_bonus_stacks,
         ) = cur.fetchone()
         unlimited_until = _active_unlimited_until(unlimited_raw)
         subscription_until = _active_unlimited_until(subscription_raw)
+        promo_bonus_until = _active_unlimited_until(promo_bonus_raw)
 
         def status(
             used=used, premium_used=premium_used, bonus=bonus, consumed=None, limit_source="free"
@@ -392,13 +451,15 @@ def try_consume_message(
                 "model_choice": model_choice,
                 "subscription_until": subscription_until,
                 "subscription_status": subscription_status,
+                "promo_bonus_until": promo_bonus_until,
+                "promo_bonus_stacks": bool(promo_bonus_stacks),
                 # What this call actually took, so a failed request (no
                 # answer produced) can be refunded via refund_consumed_message
                 # instead of silently costing the user a wasted message.
                 "consumed": consumed,
-                # Which daily allowance was actually checked ("subscription"
-                # or "free") — quota_denied_text needs this to explain the
-                # right thing when a subscriber (not a free user) is denied.
+                # Which daily allowance was actually checked ("promo",
+                # "subscription" or "free") — quota_denied_text needs this
+                # to explain the right thing when denied.
                 "limit_source": limit_source,
             }
 
@@ -406,7 +467,12 @@ def try_consume_message(
             # Active time pass: no quota/credits touched at all.
             return True, status()
 
-        if subscription_until:
+        if promo_bonus_until:
+            effective_daily_limit, effective_daily_premium_limit = promo_effective_limits(
+                True, bool(promo_bonus_stacks), subscription_until is not None
+            )
+            limit_source = "promo"
+        elif subscription_until:
             effective_daily_limit = SUBSCRIPTION_DAILY_MESSAGES
             effective_daily_premium_limit = SUBSCRIPTION_DAILY_PREMIUM_MESSAGES
             limit_source = "subscription"
@@ -741,6 +807,67 @@ def activate_unlimited(user_id: int, username: str | None, minutes: int) -> str:
         new_expiry = (base + datetime.timedelta(minutes=minutes)).isoformat(timespec="seconds")
         _conn.execute(
             "UPDATE players SET unlimited_until = ? WHERE user_id = ?", (new_expiry, user_id)
+        )
+        _conn.commit()
+        return new_expiry
+
+
+def promo_effective_limits(
+    promo_bonus_active: bool, promo_bonus_stacks: bool, subscription_active: bool
+) -> tuple[int, int] | None:
+    """Pure (no DB access) — the daily (fast, premium) limits an active
+    promo bonus grants. Called from both try_consume_message (spending) and
+    handlers.py (display), so the two can never disagree on the number.
+
+    - No promo bonus active: None.
+    - Promo bonus active, no subscription active right now: just the
+      bonus's own daily cap.
+    - Both active, promo_bonus_stacks (user had no subscription when they
+      joined via the promo link): the two caps ADD UP — a reward for
+      converting to a paying subscriber during the bonus window.
+    - Both active, not promo_bonus_stacks (user was already subscribed when
+      they joined via the link): the LARGER of the two caps applies, not
+      the sum — an existing subscriber can't double their daily allowance
+      just by clicking a public promo link.
+    """
+    if not promo_bonus_active:
+        return None
+    if not subscription_active:
+        return (PROMO_BONUS_DAILY_MESSAGES, PROMO_BONUS_DAILY_PREMIUM_MESSAGES)
+    if promo_bonus_stacks:
+        return (
+            PROMO_BONUS_DAILY_MESSAGES + SUBSCRIPTION_DAILY_MESSAGES,
+            PROMO_BONUS_DAILY_PREMIUM_MESSAGES + SUBSCRIPTION_DAILY_PREMIUM_MESSAGES,
+        )
+    return (
+        max(PROMO_BONUS_DAILY_MESSAGES, SUBSCRIPTION_DAILY_MESSAGES),
+        max(PROMO_BONUS_DAILY_PREMIUM_MESSAGES, SUBSCRIPTION_DAILY_PREMIUM_MESSAGES),
+    )
+
+
+def activate_promo_bonus(user_id: int, username: str | None, minutes: int) -> str:
+    """Like activate_unlimited, but for the promo-code time bonus: writes
+    promo_bonus_until (a capped daily allowance — see promo_effective_limits
+    and try_consume_message) instead of unlimited_until (genuinely
+    unlimited, reserved for purchased hourly passes — never touched here).
+    Also snapshots, at the moment the bonus is granted, whether the user
+    already had an active subscription — see promo_bonus_stacks."""
+    with _lock:
+        _ensure_player(user_id, username)
+        cur = _conn.execute(
+            "SELECT promo_bonus_until, subscription_until FROM players WHERE user_id = ?",
+            (user_id,),
+        )
+        current_raw, subscription_raw = cur.fetchone()
+        base = _utcnow_naive()
+        active = _active_unlimited_until(current_raw)
+        if active:
+            base = datetime.datetime.fromisoformat(active)
+        new_expiry = (base + datetime.timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        stacks = 0 if _active_unlimited_until(subscription_raw) else 1
+        _conn.execute(
+            "UPDATE players SET promo_bonus_until = ?, promo_bonus_stacks = ? WHERE user_id = ?",
+            (new_expiry, stacks, user_id),
         )
         _conn.commit()
         return new_expiry
@@ -1209,23 +1336,25 @@ def mark_reminder_sent(user_id: int, today: str) -> None:
 
 def create_promo_code(
     code: str, title: str, bonus_minutes: int, revenue_share: int, window_days: int
-) -> bool:
-    """Creates a promo code, active and owner-less (the partner claims
-    ownership later via set_promo_owner). Returns False if the code already
-    exists instead of raising, so the caller can show a friendly "code
-    taken" message rather than a traceback."""
+) -> str | None:
+    """Creates a promo code, active and owner-less, with a freshly generated
+    claim token (see claim_promo_code — the code itself is public, in the
+    shareable link, so the token is what actually gates ownership). Returns
+    the token, or None if the code already exists, so the caller can show a
+    friendly "code taken" message rather than a traceback."""
     with _lock:
+        token = _generate_claim_token()
         try:
             _conn.execute(
                 "INSERT INTO promo_codes (code, title, bonus_minutes, revenue_share, "
-                "window_days, created_at, active) VALUES (?, ?, ?, ?, ?, ?, 1)",
-                (code, title, bonus_minutes, revenue_share, window_days, _now()),
+                "window_days, created_at, active, claim_token) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+                (code, title, bonus_minutes, revenue_share, window_days, _now(), token),
             )
         except sqlite3.IntegrityError:
             _conn.rollback()
-            return False
+            return None
         _conn.commit()
-        return True
+        return token
 
 
 def _promo_code_row_to_dict(row: tuple | None) -> dict | None:
@@ -1264,17 +1393,27 @@ def get_promo_code_by_owner(user_id: int) -> dict | None:
         return _promo_code_row_to_dict(cur.fetchone())
 
 
-def set_promo_owner(code: str, user_id: int) -> str:
-    """Claims a code for a partner — but only the first claim; a code
-    already owned by someone else is rejected rather than reassigned.
-    Returns "not_found", "already_owned" (by a different user_id), or "ok"
-    (covers both a fresh claim and the same owner re-running /promo)."""
+def claim_promo_code(code: str, token: str, user_id: int) -> str:
+    """Partner-facing claim via /promo <code> <word> — requires the secret
+    claim_token, not just the (public, link-visible) code. Returns:
+      "invalid" — code doesn't exist OR the token is wrong. Deliberately
+                  the same result for both, so the response can't be used
+                  to probe which codes exist.
+      "already_owned" — code + token are right, but it's owned by someone
+                  else already (not reassigned even with the correct word —
+                  use admin_set_promo_owner to force that).
+      "ok" — claimed (a fresh claim, or the same owner re-running /promo).
+    """
     with _lock:
-        cur = _conn.execute("SELECT owner_user_id FROM promo_codes WHERE code = ?", (code,))
+        cur = _conn.execute(
+            "SELECT owner_user_id, claim_token FROM promo_codes WHERE code = ?", (code,)
+        )
         row = cur.fetchone()
         if row is None:
-            return "not_found"
-        (current_owner,) = row
+            return "invalid"
+        current_owner, real_token = row
+        if not real_token or not secrets.compare_digest(token, real_token):
+            return "invalid"
         if current_owner is not None and current_owner != user_id:
             return "already_owned"
         _conn.execute(
@@ -1282,6 +1421,46 @@ def set_promo_owner(code: str, user_id: int) -> str:
         )
         _conn.commit()
         return "ok"
+
+
+def admin_set_promo_owner(code: str, user_id: int | None) -> str:
+    """Admin-only forced (re)assignment via /promo_owner — bypasses the
+    claim token entirely and, unlike claim_promo_code, can also clear an
+    existing owner (user_id=None) or hand the code to someone else outright.
+    For when the real owner lost access to their account, or a code was
+    claimed by the wrong person before this whole token system existed.
+    Returns "not_found" or "ok"."""
+    with _lock:
+        cur = _conn.execute("SELECT code FROM promo_codes WHERE code = ?", (code,))
+        if cur.fetchone() is None:
+            return "not_found"
+        _conn.execute(
+            "UPDATE promo_codes SET owner_user_id = ? WHERE code = ?", (user_id, code)
+        )
+        _conn.commit()
+        return "ok"
+
+
+def get_promo_claim_token(code: str) -> str | None:
+    """For /promo_token <code> — None if the code doesn't exist."""
+    with _lock:
+        cur = _conn.execute("SELECT claim_token FROM promo_codes WHERE code = ?", (code,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def regenerate_promo_claim_token(code: str) -> str | None:
+    """Invalidates the old claim word and issues a fresh one — for
+    /promo_token <code> new, when a word has leaked. Returns the new word,
+    or None if the code doesn't exist."""
+    with _lock:
+        cur = _conn.execute("SELECT code FROM promo_codes WHERE code = ?", (code,))
+        if cur.fetchone() is None:
+            return None
+        token = _generate_claim_token()
+        _conn.execute("UPDATE promo_codes SET claim_token = ? WHERE code = ?", (token, code))
+        _conn.commit()
+        return token
 
 
 def disable_promo_code(code: str) -> str:
