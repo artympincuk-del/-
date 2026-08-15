@@ -122,6 +122,39 @@ _conn.execute(
 _conn.execute(
     "CREATE INDEX IF NOT EXISTS idx_events_event_created_at ON events (event, created_at)"
 )
+# Blogger/partner promo codes — parallel to (and independent of) the
+# referral program above. owner_user_id starts NULL: the admin creates the
+# code first, the partner claims it later via /promo <code>. A code has no
+# expiry and no auto-disable of any kind — it stays active until an admin
+# runs /promo_off, however long that takes.
+_conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS promo_codes (
+        code TEXT PRIMARY KEY,
+        owner_user_id INTEGER,
+        title TEXT NOT NULL,
+        bonus_minutes INTEGER NOT NULL,
+        revenue_share INTEGER NOT NULL,
+        window_days INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1
+    )
+    """
+)
+# One row per user, forever — first promo code a user arrives through wins
+# and is never overwritten, same "first wins" rule as players.referred_by
+# for the referral program. joined_at anchors that user's own
+# window_days-long attribution window (not the code's lifetime).
+_conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS promo_visits (
+        user_id INTEGER PRIMARY KEY,
+        code TEXT NOT NULL,
+        joined_at TEXT NOT NULL
+    )
+    """
+)
+_conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_visits_code ON promo_visits (code)")
 _conn.commit()
 
 MAX_NOTES_PER_USER = 30
@@ -176,6 +209,12 @@ _ensure_column("payments", "status", "TEXT NOT NULL DEFAULT 'paid'")
 # (independent of PACKAGES possibly changing later), so a refund can reverse
 # exactly what was given regardless of subsequent price changes.
 _ensure_column("payments", "credited_amount", "INTEGER")
+# Which promo code (if any) this payment counts toward for partner revenue
+# share — set at credit time in record_payment_and_credit() based on
+# promo_visits + the code's window_days, never touched afterward (so a
+# later window_days edit or the code going inactive doesn't retroactively
+# change which past payments counted).
+_ensure_column("payments", "promo_code", "TEXT")
 _conn.execute(
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_charge_id "
     "ON payments (telegram_payment_charge_id)"
@@ -741,12 +780,13 @@ def record_payment_and_credit(
     """
     with _lock:
         _ensure_player(user_id, username)
+        promo_code = _resolve_promo_for_payment(user_id)
         try:
             _conn.execute(
                 "INSERT INTO payments (user_id, username, kind, amount_stars, created_at, "
-                "telegram_payment_charge_id, credited_amount, status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'paid')",
-                (user_id, username, kind, amount_stars, _now(), charge_id, amount),
+                "telegram_payment_charge_id, credited_amount, status, promo_code) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'paid', ?)",
+                (user_id, username, kind, amount_stars, _now(), charge_id, amount, promo_code),
             )
         except sqlite3.IntegrityError:
             _conn.rollback()
@@ -833,7 +873,7 @@ def get_payment(payment_id: int) -> dict | None:
     with _lock:
         cur = _conn.execute(
             "SELECT id, user_id, username, kind, amount_stars, credited_amount, "
-            "telegram_payment_charge_id, status, created_at FROM payments WHERE id = ?",
+            "telegram_payment_charge_id, status, created_at, promo_code FROM payments WHERE id = ?",
             (payment_id,),
         )
         row = cur.fetchone()
@@ -844,7 +884,7 @@ def get_payment_by_charge_id(charge_id: str) -> dict | None:
     with _lock:
         cur = _conn.execute(
             "SELECT id, user_id, username, kind, amount_stars, credited_amount, "
-            "telegram_payment_charge_id, status, created_at FROM payments "
+            "telegram_payment_charge_id, status, created_at, promo_code FROM payments "
             "WHERE telegram_payment_charge_id = ?",
             (charge_id,),
         )
@@ -855,7 +895,7 @@ def get_payment_by_charge_id(charge_id: str) -> dict | None:
 def _payment_row_to_dict(row: tuple | None) -> dict | None:
     if row is None:
         return None
-    pid, uid, uname, kind, stars, credited_amount, charge_id, status, created_at = row
+    pid, uid, uname, kind, stars, credited_amount, charge_id, status, created_at, promo_code = row
     return {
         "id": pid,
         "user_id": uid,
@@ -866,6 +906,7 @@ def _payment_row_to_dict(row: tuple | None) -> dict | None:
         "charge_id": charge_id,
         "status": status,
         "created_at": created_at,
+        "promo_code": promo_code,
     }
 
 
@@ -972,7 +1013,7 @@ def get_admin_stats() -> dict:
         }
 
 
-FUNNEL_EVENTS = ("buy_opened", "invoice_sent", "paid")
+FUNNEL_EVENTS = ("buy_opened", "invoice_sent", "paid", "promo_join")
 
 
 def log_event(user_id: int, event: str) -> None:
@@ -1164,6 +1205,239 @@ def mark_reminder_sent(user_id: int, today: str) -> None:
             "UPDATE players SET reminder_last_sent_date = ? WHERE user_id = ?", (today, user_id)
         )
         _conn.commit()
+
+
+def create_promo_code(
+    code: str, title: str, bonus_minutes: int, revenue_share: int, window_days: int
+) -> bool:
+    """Creates a promo code, active and owner-less (the partner claims
+    ownership later via set_promo_owner). Returns False if the code already
+    exists instead of raising, so the caller can show a friendly "code
+    taken" message rather than a traceback."""
+    with _lock:
+        try:
+            _conn.execute(
+                "INSERT INTO promo_codes (code, title, bonus_minutes, revenue_share, "
+                "window_days, created_at, active) VALUES (?, ?, ?, ?, ?, ?, 1)",
+                (code, title, bonus_minutes, revenue_share, window_days, _now()),
+            )
+        except sqlite3.IntegrityError:
+            _conn.rollback()
+            return False
+        _conn.commit()
+        return True
+
+
+def _promo_code_row_to_dict(row: tuple | None) -> dict | None:
+    if row is None:
+        return None
+    code, owner_user_id, title, bonus_minutes, revenue_share, window_days, created_at, active = row
+    return {
+        "code": code,
+        "owner_user_id": owner_user_id,
+        "title": title,
+        "bonus_minutes": bonus_minutes,
+        "revenue_share": revenue_share,
+        "window_days": window_days,
+        "created_at": created_at,
+        "active": bool(active),
+    }
+
+
+def get_promo_code(code: str) -> dict | None:
+    with _lock:
+        cur = _conn.execute(
+            "SELECT code, owner_user_id, title, bonus_minutes, revenue_share, window_days, "
+            "created_at, active FROM promo_codes WHERE code = ?",
+            (code,),
+        )
+        return _promo_code_row_to_dict(cur.fetchone())
+
+
+def get_promo_code_by_owner(user_id: int) -> dict | None:
+    with _lock:
+        cur = _conn.execute(
+            "SELECT code, owner_user_id, title, bonus_minutes, revenue_share, window_days, "
+            "created_at, active FROM promo_codes WHERE owner_user_id = ?",
+            (user_id,),
+        )
+        return _promo_code_row_to_dict(cur.fetchone())
+
+
+def set_promo_owner(code: str, user_id: int) -> str:
+    """Claims a code for a partner — but only the first claim; a code
+    already owned by someone else is rejected rather than reassigned.
+    Returns "not_found", "already_owned" (by a different user_id), or "ok"
+    (covers both a fresh claim and the same owner re-running /promo)."""
+    with _lock:
+        cur = _conn.execute("SELECT owner_user_id FROM promo_codes WHERE code = ?", (code,))
+        row = cur.fetchone()
+        if row is None:
+            return "not_found"
+        (current_owner,) = row
+        if current_owner is not None and current_owner != user_id:
+            return "already_owned"
+        _conn.execute(
+            "UPDATE promo_codes SET owner_user_id = ? WHERE code = ?", (user_id, code)
+        )
+        _conn.commit()
+        return "ok"
+
+
+def disable_promo_code(code: str) -> str:
+    """Sets active = 0. Deliberately doesn't touch promo_visits or existing
+    payments' promo_code — users already attributed to this code keep their
+    attribution window, only new visits stop getting the signup bonus.
+    Returns "not_found", "already_off", or "ok"."""
+    with _lock:
+        cur = _conn.execute("SELECT active FROM promo_codes WHERE code = ?", (code,))
+        row = cur.fetchone()
+        if row is None:
+            return "not_found"
+        if not row[0]:
+            return "already_off"
+        _conn.execute("UPDATE promo_codes SET active = 0 WHERE code = ?", (code,))
+        _conn.commit()
+        return "ok"
+
+
+def get_promo_visit(user_id: int) -> dict | None:
+    with _lock:
+        cur = _conn.execute(
+            "SELECT code, joined_at FROM promo_visits WHERE user_id = ?", (user_id,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {"code": row[0], "joined_at": row[1]}
+
+
+def record_promo_visit(user_id: int, code: str) -> bool:
+    """Attributes a user to a promo code, but only the first time ever —
+    one user is permanently tied to whichever code (if any) they visited
+    first, mirroring set_referrer's "first wins" rule for the referral
+    program. Returns True iff this call is the one that set it."""
+    with _lock:
+        cur = _conn.execute(
+            "INSERT INTO promo_visits (user_id, code, joined_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id) DO NOTHING",
+            (user_id, code, _now()),
+        )
+        _conn.commit()
+        return cur.rowcount > 0
+
+
+def _resolve_promo_for_payment(user_id: int) -> str | None:
+    """Lock-free helper — only ever called from inside record_payment_and_credit,
+    which already holds _lock. Attributes a payment to this user's promo code
+    iff they're within that code's window_days of their own joined_at (the
+    window is per-user, anchored to when THEY joined, not to when the code
+    was created or when it might later be disabled)."""
+    cur = _conn.execute("SELECT code, joined_at FROM promo_visits WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    code, joined_at = row
+    cur = _conn.execute("SELECT window_days FROM promo_codes WHERE code = ?", (code,))
+    code_row = cur.fetchone()
+    if code_row is None:
+        return None
+    (window_days,) = code_row
+    try:
+        joined_dt = datetime.datetime.fromisoformat(joined_at)
+    except ValueError:
+        return None
+    deadline = joined_dt + datetime.timedelta(days=window_days)
+    return code if _utcnow_naive() <= deadline else None
+
+
+def _promo_stats(code: str) -> dict:
+    """Lock-free helper — only ever called from inside a function that
+    already holds _lock. Aggregates everything /mypromo and /promo_stat
+    show: visit counts, how many visitors have actually used the bot at
+    least once (a chat_log row — /start alone doesn't write one, so this
+    excludes people who only clicked the link and never sent a message),
+    payment count/revenue attributed to the code, the partner's share of
+    that revenue (floored), and how many visitors are still inside their
+    own attribution window right now."""
+    cur = _conn.execute("SELECT COUNT(*) FROM promo_visits WHERE code = ?", (code,))
+    (total_visits,) = cur.fetchone()
+
+    week_ago = (_utcnow_naive() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
+    cur = _conn.execute(
+        "SELECT COUNT(*) FROM promo_visits WHERE code = ? AND joined_at >= ?", (code, week_ago)
+    )
+    (visits_7d,) = cur.fetchone()
+
+    cur = _conn.execute(
+        "SELECT COUNT(DISTINCT pv.user_id) FROM promo_visits pv "
+        "WHERE pv.code = ? AND EXISTS ("
+        "  SELECT 1 FROM chat_log cl WHERE cl.user_id = pv.user_id AND cl.role = 'user'"
+        ")",
+        (code,),
+    )
+    (active_users,) = cur.fetchone()
+
+    cur = _conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(amount_stars), 0) FROM payments "
+        "WHERE promo_code = ? AND status = 'paid'",
+        (code,),
+    )
+    payments_count, revenue_stars = cur.fetchone()
+
+    cur = _conn.execute("SELECT window_days FROM promo_codes WHERE code = ?", (code,))
+    (window_days,) = cur.fetchone()
+    cur = _conn.execute("SELECT joined_at FROM promo_visits WHERE code = ?", (code,))
+    now = _utcnow_naive()
+    in_window = 0
+    for (joined_at,) in cur.fetchall():
+        try:
+            joined_dt = datetime.datetime.fromisoformat(joined_at)
+        except ValueError:
+            continue
+        if now <= joined_dt + datetime.timedelta(days=window_days):
+            in_window += 1
+
+    cur = _conn.execute(
+        "SELECT revenue_share FROM promo_codes WHERE code = ?", (code,)
+    )
+    (revenue_share,) = cur.fetchone()
+
+    return {
+        "total_visits": total_visits,
+        "visits_7d": visits_7d,
+        "active_users": active_users,
+        "payments_count": payments_count,
+        "revenue_stars": revenue_stars,
+        "partner_share_stars": revenue_stars * revenue_share // 100,
+        "in_window": in_window,
+    }
+
+
+def get_promo_stats(code: str) -> dict | None:
+    """Public entry point: promo code details merged with _promo_stats()'s
+    aggregates, or None if the code doesn't exist."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT code, owner_user_id, title, bonus_minutes, revenue_share, window_days, "
+            "created_at, active FROM promo_codes WHERE code = ?",
+            (code,),
+        )
+        promo = _promo_code_row_to_dict(cur.fetchone())
+        if promo is None:
+            return None
+        return {**promo, **_promo_stats(code)}
+
+
+def list_promo_codes() -> list[dict]:
+    """All promo codes (active and disabled) with their stats, newest first."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT code, owner_user_id, title, bonus_minutes, revenue_share, window_days, "
+            "created_at, active FROM promo_codes ORDER BY created_at DESC"
+        )
+        rows = cur.fetchall()
+        return [{**_promo_code_row_to_dict(row), **_promo_stats(row[0])} for row in rows]
 
 
 def close() -> None:

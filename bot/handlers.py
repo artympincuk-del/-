@@ -164,6 +164,29 @@ def _format_local_time(utc_iso: str) -> str:
     return dt_utc.astimezone(_QUOTA_TZINFO).strftime("%Y-%m-%d %H:%M %Z")
 
 
+def _ru_plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(n)
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not (11 <= n % 100 <= 14):
+        return few
+    return many
+
+
+def _format_minutes_duration(minutes: int) -> str:
+    """Human-readable duration for a promo bonus (e.g. "3 дня") — bonus is
+    stored in minutes since that's what activate_unlimited() takes, but
+    partners hand out day-sized bonuses, so round-trip through whichever
+    unit divides evenly rather than always showing raw minutes."""
+    if minutes > 0 and minutes % 1440 == 0:
+        days = minutes // 1440
+        return f"{days} {_ru_plural(days, 'день', 'дня', 'дней')}"
+    if minutes > 0 and minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours} {_ru_plural(hours, 'час', 'часа', 'часов')}"
+    return f"{minutes} мин."
+
+
 # Per-user lock so a user firing off several messages in a row gets them
 # processed one at a time instead of N concurrent Groq requests each — used
 # only at top-level message/callback entry points (never inside a shared
@@ -375,6 +398,38 @@ async def _apply_referral(message: Message) -> None:
     )
 
 
+async def _apply_promo(message: Message) -> None:
+    """Registers a promo-code visit and grants its time-based bonus —
+    parallel to _apply_referral above, entirely independent data (promo_visits
+    vs. referrals/players.referred_by). Silent no-op (just the normal
+    greeting) for every "nothing to do" case: no/expired/disabled code, the
+    owner clicking their own link, or a user who already visited some promo
+    code before — none of these are errors worth surfacing to the user."""
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].startswith("promo_"):
+        return
+    code = parts[1][len("promo_") :].strip().lower()
+    if not code:
+        return
+    promo = db.get_promo_code(code)
+    if promo is None or not promo["active"]:
+        return
+    user_id = message.from_user.id
+    if promo["owner_user_id"] == user_id:
+        return
+    if not db.record_promo_visit(user_id, code):
+        return
+    username = message.from_user.username
+    new_expiry = db.activate_unlimited(user_id, username, promo["bonus_minutes"])
+    db.log_event(user_id, "promo_join")
+    until_local = _format_local_time(new_expiry)
+    duration = _format_minutes_duration(promo["bonus_minutes"])
+    await message.answer(
+        f"🎁 Бонус по промокоду — безлимит на <b>{duration}</b>! "
+        f"Действует до <b>{until_local}</b>."
+    )
+
+
 async def _credit_referral_progress(bot, user_id: int) -> None:
     """Call after each real (quota-approved) message a user sends, and only
     after the reply has already been sent to that user — this is secondary
@@ -406,6 +461,7 @@ async def _credit_referral_progress(bot, user_id: int) -> None:
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await _apply_referral(message)
+    await _apply_promo(message)
     await message.answer(
         "🤖 <b>Привет! Я AI-ассистент.</b>\n"
         "Пиши текстом, голосом, присылай фото или PDF — отвечу на всё.\n\n"
@@ -694,6 +750,59 @@ async def cb_menu_invite(callback: CallbackQuery) -> None:
 @router.message(F.text == BTN_INVITE)
 async def btn_invite_text(message: Message) -> None:
     await message.answer(await _invite_text(message.bot, message.from_user.id))
+
+
+def _promo_stats_text(stats: dict, admin_view: bool) -> str:
+    lines = []
+    if admin_view:
+        status_label = "активен" if stats["active"] else "выключен"
+        owner_label = str(stats["owner_user_id"]) if stats["owner_user_id"] else "не привязан"
+        lines.append(f"🎟 <b>{stats['code']}</b> — {stats['title']} ({status_label})")
+        lines.append(f"Владелец: {owner_label}")
+        lines.append(
+            f"Бонус: {_format_minutes_duration(stats['bonus_minutes'])}, "
+            f"доля {stats['revenue_share']}%, окно {stats['window_days']} дн.\n"
+        )
+    else:
+        lines.append(f"🎟 <b>Статистика по коду {stats['code']}</b>\n")
+    lines.append(f"Переходов: {stats['total_visits']} (за 7 дней: {stats['visits_7d']})")
+    lines.append(f"Пользовались ботом: {stats['active_users']}")
+    lines.append(f"Оплат: {stats['payments_count']} на {stats['revenue_stars']}⭐")
+    share_label = "Доля партнёра" if admin_view else "Твоя доля"
+    lines.append(f"{share_label} ({stats['revenue_share']}%): {stats['partner_share_stars']}⭐")
+    lines.append(f"\nВнутри окна атрибуции сейчас: {stats['in_window']}")
+    return "\n".join(lines)
+
+
+@router.message(Command("promo"))
+async def cmd_promo(message: Message) -> None:
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /promo &lt;код&gt;")
+        return
+    code = parts[1].strip().lower()
+    result = db.set_promo_owner(code, message.from_user.id)
+    if result == "not_found":
+        await message.answer(f"Промокод <code>{code}</code> не найден.")
+    elif result == "already_owned":
+        await message.answer(f"Промокод <code>{code}</code> уже привязан к другому аккаунту.")
+    else:
+        await message.answer(
+            f"Готово — промокод <code>{code}</code> теперь привязан к тебе. Статистика: /mypromo"
+        )
+
+
+@router.message(Command("mypromo"))
+async def cmd_mypromo(message: Message) -> None:
+    promo = db.get_promo_code_by_owner(message.from_user.id)
+    if promo is None:
+        await message.answer(
+            "У тебя нет привязанного промокода. Если у тебя есть код от админа — "
+            "привяжи его: /promo &lt;код&gt;"
+        )
+        return
+    stats = db.get_promo_stats(promo["code"])
+    await _send_long(message, _promo_stats_text(stats, admin_view=False))
 
 
 REMINDER_HOURS = [9, 12, 15, 18, 21]
@@ -1578,6 +1687,114 @@ async def cmd_chatlog(message: Message) -> None:
         await message.answer("Нет сообщений для этого пользователя.")
         return
     await message.answer(_chatlog_text(parts[1], rows), parse_mode=None)
+
+
+PROMO_CODE_RE = re.compile(r"^[a-z0-9]{1,16}$")
+
+
+@router.message(Command("promo_add"))
+async def cmd_promo_add(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    usage = (
+        "Использование: /promo_add &lt;код&gt; &lt;название партнёра&gt; "
+        "&lt;бонус_минут&gt; &lt;доля_%&gt; &lt;окно_дней&gt;\n"
+        "Например: /promo_add tt1 Иван TikTok 4320 40 30"
+    )
+    if len(parts) < 6:
+        await message.answer(usage)
+        return
+    code = parts[1].strip().lower()
+    if not PROMO_CODE_RE.match(code):
+        await message.answer("Код должен быть латиницей и цифрами, до 16 символов.")
+        return
+    bonus_minutes_str, revenue_share_str, window_days_str = parts[-3], parts[-2], parts[-1]
+    title = " ".join(parts[2:-3]).strip()
+    if not title:
+        await message.answer(usage)
+        return
+    if not (bonus_minutes_str.isdigit() and revenue_share_str.isdigit() and window_days_str.isdigit()):
+        await message.answer(
+            "Бонус (мин.), доля (%) и окно (дней) должны быть целыми положительными числами."
+        )
+        return
+    bonus_minutes = int(bonus_minutes_str)
+    revenue_share = int(revenue_share_str)
+    window_days = int(window_days_str)
+    if bonus_minutes <= 0 or window_days <= 0:
+        await message.answer("Бонус и окно атрибуции должны быть больше нуля.")
+        return
+    if not (0 <= revenue_share <= 100):
+        await message.answer("Доля партнёра должна быть от 0 до 100.")
+        return
+    if not db.create_promo_code(code, title, bonus_minutes, revenue_share, window_days):
+        await message.answer(f"Промокод <code>{code}</code> уже существует.")
+        return
+    username = await _get_bot_username(message.bot)
+    link = f"https://t.me/{username}?start=promo_{code}"
+    await message.answer(
+        f"✅ Промокод <code>{code}</code> создан для «{title}».\n"
+        f"Бонус: {_format_minutes_duration(bonus_minutes)}, доля {revenue_share}%, "
+        f"окно атрибуции {window_days} дн.\n\n"
+        f"Ссылка: <code>{link}</code>"
+    )
+
+
+@router.message(Command("promo_off"))
+async def cmd_promo_off(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /promo_off &lt;код&gt;")
+        return
+    code = parts[1].strip().lower()
+    result = db.disable_promo_code(code)
+    if result == "not_found":
+        await message.answer(f"Промокод <code>{code}</code> не найден.")
+    elif result == "already_off":
+        await message.answer(f"Промокод <code>{code}</code> уже выключен.")
+    else:
+        await message.answer(
+            f"Промокод <code>{code}</code> выключен. Уже привязанные пользователи и их "
+            f"оплаты внутри окна атрибуции продолжают засчитываться."
+        )
+
+
+@router.message(Command("promo_list"))
+async def cmd_promo_list(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    codes = db.list_promo_codes()
+    if not codes:
+        await message.answer("Промокодов пока нет. Создать: /promo_add")
+        return
+    lines = ["🎟 <b>Промокоды</b>\n"]
+    for c in codes:
+        status = "активен" if c["active"] else "выключен"
+        lines.append(
+            f"<code>{c['code']}</code> — {c['title']} · {status} · "
+            f"переходов {c['total_visits']} · оплат {c['payments_count']} на "
+            f"{c['revenue_stars']}⭐ (доля {c['partner_share_stars']}⭐)"
+        )
+    await _send_long(message, "\n".join(lines))
+
+
+@router.message(Command("promo_stat"))
+async def cmd_promo_stat(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /promo_stat &lt;код&gt;")
+        return
+    code = parts[1].strip().lower()
+    stats = db.get_promo_stats(code)
+    if stats is None:
+        await message.answer(f"Промокод <code>{code}</code> не найден.")
+        return
+    await _send_long(message, _promo_stats_text(stats, admin_view=True))
 
 
 REMEMBER_PREFIXES = ("запомни:", "запомни,", "запомни ")

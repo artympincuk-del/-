@@ -17,7 +17,7 @@ PREMIUM_CREDIT_COST = int(os.environ.get("PREMIUM_CREDIT_COST", "3"))
 IMAGE_CREDIT_COST = int(os.environ.get("IMAGE_CREDIT_COST", "5"))
 
 DAILY_FREE_MESSAGES = int(os.environ.get("DAILY_FREE_MESSAGES", "10"))
-DAILY_FREE_PREMIUM_MESSAGES = int(os.environ.get("DAILY_FREE_PREMIUM_MESSAGES", "3"))
+DAILY_FREE_PREMIUM_MESSAGES = int(os.environ.get("DAILY_FREE_PREMIUM_MESSAGES", "5"))
 REFERRAL_BONUS_MESSAGES = int(os.environ.get("REFERRAL_BONUS_MESSAGES", "20"))
 # Small immediate welcome gift for whoever clicks a referral link — paid
 # right away, unlike REFERRAL_BONUS_MESSAGES below. Not worth gating behind
