@@ -37,9 +37,14 @@ from bot.config import (
     DAILY_FREE_IMAGE_MESSAGES,
     DAILY_FREE_MESSAGES,
     DAILY_FREE_PREMIUM_MESSAGES,
+    FALLBACK_DAILY_CAP,
+    FALLBACK_MODEL,
+    FALLBACK_USER_DAILY_CAP,
     FAST_MODEL,
     FAST_REASONING_EFFORT,
     MAX_HISTORY_TURNS,
+    MODEL_DAILY_SUBLIMITS,
+    MULTIMODAL_MODELS,
     PREMIUM_CREDIT_COST,
     POLLINATIONS_API_KEY,
     PREMIUM_MODEL,
@@ -75,47 +80,45 @@ class Form(StatesGroup):
     waiting_for_image_edit = State()
 
 
-# (tier, choice) -> which actual Groq model + reasoning_effort to use. `tier`
+# (tier, choice) -> which actual model + reasoning_effort to use. `tier`
 # ('fast'/'premium') decides which quota bucket a message is billed against;
-# `choice` decides which specific engine runs within that tier — the two
-# GPT-OSS models are the default/recommended pick, the original Llama model
-# is offered alongside the premium one as an alternative "flavor" within
-# that tier. Llama 3.1 8B (fast tier) was removed on purpose: its Groq TPM
-# ceiling (6000, see config.MODEL_TOKEN_CEILINGS) is noticeably smaller than
-# gpt-oss-20b's (8000), so it refused even short questions once history and
-# the reserved response budget were counted against it — strictly worse
-# than 20B, which is both faster and stronger. _model_option already falls
-# back to gptoss for any (tier, choice) it doesn't recognize, so an existing
-# user whose stored preference is ("fast", "llama") is switched over
-# automatically, no migration needed.
+# `choice` decides which specific engine runs within that tier. Labels are
+# written for picking BY TASK, not by technical name — the technical name
+# stays in parentheses for anyone who cares. Llama 3.1 8B (fast tier) and
+# Qwen 3.7 Flash (premium tier, AITUNNEL) were both removed from this menu
+# on purpose: Llama 3.1 8B's Groq TPM ceiling was too small to be usable
+# (see config.MODEL_TOKEN_CEILINGS); Qwen has no upside over the other
+# options here — Groq's models are faster and free, Gemini is faster and
+# stronger — so as a user-facing choice it was pure noise. Qwen stays wired
+# up in config/ai.py as FALLBACK_MODEL, an emergency backstop for when Groq
+# itself is failing (see _ask_ai_with_fallback), just not offered as
+# something to pick directly. _model_option already falls back to gptoss
+# for any (tier, choice) it doesn't recognize, so an existing user whose
+# stored preference is ("fast", "llama") or ("premium", "qwen37") is
+# switched over automatically, no migration needed.
 MODEL_OPTIONS = {
     ("fast", "gptoss"): {
         "model": FAST_MODEL,
         "reasoning": FAST_REASONING_EFFORT,
-        "label": "⚡ GPT-OSS 20B",
+        "label": "⚡ Быстрый ответ (GPT-OSS 20B)",
     },
     ("premium", "gptoss"): {
         "model": PREMIUM_MODEL,
         "reasoning": PREMIUM_REASONING_EFFORT,
-        "label": "💎 GPT-OSS 120B (глубокий анализ)",
+        "label": "💎 Разбор задачи (GPT-OSS 120B)",
     },
     ("premium", "llama"): {
         "model": "llama-3.3-70b-versatile",
         "reasoning": None,
-        "label": "💎🦙 Llama 3.3 70B",
+        "label": "💎 Альтернатива (Llama 3.3 70B)",
     },
-    # Модели второго провайдера (AITUNNEL). Идут в премиум-тариф: у них нет
-    # минутных лимитов Groq, но каждый запрос стоит денег с баланса, поэтому
-    # бесплатному тарифу их не отдаём.
-    ("premium", "qwen37"): {
-        "model": "qwen3.7-flash",
-        "reasoning": None,
-        "label": "💎 Qwen 3.7 Flash",
-    },
+    # AITUNNEL, не Groq — своих минутных лимитов нет, зато каждый запрос
+    # стоит денег с баланса, поэтому дневной подлимит (MODEL_DAILY_SUBLIMITS)
+    # и мультимодальность (MULTIMODAL_MODELS: видит фото/файлы напрямую).
     ("premium", "gemini"): {
         "model": "gemini-3.5-flash-lite",
         "reasoning": None,
-        "label": "💎 Gemini 3.5 Flash Lite",
+        "label": "🧠 Умный режим (Gemini 3.5 Flash Lite)",
     },
 }
 
@@ -123,6 +126,41 @@ MODEL_OPTIONS = {
 def _model_option(status: dict) -> dict:
     key = (status["model_pref"], status.get("model_choice") or "gptoss")
     return MODEL_OPTIONS.get(key, MODEL_OPTIONS[(status["model_pref"], "gptoss")])
+
+
+# Display-only labels for models that can answer (and so can show up in the
+# "which model actually replied" footer — see _ask_ai_with_fallback) but
+# aren't offered in MODEL_OPTIONS as something to pick. Currently just
+# FALLBACK_MODEL: the user never chose it, but Правка 4.4 is explicit that
+# the footer must never claim a different model answered than the one that
+# actually did.
+_MODEL_DISPLAY_LABELS = {
+    "qwen3.7-flash": "💎 Qwen 3.7 Flash",
+}
+
+
+def _label_for_model_id(model_id: str) -> str:
+    for opt in MODEL_OPTIONS.values():
+        if opt["model"] == model_id:
+            return opt["label"]
+    return _MODEL_DISPLAY_LABELS.get(model_id, model_id)
+
+
+def _is_paid_tier(status: dict) -> bool:
+    """"Paid" for the purposes of MODEL_DAILY_SUBLIMITS (Правка 1): an
+    active subscription, an active purchased unlimited-time pass, or having
+    bonus_credits on hand (a previously bought message package). Everything
+    else — the plain free daily quota, or a promo partner's temporary
+    bonus — gets the smaller free-tier cap: that combination costs the
+    model's real per-call price while the user pays nothing themselves.
+    Used both live (right after try_consume_message, deciding which cap
+    applies to the request that just happened) and for display (the model
+    menu's "осталось X из Y" — see model_keyboard)."""
+    return (
+        status.get("subscription_until") is not None
+        or status.get("unlimited_until") is not None
+        or status.get("bonus_credits", 0) > 0
+    )
 
 
 # Default (gptoss) labels for the "you can pick a model" mention in the
@@ -508,9 +546,19 @@ def quick_actions_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def model_keyboard(current_pref: str, current_choice: str) -> InlineKeyboardMarkup:
+def model_keyboard(status: dict, user_id: int) -> InlineKeyboardMarkup:
+    current_pref, current_choice = status["model_pref"], status["model_choice"]
+
     def label(tier: str, choice: str) -> str:
-        text = MODEL_OPTIONS[(tier, choice)]["label"]
+        opt = MODEL_OPTIONS[(tier, choice)]
+        text = opt["label"]
+        sublimit = MODEL_DAILY_SUBLIMITS.get(opt["model"])
+        if sublimit is not None:
+            # Правка 3.3: actual remaining count next to the model that has
+            # a sub-limit, from the live counter — never a hardcoded number.
+            limit = sublimit["paid"] if _is_paid_tier(status) else sublimit["free"]
+            used = db.get_model_sublimit_usage(user_id, opt["model"])
+            text = f"{text} — осталось {max(0, limit - used)} из {limit}"
         return f"✅ {text}" if (tier, choice) == (current_pref, current_choice) else text
 
     return InlineKeyboardMarkup(
@@ -518,7 +566,6 @@ def model_keyboard(current_pref: str, current_choice: str) -> InlineKeyboardMark
             [InlineKeyboardButton(text=label("fast", "gptoss"), callback_data="model:fast:gptoss")],
             [InlineKeyboardButton(text=label("premium", "llama"), callback_data="model:premium:llama")],
             [InlineKeyboardButton(text=label("premium", "gptoss"), callback_data="model:premium:gptoss")],
-            [InlineKeyboardButton(text=label("premium", "qwen37"), callback_data="model:premium:qwen37")],
             [InlineKeyboardButton(text=label("premium", "gemini"), callback_data="model:premium:gemini")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")],
         ]
@@ -582,6 +629,99 @@ def _image_quota_denied_text(status: dict) -> str:
         f"({PREMIUM_CREDIT_COST} за картинку). Пополните баланс: /buy — или "
         "дождитесь сброса в полночь."
     )
+
+
+def _sublimit_denied_text(model: str, limit: int, used_today: int) -> str:
+    """Правка 3.4: explains three things, in order — what specifically ran
+    out, that the rest of the bot still works, and when it resets. No
+    purchase pitch first — someone hitting this already pays for a
+    subscription/package, they need an answer, not a storefront."""
+    label = _label_for_model_id(model)
+    tz_abbr = datetime.datetime.now(_QUOTA_TZINFO).strftime("%Z")
+    return (
+        f"Дневной лимит запросов к «{label}» на сегодня исчерпан ({used_today}/{limit}). "
+        "Остальные модели работают без ограничений сверх обычного дневного лимита — "
+        f"переключитесь в «{BTN_MODEL}», или дождитесь обновления счётчика в 00:00 {tz_abbr}."
+    )
+
+
+def _enforce_model_sublimit(user_id: int, model: str, status: dict) -> tuple[bool, str | None, bool]:
+    """Правка 1: a per-model daily sub-limit lives INSIDE the normal quota
+    (config.MODEL_DAILY_SUBLIMITS) — call this right after
+    try_consume_message has already succeeded for the same request, and
+    before the model is actually asked anything (Правка 1.5). `status` is
+    that same try_consume_message result (already has subscription_until/
+    unlimited_until/bonus_credits/consumed for _is_paid_tier).
+
+    Returns (ok, denial_text, sublimit_consumed):
+      - model has no sub-limit: (True, None, False) — nothing to do.
+      - sub-limit consumed successfully: (True, None, True) — caller must
+        refund_model_sublimit(user_id, model) if the request later fails.
+      - sub-limit exhausted: (False, denial_text, False) — caller must
+        refund the normal quota it already took (refund_consumed_message)
+        and show denial_text instead of proceeding."""
+    sublimit = MODEL_DAILY_SUBLIMITS.get(model)
+    if sublimit is None:
+        return True, None, False
+    limit = sublimit["paid"] if _is_paid_tier(status) else sublimit["free"]
+    ok, sub_status = db.try_consume_model_sublimit(user_id, model, limit)
+    if ok:
+        return True, None, True
+    return False, _sublimit_denied_text(model, limit, sub_status["used_today"]), False
+
+
+async def _ask_ai_with_fallback(
+    history: list[dict],
+    content,
+    model: str,
+    *,
+    user_id: int,
+    notes: list[str] | None = None,
+    reasoning_effort: str | None = None,
+    max_tokens: int | None = None,
+    enable_search: bool = False,
+) -> tuple[str, list[tuple[str, str]], str]:
+    """Правка 4: wraps ai.ask_ai with the Groq-outage fallback to AITUNNEL.
+    Only for TEXT requests — never call this for a multimodal (image/native
+    PDF) request, since FALLBACK_MODEL is text-only and silently dropping
+    the image/file would produce a confidently wrong answer instead of an
+    honest failure.
+
+    Retries the exact same request on FALLBACK_MODEL only when ai.ask_ai
+    fails with e.is_limit_error (429, or 413 after ai.ask_ai's own
+    reductions are exhausted) — any other AIError (bad key, malformed
+    request, anything else) means something is actually broken and is
+    re-raised immediately, never routed to the fallback. Also skipped if
+    FALLBACK_MODEL is empty, the primary model already IS FALLBACK_MODEL, or
+    the daily fallback spend caps (FALLBACK_DAILY_CAP / FALLBACK_USER_DAILY_CAP)
+    are exhausted — in every one of those cases this just re-raises the
+    original error unchanged, so the caller's existing `except ai.AIError`
+    handling covers it exactly as before this existed.
+
+    Returns (text, sources, answered_model) — answered_model is whichever
+    model actually produced the text, for a truthful "model used" footer
+    (Правка 4.4: the user is never told about the substitution, but the
+    footer must never claim a model that didn't actually answer)."""
+    try:
+        text, sources = await ai.ask_ai(
+            history, content, model, notes=notes, reasoning_effort=reasoning_effort,
+            max_tokens=max_tokens, enable_search=enable_search,
+        )
+        return text, sources, model
+    except ai.AIError as e:
+        if not FALLBACK_MODEL or not e.is_limit_error or model == FALLBACK_MODEL:
+            raise
+        if not db.try_consume_fallback(user_id, FALLBACK_DAILY_CAP, FALLBACK_USER_DAILY_CAP):
+            raise
+        logger.warning(
+            "Falling back to %s after Groq error %s (source_model=%s, user_id=%s)",
+            FALLBACK_MODEL, e.status_code, model, user_id,
+        )
+        text, sources = await ai.ask_ai(
+            history, content, FALLBACK_MODEL, notes=notes, reasoning_effort=reasoning_effort,
+            max_tokens=max_tokens, enable_search=enable_search,
+        )
+        return text, sources, FALLBACK_MODEL
 
 
 async def _apply_referral(message: Message) -> None:
@@ -921,35 +1061,33 @@ async def btn_balance_text(message: Message) -> None:
 
 
 MODEL_MENU_TEXT = (
-    "Выберите модель:\n\n"
-    "⚡ — быстрый тариф, 💎 — премиум (глубже анализ, свой дневной лимит)\n"
-    "🦙 — оригинальные модели Llama (альтернатива GPT-OSS)"
+    "Выберите модель под задачу:\n\n"
+    "⚡/💎 — бесплатные модели, работают в рамках обычного дневного лимита, без "
+    "дополнительных ограничений.\n\n"
+    "🧠 Умный режим сам видит фото и файлы и отвечает за секунды — но каждый его "
+    "запрос стоит денег, поэтому у него отдельный дневной счётчик: "
+    f"{MODEL_DAILY_SUBLIMITS['gemini-3.5-flash-lite']['paid']} в день у подписки/пакета, "
+    f"{MODEL_DAILY_SUBLIMITS['gemini-3.5-flash-lite']['free']} — на бесплатном тарифе."
 )
 
 
 @router.message(Command("model"))
 async def cmd_model(message: Message) -> None:
     status = db.get_status(message.from_user.id, message.from_user.username)
-    await message.answer(
-        MODEL_MENU_TEXT, reply_markup=model_keyboard(status["model_pref"], status["model_choice"])
-    )
+    await message.answer(MODEL_MENU_TEXT, reply_markup=model_keyboard(status, message.from_user.id))
 
 
 @router.callback_query(F.data == "menu:model")
 async def cb_menu_model(callback: CallbackQuery) -> None:
     await callback.answer()
     status = db.get_status(callback.from_user.id, callback.from_user.username)
-    await _edit_or_send(
-        callback, MODEL_MENU_TEXT, model_keyboard(status["model_pref"], status["model_choice"])
-    )
+    await _edit_or_send(callback, MODEL_MENU_TEXT, model_keyboard(status, callback.from_user.id))
 
 
 @router.message(F.text == BTN_MODEL)
 async def btn_model_text(message: Message) -> None:
     status = db.get_status(message.from_user.id, message.from_user.username)
-    await message.answer(
-        MODEL_MENU_TEXT, reply_markup=model_keyboard(status["model_pref"], status["model_choice"])
-    )
+    await message.answer(MODEL_MENU_TEXT, reply_markup=model_keyboard(status, message.from_user.id))
 
 
 @router.callback_query(F.data.startswith("model:"))
@@ -957,13 +1095,15 @@ async def cb_model(callback: CallbackQuery) -> None:
     _, tier, choice = callback.data.split(":")
     if (tier, choice) not in MODEL_OPTIONS:
         # A stale button from before a model was removed from the menu
-        # (e.g. fast/llama) — same soft fallback as _model_option: settle
-        # on gptoss for that tier instead of a KeyError below.
+        # (e.g. fast/llama, premium/qwen37) — same soft fallback as
+        # _model_option: settle on gptoss for that tier instead of a
+        # KeyError below.
         choice = "gptoss"
     db.set_model_pref(callback.from_user.id, callback.from_user.username, tier, choice)
     label = MODEL_OPTIONS[(tier, choice)]["label"]
     await callback.answer(f"Модель: {label}")
-    await _edit_or_send(callback, MODEL_MENU_TEXT, model_keyboard(tier, choice))
+    status = db.get_status(callback.from_user.id, callback.from_user.username)
+    await _edit_or_send(callback, MODEL_MENU_TEXT, model_keyboard(status, callback.from_user.id))
 
 
 @router.message(Command("reset"))
@@ -1797,12 +1937,80 @@ ADMIN_PAGE_SIZE = 8
 
 ADMIN_MENU_TEXT = (
     "🔑 <b>Админ-панель</b>\n\n"
-    "Команды по-прежнему работают: /grant, /users, /chatlog "
-    "&lt;@username или id&gt;, /notes_of &lt;@username или id&gt;, "
-    "/refund &lt;telegram_payment_charge_id&gt;, "
-    "/promo_add, /promo_off, /promo_list, /promo_stat, /promo_owner "
-    "&lt;код&gt; &lt;@username или id&gt;, /promo_token, /backup."
+    "Кнопки ниже — быстрый доступ к статистике и карточкам пользователей "
+    "(баланс, чатлог, возврат — всё оттуда, без команд).\n\n"
+    "Полный список текстовых команд с описанием и примерами — в «📖 Все команды»."
 )
+
+# Reference shown by "📖 Все команды" — every admin-only text command, grouped
+# by topic, with its argument syntax and a one-line description. Exists so an
+# admin can find "how do I do X" without reading handlers.py; keep this in
+# sync whenever an admin command is added, renamed, or its arguments change.
+ADMIN_HELP_CATEGORIES = {
+    "users": {
+        "label": "👤 Пользователи и баланс",
+        "text": (
+            "👤 <b>Пользователи и баланс</b>\n\n"
+            "<code>/users</code>\n"
+            "Список всех пользователей: выбранная модель, использовано сегодня "
+            "(free/premium), бонусные сообщения, последняя активность. Без аргументов.\n\n"
+            "<code>/grant &lt;@username или id&gt; &lt;amount&gt;</code>\n"
+            "Начислить бонусные сообщения. Отрицательное число — списать. "
+            "Пример: <code>/grant @ivan 20</code>\n\n"
+            "<code>/chatlog &lt;@username или id&gt; [N]</code>\n"
+            "Последние N сообщений переписки пользователя с ботом (по умолчанию 20).\n\n"
+            "<code>/notes_of &lt;@username или id&gt;</code>\n"
+            "Заметки пользователя, сохранённые через /remember — пригождается при "
+            "разборе жалоб на тон ответов.\n\n"
+            "💡 То же самое, плюс кнопки +10/+50/-10 к балансу и возврат оплаты в один "
+            "тап, доступно без единой команды — через «👥 Пользователи» в главном меню."
+        ),
+    },
+    "payments": {
+        "label": "💳 Платежи",
+        "text": (
+            "💳 <b>Платежи</b>\n\n"
+            "<code>/refund &lt;telegram_payment_charge_id&gt;</code>\n"
+            "Вернуть звёзды за платёж и списать то, что он дал (сообщения/подписку/"
+            "безлимит). Тот же charge_id, что и у кнопки «Возврат» на карточке "
+            "пользователя (👥 Пользователи → выбрать пользователя → платёж)."
+        ),
+    },
+    "promo": {
+        "label": "🎟 Промокоды",
+        "text": (
+            "🎟 <b>Промокоды</b>\n\n"
+            "<code>/promo_add &lt;код&gt; &lt;название партнёра&gt; &lt;бонус_минут&gt; "
+            "&lt;доля_%&gt; &lt;окно_дней&gt;</code>\n"
+            "Создать промокод для партнёра. Пример: "
+            "<code>/promo_add tt1 Иван TikTok 4320 40 30</code>\n\n"
+            "<code>/promo_off &lt;код&gt;</code>\n"
+            "Выключить промокод. Уже привязанные пользователи и их оплаты внутри окна "
+            "атрибуции продолжают засчитываться.\n\n"
+            "<code>/promo_list</code>\n"
+            "Список всех промокодов со статусом и статистикой. Без аргументов.\n\n"
+            "<code>/promo_stat &lt;код&gt;</code>\n"
+            "Подробная статистика по одному промокоду.\n\n"
+            "<code>/promo_owner &lt;код&gt; &lt;@username или id&gt;</code>\n"
+            "Назначить владельца промокода — ему становится доступна статистика через "
+            "/mypromo. <code>0</code> вместо адресата — снять владельца.\n\n"
+            "<code>/promo_token &lt;код&gt; [new]</code>\n"
+            "Показать секретное слово для привязки промокода партнёром (командой "
+            "/promo). С <code>new</code> — перегенерировать; старое слово перестаёт "
+            "работать."
+        ),
+    },
+    "system": {
+        "label": "🛠 Система",
+        "text": (
+            "🛠 <b>Система</b>\n\n"
+            "<code>/backup</code>\n"
+            "Прислать дамп базы данных .db файлом лично тебе в этот чат. Без аргументов."
+        ),
+    },
+}
+
+ADMIN_HELP_INDEX_TEXT = "📖 <b>Все команды</b>\n\nВыбери раздел:"
 
 
 def admin_menu_keyboard() -> InlineKeyboardMarkup:
@@ -1811,7 +2019,23 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
             [InlineKeyboardButton(text="📈 Воронка покупок", callback_data="admin:funnel")],
             [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users:0")],
+            [InlineKeyboardButton(text="📖 Все команды", callback_data="admin:help")],
         ]
+    )
+
+
+def admin_help_index_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=category["label"], callback_data=f"admin:help:{key}")]
+        for key, category in ADMIN_HELP_CATEGORIES.items()
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ В меню", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_help_category_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ Ко всем командам", callback_data="admin:help")]]
     )
 
 
@@ -1831,8 +2055,32 @@ async def cb_admin_menu(callback: CallbackQuery) -> None:
     await _edit_or_send(callback, ADMIN_MENU_TEXT, admin_menu_keyboard())
 
 
+@router.callback_query(F.data == "admin:help")
+async def cb_admin_help(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.answer()
+    await _edit_or_send(callback, ADMIN_HELP_INDEX_TEXT, admin_help_index_keyboard())
+
+
+@router.callback_query(F.data.startswith("admin:help:"))
+async def cb_admin_help_category(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    key = callback.data.split(":", 2)[2]
+    category = ADMIN_HELP_CATEGORIES.get(key)
+    if category is None:
+        await callback.answer()
+        return
+    await callback.answer()
+    await _edit_or_send(callback, category["text"], admin_help_category_keyboard())
+
+
 def _admin_stats_text() -> str:
     s = db.get_admin_stats()
+    fallback_used_today = db.get_fallback_usage_today()
     return (
         "📊 <b>Статистика</b>\n\n"
         f"Всего пользователей: <b>{s['total_users']}</b>\n"
@@ -1840,7 +2088,12 @@ def _admin_stats_text() -> str:
         f"Докупленных сообщений на руках: <b>{s['bonus_outstanding']}</b>\n\n"
         f"⭐ Доход сегодня: <b>{s['revenue_today']}</b> ({s['payments_today']} плат.)\n"
         f"⭐ Доход за 7 дней: <b>{s['revenue_7d']}</b> ({s['payments_7d']} плат.)\n"
-        f"⭐ Доход всего: <b>{s['revenue_all']}</b> ({s['payments_all']} плат.)"
+        f"⭐ Доход всего: <b>{s['revenue_all']}</b> ({s['payments_all']} плат.)\n\n"
+        # Правка 4.8: how often Groq itself is failing over to the AITUNNEL
+        # backstop today — a rising number here means Groq is struggling,
+        # not that anything in the bot is broken.
+        f"🆘 Откатов на резерв сегодня: <b>{fallback_used_today}</b> "
+        f"(лимит {FALLBACK_DAILY_CAP}/день)"
     )
 
 
@@ -2482,14 +2735,21 @@ async def _answer_text_query(
     model, reasoning_effort = opt["model"], opt["reasoning"]
     notes = [content for _id, content in db.list_notes(user_id)]
 
+    sublimit_ok, sublimit_denial, sublimit_consumed = _enforce_model_sublimit(user_id, model, status)
+    if not sublimit_ok:
+        db.refund_consumed_message(user_id, status["consumed"])
+        await message.answer(sublimit_denial)
+        return
+
     history = db.get_dialog_history(user_id, MAX_HISTORY_TURNS)
 
     await message.bot.send_chat_action(message.chat.id, "typing")
 
     t0 = time.monotonic()
     try:
-        reply_text, sources = await ai.ask_ai(
-            history, text, model, notes=notes, reasoning_effort=reasoning_effort, enable_search=True
+        reply_text, sources, answered_model = await _ask_ai_with_fallback(
+            history, text, model, user_id=user_id, notes=notes,
+            reasoning_effort=reasoning_effort, enable_search=True,
         )
         elapsed = time.monotonic() - t0
 
@@ -2497,7 +2757,7 @@ async def _answer_text_query(
         db.log_message(user_id, username, "assistant", reply_text)
         db.append_dialog_turn(user_id, text, reply_text, MAX_HISTORY_TURNS)
 
-        footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · {opt['label']}</i>"
+        footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · {_label_for_model_id(answered_model)}</i>"
         await _send_long(
             message,
             reply_text + footer,
@@ -2509,10 +2769,14 @@ async def _answer_text_query(
         # the user got nothing for it, so give it back rather than making
         # them pay again to retry.
         db.refund_consumed_message(user_id, status["consumed"])
+        if sublimit_consumed:
+            db.refund_model_sublimit(user_id, model)
         await message.answer(e.user_message)
         return
     except Exception:
         db.refund_consumed_message(user_id, status["consumed"])
+        if sublimit_consumed:
+            db.refund_model_sublimit(user_id, model)
         raise
 
     # Referral bonus accounting is secondary to the reply above — a bug here
@@ -2698,49 +2962,119 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
             await message.answer(quota_denied_text(status))
             return
 
-        file_buf = await message.bot.download(doc.file_id)
-        try:
-            reader = PdfReader(file_buf)
-            doc_text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
-        except Exception:
-            db.refund_consumed_message(user_id, status["consumed"])
-            await message.answer("Не удалось прочитать PDF. Возможно, файл повреждён.")
-            return
-
-        if not doc_text:
-            db.refund_consumed_message(user_id, status["consumed"])
-            await message.answer(
-                "В этом PDF нет текстового слоя (похоже на скан без OCR). "
-                "Пришлите страницы как фото — так я смогу распознать текст."
-            )
-            return
-
-        truncated = len(doc_text) > MAX_PDF_CHARS
-        doc_text = doc_text[:MAX_PDF_CHARS]
-
-        caption = await _strip_mention(message, message.caption) or "Кратко перескажи документ и выдели главное."
-        prompt = (
-            f"Пользователь прислал PDF «{filename}» ({len(reader.pages)} стр."
-            f"{', показана только часть текста' if truncated else ''}). Содержимое документа:\n\n"
-            f"{doc_text}\n\n---\nЗадача: {caption}"
-        )
-
         opt = _model_option(status)
         model, reasoning_effort = opt["model"], opt["reasoning"]
         notes = [content for _id, content in db.list_notes(user_id)]
 
+        sublimit_ok, sublimit_denial, sublimit_consumed = _enforce_model_sublimit(user_id, model, status)
+        if not sublimit_ok:
+            db.refund_consumed_message(user_id, status["consumed"])
+            await message.answer(sublimit_denial)
+            return
+
+        def _refund_all() -> None:
+            db.refund_consumed_message(user_id, status["consumed"])
+            if sublimit_consumed:
+                db.refund_model_sublimit(user_id, model)
+
+        caption = await _strip_mention(message, message.caption) or "Кратко перескажи документ и выдели главное."
         history = (
             db.get_dialog_history(user_id, MAX_HISTORY_TURNS)
             if _caption_references_history(caption)
             else []
         )
 
+        file_buf = await message.bot.download(doc.file_id)
+        raw_bytes = file_buf.read()
+
         await message.bot.send_chat_action(message.chat.id, "typing")
 
-        try:
-            reply_text, _ = await ai.ask_ai(
-                history, prompt, model, notes=notes, reasoning_effort=reasoning_effort
+        # Правка 2.3: a multimodal model reads the PDF itself, one request,
+        # no pypdf text extraction (and no fallback below — FALLBACK_MODEL
+        # is text-only and can't see the file, so a failure here is just a
+        # failure, not something to silently paper over with a model that
+        # would drop the document). Every other model keeps the exact
+        # pypdf-extraction pipeline this always used.
+        if model in MULTIMODAL_MODELS:
+            # NOTE: "file" content blocks with an inline data: URL is
+            # OpenAI's own convention for PDF input in chat completions —
+            # the most likely shape an OpenAI-compatible gateway like
+            # AITUNNEL expects, but this hasn't been exercised against a
+            # live Gemini/AITUNNEL request yet and is worth confirming.
+            pdf_b64 = base64.b64encode(raw_bytes).decode()
+            content = [
+                {
+                    "type": "text",
+                    "text": (
+                        f"Прочитай приложенный PDF-документ «{filename}» и ответь на запрос "
+                        f"пользователя по его содержимому.\n\nЗапрос: {caption}"
+                    ),
+                },
+                {
+                    "type": "file",
+                    "file": {"filename": filename, "file_data": f"data:application/pdf;base64,{pdf_b64}"},
+                },
+            ]
+            try:
+                reply_text, _ = await ai.ask_ai(
+                    history, content, model, notes=notes, reasoning_effort=reasoning_effort
+                )
+            except ai.AIError as e:
+                _refund_all()
+                await message.answer(e.user_message)
+                return
+            except Exception:
+                _refund_all()
+                raise
+
+            short_ref = f"[документ «{filename}», прочитан моделью напрямую] {caption}"
+            db.log_message(user_id, username, "user", short_ref)
+            db.log_message(user_id, username, "assistant", reply_text)
+            history_entry = f"[Документ «{filename}», прочитан моделью напрямую] {caption}"
+            db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
+
+            try:
+                await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
+            except Exception:
+                _refund_all()
+                raise
+        else:
+            try:
+                reader = PdfReader(io.BytesIO(raw_bytes))
+                doc_text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+            except Exception:
+                _refund_all()
+                await message.answer("Не удалось прочитать PDF. Возможно, файл повреждён.")
+                return
+
+            if not doc_text:
+                _refund_all()
+                await message.answer(
+                    "В этом PDF нет текстового слоя (похоже на скан без OCR). "
+                    "Пришлите страницы как фото — так я смогу распознать текст."
+                )
+                return
+
+            truncated = len(doc_text) > MAX_PDF_CHARS
+            doc_text = doc_text[:MAX_PDF_CHARS]
+
+            prompt = (
+                f"Пользователь прислал PDF «{filename}» ({len(reader.pages)} стр."
+                f"{', показана только часть текста' if truncated else ''}). Содержимое документа:\n\n"
+                f"{doc_text}\n\n---\nЗадача: {caption}"
             )
+
+            try:
+                reply_text, _, _ = await _ask_ai_with_fallback(
+                    history, prompt, model, user_id=user_id, notes=notes, reasoning_effort=reasoning_effort
+                )
+            except ai.AIError as e:
+                _refund_all()
+                await message.answer(e.user_message)
+                return
+            except Exception:
+                _refund_all()
+                raise
 
             short_ref = f"[документ «{filename}»] {caption}"
             db.log_message(user_id, username, "user", short_ref)
@@ -2753,17 +3087,11 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
             history_entry = f"[Документ «{filename}»] {caption}\n\n{doc_text[:MAX_DOC_HISTORY_CHARS]}"
             db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
 
-            await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
-        except ai.AIError as e:
-            # The request already cost a message/credit above — an error
-            # means the user got nothing for it, so give it back rather than
-            # making them pay again to retry.
-            db.refund_consumed_message(user_id, status["consumed"])
-            await message.answer(e.user_message)
-            return
-        except Exception:
-            db.refund_consumed_message(user_id, status["consumed"])
-            raise
+            try:
+                await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
+            except Exception:
+                _refund_all()
+                raise
 
         # Referral bonus accounting is secondary to the reply above — a bug
         # here must never eat the response the user already paid a message for.
@@ -2785,6 +3113,15 @@ async def handle_photo_message(message: Message, state: FSMContext) -> None:
         await _handle_photo_message_locked(message, state)
 
 
+MULTIMODAL_PHOTO_INSTRUCTIONS = (
+    "На фото — задание или сцена. Если это текст/задача (числа, формулы, вопросы) — "
+    "реши её по шагам, а в конце добавь короткий раздел «✅ Проверка:» с быстрой "
+    "самопроверкой результата (например, подстановкой ответа обратно в условие или "
+    "другим способом решения). Если это не вычислительная/логическая задача, а просто "
+    "вопрос о содержимом фото — ответь по существу, раздел «Проверка» не нужен."
+)
+
+
 async def _handle_photo_message_locked(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     username = message.from_user.username
@@ -2796,6 +3133,20 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
         await message.answer(quota_denied_text(status))
         return
 
+    opt = _model_option(status)
+    model = opt["model"]
+
+    sublimit_ok, sublimit_denial, sublimit_consumed = _enforce_model_sublimit(user_id, model, status)
+    if not sublimit_ok:
+        db.refund_consumed_message(user_id, status["consumed"])
+        await message.answer(sublimit_denial)
+        return
+
+    def _refund_all() -> None:
+        db.refund_consumed_message(user_id, status["consumed"])
+        if sublimit_consumed:
+            db.refund_model_sublimit(user_id, model)
+
     caption = await _strip_mention(message, message.caption) or (
         "Реши задание на фото. Если это не задание — опиши, что на фото."
     )
@@ -2805,7 +3156,7 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
     try:
         image_bytes = _prepare_image(file_buf.read())
     except Exception:
-        db.refund_consumed_message(user_id, status["consumed"])
+        _refund_all()
         await message.answer("Не удалось обработать изображение. Попробуйте другое фото.")
         return
     image_b64 = base64.b64encode(image_bytes).decode()
@@ -2818,8 +3169,60 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
     )
 
     await message.bot.send_chat_action(message.chat.id, "typing")
-    status_msg = await message.answer("🔍 <i>Распознаю задание...</i>")
     t0 = time.monotonic()
+
+    # Правка 2.2: a multimodal model gets the photo directly, one request,
+    # recognition and solving together — no separate Groq vision stage (so
+    # it never touches Groq's limits at all) and no accuracy lost to a
+    # middleman's retelling of the picture. No fallback here either, same
+    # reasoning as the PDF path: FALLBACK_MODEL is text-only.
+    if model in MULTIMODAL_MODELS:
+        status_msg = await message.answer("🔍 <i>Смотрю фото...</i>")
+        content = [
+            {
+                "type": "text",
+                "text": f"{MULTIMODAL_PHOTO_INSTRUCTIONS}\n\nЗапрос пользователя: {caption}",
+            },
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]
+        try:
+            reply_text, _ = await ai.ask_ai(
+                history, content, model, notes=notes, reasoning_effort=opt["reasoning"], max_tokens=6144
+            )
+        except ai.AIError as e:
+            _refund_all()
+            await status_msg.edit_text(e.user_message)
+            return
+
+        try:
+            await status_msg.delete()
+        except TelegramBadRequest:
+            pass
+
+        try:
+            db.log_message(user_id, username, "user", f"[фото] {caption}")
+            db.log_message(user_id, username, "assistant", reply_text)
+            # No separate description to store here (the model saw the
+            # actual pixels, not a stand-in text) — a follow-up text
+            # question still has the caption/reply_text for context, just
+            # not a re-describable transcript the way the two-stage path has.
+            history_entry = f"[Фото, распознано моделью напрямую] {caption}"
+            db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
+
+            elapsed = time.monotonic() - t0
+            footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · {opt['label']}</i>"
+            await _send_long(message, reply_text + footer, reply_markup=quick_actions_keyboard())
+        except Exception:
+            _refund_all()
+            raise
+
+        try:
+            await _credit_referral_progress(message.bot, user_id)
+        except Exception:
+            logger.exception("Referral credit progress failed for user_id=%s", user_id)
+        return
+
+    status_msg = await message.answer("🔍 <i>Распознаю задание...</i>")
 
     # Stage 1 — pure perception: get an accurate, literal description of
     # what's on the photo (text/problem AND general visual content — the
@@ -2847,12 +3250,12 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
         {"type": "image_url", "image_url": {"url": data_url}},
     ]
     try:
-        vision_text = await ai.ask_ai([], transcription_request, VISION_MODEL, max_tokens=3000)
+        vision_text, _ = await ai.ask_ai([], transcription_request, VISION_MODEL, max_tokens=3000)
     except ai.AIError as e:
         # The request already cost a message/credit above — an error means
         # the user got nothing for it, so give it back rather than making
         # them pay again to retry.
-        db.refund_consumed_message(user_id, status["consumed"])
+        _refund_all()
         await status_msg.edit_text(e.user_message)
         return
 
@@ -2875,11 +3278,12 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
         f"«Проверка» не нужен."
     )
     try:
-        reply_text, _ = await ai.ask_ai(
-            history, solve_prompt, PREMIUM_MODEL, notes=notes, reasoning_effort="high", max_tokens=6144
+        reply_text, _, _ = await _ask_ai_with_fallback(
+            history, solve_prompt, PREMIUM_MODEL, user_id=user_id, notes=notes,
+            reasoning_effort="high", max_tokens=6144,
         )
     except ai.AIError as e:
-        db.refund_consumed_message(user_id, status["consumed"])
+        _refund_all()
         await status_msg.edit_text(e.user_message)
         return
 
@@ -2908,7 +3312,7 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
         # Both AI stages already succeeded at this point, but the reply
         # never actually reached the user — still a wasted request from
         # their side, so it still gets refunded.
-        db.refund_consumed_message(user_id, status["consumed"])
+        _refund_all()
         raise
 
     # Referral bonus accounting is secondary to the reply above — a bug here

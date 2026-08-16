@@ -168,9 +168,24 @@ def _strip_thinking(text: str) -> str:
 
 
 class AIError(Exception):
-    def __init__(self, message: str, user_message: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        user_message: str | None = None,
+        is_limit_error: bool = False,
+        status_code: int | None = None,
+    ):
         super().__init__(message)
         self.user_message = user_message or "Не удалось получить ответ. Попробуйте ещё раз."
+        # Set only for a genuine rate/size-limit failure (429, or 413 after
+        # ask_ai's own history/message reductions are exhausted) — never for
+        # a config/auth/malformed-request problem. Read by
+        # handlers._ask_ai_with_fallback to decide whether this specific
+        # failure is eligible for the Groq-outage fallback to AITUNNEL; any
+        # other AIError always propagates as-is, since it means something is
+        # actually broken and papering over it would hide that.
+        self.is_limit_error = is_limit_error
+        self.status_code = status_code
 
 
 class _PayloadTooLargeError(Exception):
@@ -457,6 +472,8 @@ async def _complete_once(
                 raise AIError(
                     "Groq API error: 429",
                     user_message="Сейчас слишком много запросов. Попробуйте через несколько секунд.",
+                    is_limit_error=True,
+                    status_code=429,
                 ) from e
             raise AIError(f"API error: {e.status_code}") from e
         except _API_CONNECTION_ERRORS as e:
@@ -686,6 +703,8 @@ async def ask_ai(
             "Документ или фото получились слишком большими, чтобы обработать их за один раз. "
             "Пришлите, пожалуйста, одну страницу или один вопрос — так я смогу ответить."
         ),
+        is_limit_error=True,
+        status_code=413,
     )
 
 

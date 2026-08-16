@@ -76,6 +76,42 @@ MODEL_RESPONSE_TOKENS = {
 }
 DEFAULT_MODEL_RESPONSE_TOKENS = 2048
 
+# Per-model daily sub-limit — checked and consumed IN ADDITION to (not
+# instead of) the normal daily quota above: a request to a sub-limited
+# model spends one unit from the normal quota AND one from this counter,
+# never a separate budget stacked on top of it. Exists for AITUNNEL models
+# that bill real money per call (unlike Groq): a free-tier user costs the
+# model's actual price while paying nothing themselves, so the free-tier
+# cap is deliberately smaller than what a paying user (active subscription,
+# active purchased unlimited pass, or spending a purchased message package)
+# gets — set via two separate env vars for exactly that reason.
+MODEL_DAILY_SUBLIMIT_PAID = int(os.environ.get("MODEL_DAILY_SUBLIMIT_PAID", "10"))
+MODEL_DAILY_SUBLIMIT_FREE = int(os.environ.get("MODEL_DAILY_SUBLIMIT_FREE", "2"))
+MODEL_DAILY_SUBLIMITS = {
+    "gemini-3.5-flash-lite": {"paid": MODEL_DAILY_SUBLIMIT_PAID, "free": MODEL_DAILY_SUBLIMIT_FREE},
+}
+
+# Models that accept an image/file directly in the request and don't need
+# the two-stage Groq-vision-then-solve pipeline (see handlers.py's photo/PDF
+# handling) — a set, not a single constant, since more multimodal models
+# are expected later.
+MULTIMODAL_MODELS = {"gemini-3.5-flash-lite"}
+
+# Backup provider for when Groq itself is the problem (rate/size limits),
+# routed through AITUNNEL — see handlers._ask_ai_with_fallback. Not offered
+# as a menu choice (Qwen alone is strictly worse than Groq's free, faster
+# models or Gemini's stronger/multimodal one — see MODEL_OPTIONS), but it
+# has no per-minute ceiling and costs a fraction of Gemini, which is
+# exactly what an emergency backstop needs. Empty disables the fallback
+# entirely.
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "qwen3.7-flash")
+# Two independent spend brakes on the fallback (it's real AITUNNEL money,
+# triggered automatically without the user asking for it): a global cap
+# across every user, and a per-user cap so one stuck retry loop or one
+# heavy user can't eat the whole day's budget alone.
+FALLBACK_DAILY_CAP = int(os.environ.get("FALLBACK_DAILY_CAP", "300"))
+FALLBACK_USER_DAILY_CAP = int(os.environ.get("FALLBACK_USER_DAILY_CAP", "20"))
+
 DAILY_FREE_MESSAGES = int(os.environ.get("DAILY_FREE_MESSAGES", "10"))
 DAILY_FREE_PREMIUM_MESSAGES = int(os.environ.get("DAILY_FREE_PREMIUM_MESSAGES", "5"))
 # Images (generate from scratch AND edit a photo) get their own separate
