@@ -1,9 +1,11 @@
 import asyncio
 import base64
+import datetime
 import json
 import logging
 import re
 import urllib.parse
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import groq
@@ -19,12 +21,32 @@ from bot.config import (
     MODEL_TOKEN_CEILINGS,
     POLLINATIONS_API_KEY,
     PREMIUM_MODEL,
+    QUOTA_TZ,
     REQUEST_TOKEN_BUDGET,
     STT_MODEL,
     VISION_MODEL,
 )
 
 logger = logging.getLogger(__name__)
+
+_QUOTA_TZINFO = ZoneInfo(QUOTA_TZ)
+
+_RU_WEEKDAYS = (
+    "понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье",
+)
+_RU_MONTHS = (
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
+
+
+def _current_date_str() -> str:
+    """Human-readable current date with weekday, in QUOTA_TZ — hand-rolled
+    Russian names instead of strftime('%A')/('%B') because those depend on
+    the system locale (ru_RU.UTF-8 isn't guaranteed to be installed), which
+    would silently fall back to English or raise."""
+    now = datetime.datetime.now(_QUOTA_TZINFO)
+    return f"{_RU_WEEKDAYS[now.weekday()]}, {now.day} {_RU_MONTHS[now.month - 1]} {now.year} года"
 
 SYSTEM_PROMPT = (
     "Ты дружелюбный и полезный AI-ассистент внутри Telegram-бота. "
@@ -126,8 +148,12 @@ class _PayloadTooLargeError(Exception):
 _SEARCH_BACKENDS = ("duckduckgo", "google", "brave", "yahoo")
 
 
-def _sync_search_web(query: str, max_results: int = 5) -> str:
-    results = None
+def _sync_search_web_structured(query: str, max_results: int = 5) -> list[dict]:
+    """The raw ddgs results (title/href/body dicts), [] if every backend
+    failed or found nothing. Split out from the string-formatting below so
+    forced pre-search (see ask_ai._has_freshness_marker) can cite real
+    (title, url) pairs directly, instead of asking the model to reproduce a
+    URL from memory (which it could get wrong)."""
     for backend in _SEARCH_BACKENDS:
         try:
             results = DDGS(timeout=6).text(
@@ -136,7 +162,11 @@ def _sync_search_web(query: str, max_results: int = 5) -> str:
         except Exception:
             results = None
         if results:
-            break
+            return results
+    return []
+
+
+def _format_search_results(results: list[dict]) -> str:
     if not results:
         return "Поиск не дал результатов — свежих данных по этому запросу найти не удалось."
     lines = []
@@ -148,21 +178,40 @@ def _sync_search_web(query: str, max_results: int = 5) -> str:
     return "\n".join(lines)
 
 
+def _sync_search_web(query: str, max_results: int = 5) -> str:
+    return _format_search_results(_sync_search_web_structured(query, max_results))
+
+
 async def _search_web(query: str) -> str:
     return await asyncio.to_thread(_sync_search_web, query)
 
 
+async def _search_web_structured(query: str, max_results: int = 5) -> list[dict]:
+    return await asyncio.to_thread(_sync_search_web_structured, query, max_results)
+
+
 def _build_system_prompt(notes: list[str] | None) -> str:
-    if not notes:
-        return SYSTEM_PROMPT
-    notes_block = "\n".join(f"- {n}" for n in notes)
-    return (
+    # Recomputed on every call (not baked into the static SYSTEM_PROMPT
+    # constant) since it has to reflect the real current date, not whatever
+    # date it was when the process started.
+    prompt = (
         f"{SYSTEM_PROMPT}\n\n"
-        "Пользователь также сохранил через /remember заметки о своих пожеланиях к ответу — "
-        "учитывай их при выборе содержания, темы и подробности ответа, но они не отменяют "
-        "базовые правила тона и уместности из инструкции выше:\n"
-        f"{notes_block}"
+        f"Сегодня {_current_date_str()}. Твои знания устарели и не включают события, "
+        "которые могли произойти после обучения — про новости, спортивные результаты, курсы "
+        "валют, актуальные цены и любые события, которые могли случиться позже, отвечай "
+        "только по результатам поиска (инструмент search_web или уже готовые результаты поиска "
+        "ниже, если они есть), а не по памяти. Если поиск не дал данных, честно скажи, что "
+        "свежей информации нет — не выдавай старые данные за текущие."
     )
+    if notes:
+        notes_block = "\n".join(f"- {n}" for n in notes)
+        prompt += (
+            "\n\nПользователь также сохранил через /remember заметки о своих пожеланиях к ответу — "
+            "учитывай их при выборе содержания, темы и подробности ответа, но они не отменяют "
+            "базовые правила тона и уместности из инструкции выше:\n"
+            f"{notes_block}"
+        )
+    return prompt
 
 
 # Rough, no-dependency token estimate — NOT an exact token count, just an
@@ -416,6 +465,37 @@ async def _complete_with_effort_fallback(
     return text
 
 
+# Marks a question as likely time-sensitive, worth searching for even if
+# the model itself wouldn't have called search_web (see ask_ai) — plain
+# substring/regex checks, no model call, so this stays cheap and instant.
+# Pluggable: extend as new phrasings show up in practice. Deliberately
+# broad (a false-positive search just costs a few extra seconds/tokens on
+# one message; a false negative means a stale, wrong answer).
+_FRESHNESS_MARKERS = (
+    "сегодня", "сейчас", "вчера", "на этой неделе", "в этом месяце",
+    "последни",  # "последние/-их/-юю новости/результаты..."
+    "свеж",  # "свежие/-их данные/новости"
+    "актуальн",  # "актуальные цены/данные"
+    "кто выиграл", "кто победил", "кто выигра", "результаты", "результат матча",
+    "счёт матча", "счет матча", "курс валют", "курс доллара", "курс евро",
+    "погода", "новости", "новость",
+    "вышел", "вышла", "вышло", "вышли",
+    "когда будет", "когда выйдет", "когда состоится", "расписание",
+)
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+
+
+def _has_freshness_marker(text: str) -> bool:
+    lowered = text.lower()
+    if any(marker in lowered for marker in _FRESHNESS_MARKERS):
+        return True
+    # A current-or-future year mentioned in the question (e.g. "чемпионат
+    # мира 2026") is also treated as a freshness signal — almost always
+    # someone asking about a still-upcoming or ongoing event.
+    now_year = datetime.datetime.now(_QUOTA_TZINFO).year
+    return any(int(m.group()) >= now_year for m in _YEAR_RE.finditer(text))
+
+
 async def ask_ai(
     history: list[dict],
     user_content,
@@ -424,7 +504,7 @@ async def ask_ai(
     reasoning_effort: str | None = None,
     max_tokens: int | None = None,
     enable_search: bool = False,
-) -> str:
+) -> tuple[str, list[tuple[str, str]]]:
     """`user_content` is either a plain string (text-only turn) or a list of
     content blocks (e.g. text + image_url) for multimodal turns. `max_tokens`
     is the caller's desired response budget; if omitted, a per-model default
@@ -433,6 +513,14 @@ async def ask_ai(
     size (see _fit_response_budget) — Groq reserves max_tokens against the
     same per-minute budget as the prompt, so a generous max_tokens on a big
     request can trip a 413 all on its own.
+
+    Returns (answer_text, sources) — sources is a list of (title, url) pairs
+    the answer was actually built from, non-empty only when a forced
+    pre-search ran (see _has_freshness_marker below); empty otherwise,
+    including when the model calls the search_web tool on its own — that
+    still enriches the model's context exactly as before, it just isn't
+    cited as a source list by the caller. Callers that don't care can
+    discard the second element.
 
     History is trimmed to REQUEST_TOKEN_BUDGET before the first attempt (see
     _trim_history_to_budget, further tightened by _fit_response_budget if
@@ -444,6 +532,34 @@ async def ask_ai(
     produces a plain-language refusal; a success on any attempt reaches the
     caller as an ordinary answer, no retry visible."""
     system_content = _build_system_prompt(notes)
+
+    sources: list[tuple[str, str]] = []
+    if enable_search and _has_freshness_marker(_content_text(user_content)):
+        # Don't rely on the model deciding to call search_web — the fast
+        # model in particular does this badly, and by the time it decides
+        # NOT to search, it's already answered from stale memory. This is
+        # deliberately gated on enable_search (chat pipeline only, not
+        # every ask_ai call — photo/PDF/vision prompts never set it) and on
+        # an actual freshness marker match, so it never fires on ordinary
+        # messages. search_web stays available to the model on top of this,
+        # it's additive, not a replacement.
+        query = _content_text(user_content).strip()[:300]
+        results = await _search_web_structured(query)
+        if results:
+            search_block = (
+                f"Данные поиска в интернете на {_current_date_str()} "
+                f"(запрос: {query!r}):\n{_format_search_results(results)}"
+            )
+            # Appended to the system prompt, which _trim_history_to_budget
+            # treats as untouchable — so if the budget gets tight, history
+            # is what gets dropped first, never these search results.
+            system_content = f"{system_content}\n\n{search_block}"
+            sources = [
+                (r.get("title", "") or r.get("href", ""), r.get("href", ""))
+                for r in results
+                if r.get("href")
+            ]
+
     trimmed_history = _trim_history_to_budget(
         history, system_content, user_content, REQUEST_TOKEN_BUDGET
     )
@@ -507,8 +623,8 @@ async def ask_ai(
             continue
 
         if text is not None:
-            return text
-        return "Ответ получился слишком длинным для обработки. Попробуйте задать вопрос короче."
+            return text, sources
+        return "Ответ получился слишком длинным для обработки. Попробуйте задать вопрос короче.", []
 
     logger.warning("Groq 413 persisted after 3 attempts (model=%s): %s", model, last_detail)
     raise AIError(
@@ -630,7 +746,8 @@ async def describe_image_for_generation(image_bytes: bytes) -> str:
         },
         {"type": "image_url", "image_url": {"url": data_url}},
     ]
-    return await ask_ai([], content, VISION_MODEL, max_tokens=500)
+    description, _ = await ask_ai([], content, VISION_MODEL, max_tokens=500)
+    return description
 
 
 IMAGE_EDIT_URL = "https://gen.pollinations.ai/v1/images/edits"

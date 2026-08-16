@@ -292,8 +292,55 @@ def _prepare_image(raw: bytes) -> bytes:
     return buf.getvalue()
 
 
+_MD_CODE_RE = re.compile(r"`([^`\n]+?)`")
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__", re.DOTALL)
+_MD_ITALIC_RE = re.compile(r"(?<!\*)\*([^\n*]+?)\*(?!\*)|(?<!_)_([^\n_]+?)_(?!_)")
+_MD_LEADING_MARKER_RE = re.compile(r"(?m)^[ \t]*[*#]+[ \t]+")
+
+
+def _convert_markdown(text: str) -> str:
+    """The model is told (SYSTEM_PROMPT) not to use Markdown, but sometimes
+    does anyway (**bold**, `code`) — converts the common cases into the
+    whitelist HTML tags _sanitize_model_html/Telegram actually understand,
+    so the user sees real formatting instead of literal asterisks. Runs
+    BEFORE _sanitize_model_html on purpose: whatever this produces is then
+    validated/escaped exactly like any other tag, so a leftover or
+    mismatched marker just ends up shown as plain text, never breaks
+    sending. Deliberately approximate, not a full parser: code spans first
+    (so bold/italic markers inside `code` aren't touched), then **/__ bold
+    (safe across a line break — two consecutive markers is unambiguous),
+    then single */_ italic restricted to one line each (a lone '*' spanning
+    several bullet-list lines would otherwise misread as an italic pair;
+    this doesn't try to protect subscript-style "x_1" notation from a
+    coincidental */_ pairing elsewhere in the same line — a known,
+    accepted limit of a best-effort conversion). Any '*'/'#' still sitting
+    at the start of a line afterwards (bullet lists, ### headings) gets
+    dropped rather than shown raw."""
+
+    def _code_sub(m):
+        return f"<code>{m.group(1)}</code>"
+
+    def _bold_sub(m):
+        return f"<b>{m.group(1) if m.group(1) is not None else m.group(2)}</b>"
+
+    def _italic_sub(m):
+        return f"<i>{m.group(1) if m.group(1) is not None else m.group(2)}</i>"
+
+    text = _MD_CODE_RE.sub(_code_sub, text)
+    text = _MD_BOLD_RE.sub(_bold_sub, text)
+    text = _MD_ITALIC_RE.sub(_italic_sub, text)
+    text = _MD_LEADING_MARKER_RE.sub("", text)
+    return text
+
+
 _HTML_ALLOWED_TAGS = {"b", "i", "u", "s", "code", "pre"}
 _HTML_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)>")
+# Matches a whole trusted <a href="...">title</a> source-link pair (see
+# _build_sources_html) — used only by _strip_to_plain_text's fallback, never
+# by _sanitize_model_html: <a> is deliberately NOT in _HTML_ALLOWED_TAGS,
+# so the model's own output can never produce a real clickable link, only
+# the source-citation block this bot builds itself from search results.
+_HTML_A_PAIR_RE = re.compile(r'<a href="([^"<>]*)">(.*?)</a>', re.DOTALL)
 
 
 def _escape_html_text(s: str) -> str:
@@ -351,33 +398,70 @@ def _sanitize_model_html(text: str) -> str:
 
 def _strip_to_plain_text(sanitized_html: str) -> str:
     """Last-resort fallback for _send_long, used only if Telegram still
-    rejects the already-sanitized HTML — removes the (by construction, only
-    valid whitelist) tags and un-escapes entities back to literal characters,
-    since a plain-mode message doesn't decode HTML entities at all. The user
-    never sees raw markup, at worst just loses the bold/italic formatting."""
-    without_tags = _HTML_TAG_RE.sub("", sanitized_html)
+    rejects the already-sanitized (+ trusted_suffix-appended) HTML — removes
+    the (by construction, only valid whitelist) tags and un-escapes entities
+    back to literal characters, since a plain-mode message doesn't decode
+    HTML entities at all. A trusted <a href="...">title</a> source link (see
+    _build_sources_html) survives as "title (url)" rather than losing the
+    link or leaking raw tag markup. The user never sees raw markup, at worst
+    just loses the bold/italic formatting."""
+    without_links = _HTML_A_PAIR_RE.sub(lambda m: f"{m.group(2)} ({m.group(1)})", sanitized_html)
+    without_tags = _HTML_TAG_RE.sub("", without_links)
     return without_tags.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+def _build_sources_html(sources: list[tuple[str, str]]) -> str:
+    """A short <a href="...">title</a> block citing up to 3 sources an
+    answer was actually built from (see ai.ask_ai's forced pre-search on a
+    freshness marker) — only ever built from data this bot fetched itself,
+    never fabricated and never derived from the model's own text. Returns
+    "" when there's nothing to cite. <a> is deliberately not in
+    _HTML_ALLOWED_TAGS (the model's own output never gets to produce a real
+    link), so this is meant to be appended as _send_long's trusted_suffix,
+    AFTER _sanitize_model_html has already run on the model's answer, not
+    sanitized itself."""
+    usable = [(title, url) for title, url in sources if url.startswith(("http://", "https://"))][:3]
+    if not usable:
+        return ""
+    lines = ["\n\n📎 <b>Источники:</b>"]
+    for title, url in usable:
+        safe_title = _escape_html_text((title or url).strip())
+        safe_url = url.replace('"', "%22")
+        lines.append(f'• <a href="{safe_url}">{safe_title}</a>')
+    return "\n".join(lines)
 
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000
 
 
 async def _send_long(
-    message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None
+    message: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    trusted_suffix: str = "",
 ) -> None:
     """Telegram rejects messages over ~4096 chars outright; split instead of crashing.
-    Each chunk is run through _sanitize_model_html first so the model's <b>/<i>/<code>
-    formatting renders while stray '<'/'>' (e.g. from math) can never break parsing.
-    If Telegram still rejects a chunk for some other reason, the fallback strips
-    markup down to plain text instead of ever showing raw tags. `reply_markup`
-    (if given) is attached only to the last chunk."""
+    Each chunk goes through _convert_markdown (turns stray **bold**/`code` the
+    model wrote despite instructions not to into real tags) and then
+    _sanitize_model_html, so the model's <b>/<i>/<code> formatting renders
+    while stray '<'/'>' (e.g. from math) can never break parsing. If Telegram
+    still rejects a chunk for some other reason, the fallback strips markup
+    down to plain text instead of ever showing raw tags. `reply_markup` (if
+    given) is attached only to the last chunk. `trusted_suffix` (if given) is
+    caller-vetted HTML — e.g. _build_sources_html's source-links block, built
+    from data this bot fetched itself, not model output — appended to the
+    LAST chunk AFTER sanitization, never sanitized itself, so its
+    <a href="..."> links survive (_sanitize_model_html doesn't allow <a> at
+    all, on purpose)."""
     chunks = [
         text[i : i + TELEGRAM_MAX_MESSAGE_LEN]
         for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LEN)
     ] or [""]
     for i, chunk in enumerate(chunks):
         markup = reply_markup if i == len(chunks) - 1 else None
-        safe_chunk = _sanitize_model_html(chunk)
+        safe_chunk = _sanitize_model_html(_convert_markdown(chunk))
+        if i == len(chunks) - 1 and trusted_suffix:
+            safe_chunk += trusted_suffix
         try:
             await message.answer(safe_chunk, reply_markup=markup)
         except TelegramBadRequest:
@@ -2376,7 +2460,7 @@ async def _answer_text_query(
 
     t0 = time.monotonic()
     try:
-        reply_text = await ai.ask_ai(
+        reply_text, sources = await ai.ask_ai(
             history, text, model, notes=notes, reasoning_effort=reasoning_effort, enable_search=True
         )
         elapsed = time.monotonic() - t0
@@ -2386,7 +2470,12 @@ async def _answer_text_query(
         db.append_dialog_turn(user_id, text, reply_text, MAX_HISTORY_TURNS)
 
         footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · {opt['label']}</i>"
-        await _send_long(message, reply_text + footer, reply_markup=quick_actions_keyboard())
+        await _send_long(
+            message,
+            reply_text + footer,
+            reply_markup=quick_actions_keyboard(),
+            trusted_suffix=_build_sources_html(sources),
+        )
     except ai.AIError as e:
         # The request already cost a message/credit above — an error means
         # the user got nothing for it, so give it back rather than making
@@ -2621,7 +2710,7 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
         await message.bot.send_chat_action(message.chat.id, "typing")
 
         try:
-            reply_text = await ai.ask_ai(
+            reply_text, _ = await ai.ask_ai(
                 history, prompt, model, notes=notes, reasoning_effort=reasoning_effort
             )
 
@@ -2758,7 +2847,7 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
         f"«Проверка» не нужен."
     )
     try:
-        reply_text = await ai.ask_ai(
+        reply_text, _ = await ai.ask_ai(
             history, solve_prompt, PREMIUM_MODEL, notes=notes, reasoning_effort="high", max_tokens=6144
         )
     except ai.AIError as e:
