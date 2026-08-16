@@ -34,6 +34,7 @@ from pypdf import PdfReader
 from bot import ai, db
 from bot.config import (
     ADMIN_IDS,
+    DAILY_COST_CAP,
     DAILY_FREE_IMAGE_MESSAGES,
     DAILY_FREE_MESSAGES,
     DAILY_FREE_PREMIUM_MESSAGES,
@@ -43,7 +44,9 @@ from bot.config import (
     FAST_MODEL,
     FAST_REASONING_EFFORT,
     MAX_HISTORY_TURNS,
+    MODEL_COST_PER_REQUEST,
     MODEL_DAILY_SUBLIMITS,
+    MODEL_TRIAL_TOTALS,
     MULTIMODAL_MODELS,
     PREMIUM_CREDIT_COST,
     POLLINATIONS_API_KEY,
@@ -552,13 +555,21 @@ def model_keyboard(status: dict, user_id: int) -> InlineKeyboardMarkup:
     def label(tier: str, choice: str) -> str:
         opt = MODEL_OPTIONS[(tier, choice)]
         text = opt["label"]
-        sublimit = MODEL_DAILY_SUBLIMITS.get(opt["model"])
-        if sublimit is not None:
-            # Правка 3.3: actual remaining count next to the model that has
-            # a sub-limit, from the live counter — never a hardcoded number.
-            limit = sublimit["paid"] if _is_paid_tier(status) else sublimit["free"]
-            used = db.get_model_sublimit_usage(user_id, opt["model"])
-            text = f"{text} — осталось {max(0, limit - used)} из {limit}"
+        model_id = opt["model"]
+        # Правка 1.5: paying tiers see their daily sub-limit remainder (as
+        # before); the free tier sees its lifetime trial remainder instead
+        # — always the live counter, never a hardcoded number.
+        if _is_paid_tier(status):
+            sublimit = MODEL_DAILY_SUBLIMITS.get(model_id)
+            if sublimit is not None:
+                limit = sublimit["paid"]
+                used = db.get_model_sublimit_usage(user_id, model_id)
+                text = f"{text} — осталось {max(0, limit - used)} из {limit}"
+        else:
+            trial_total = MODEL_TRIAL_TOTALS.get(model_id)
+            if trial_total is not None:
+                used = db.get_model_trial_usage(user_id, model_id)
+                text = f"{text} — осталось {max(0, trial_total - used)} из {trial_total} пробных"
         return f"✅ {text}" if (tier, choice) == (current_pref, current_choice) else text
 
     return InlineKeyboardMarkup(
@@ -632,10 +643,12 @@ def _image_quota_denied_text(status: dict) -> str:
 
 
 def _sublimit_denied_text(model: str, limit: int, used_today: int) -> str:
-    """Правка 3.4: explains three things, in order — what specifically ran
-    out, that the rest of the bot still works, and when it resets. No
-    purchase pitch first — someone hitting this already pays for a
-    subscription/package, they need an answer, not a storefront."""
+    """Daily sub-limit denial, for a PAYING tier (config.MODEL_DAILY_SUBLIMITS
+    — the free tier's trial has its own text, _trial_denied_text below).
+    Explains three things, in order — what specifically ran out, that the
+    rest of the bot still works, and when it resets. No purchase pitch
+    first — someone hitting this already pays for a subscription/package,
+    they need an answer, not a storefront."""
     label = _label_for_model_id(model)
     tz_abbr = datetime.datetime.now(_QUOTA_TZINFO).strftime("%Z")
     return (
@@ -645,29 +658,142 @@ def _sublimit_denied_text(model: str, limit: int, used_today: int) -> str:
     )
 
 
-def _enforce_model_sublimit(user_id: int, model: str, status: dict) -> tuple[bool, str | None, bool]:
-    """Правка 1: a per-model daily sub-limit lives INSIDE the normal quota
-    (config.MODEL_DAILY_SUBLIMITS) — call this right after
-    try_consume_message has already succeeded for the same request, and
-    before the model is actually asked anything (Правка 1.5). `status` is
-    that same try_consume_message result (already has subscription_until/
-    unlimited_until/bonus_credits/consumed for _is_paid_tier).
+def _trial_denied_text(model: str, trial_total: int, used_total: int) -> str:
+    """Правка 1.4: the free tier's trial ran out — a ONE-TIME allowance,
+    not a daily one, so this must say so explicitly (used_total/trial_total
+    reads the same either way, and could otherwise be misread as "today").
+    Same ordering as _sublimit_denied_text: what ran out and that the rest
+    of the bot still works come first, the purchase pitch is a second,
+    separate line."""
+    label = _label_for_model_id(model)
+    return (
+        f"Пробные запросы к «{label}» закончились ({used_total}/{trial_total} — это разово, "
+        "не сбрасывается по дням). Остальные модели работают без ограничений сверх "
+        f"обычного дневного лимита — переключитесь в «{BTN_MODEL}».\n\n"
+        f"Чтобы снова пользоваться «{label}»: подписка или пакет сообщений дают отдельный "
+        "дневной лимит на неё, а не разовый — /buy"
+    )
 
-    Returns (ok, denial_text, sublimit_consumed):
-      - model has no sub-limit: (True, None, False) — nothing to do.
-      - sub-limit consumed successfully: (True, None, True) — caller must
-        refund_model_sublimit(user_id, model) if the request later fails.
-      - sub-limit exhausted: (False, denial_text, False) — caller must
-        refund the normal quota it already took (refund_consumed_message)
-        and show denial_text instead of proceeding."""
-    sublimit = MODEL_DAILY_SUBLIMITS.get(model)
-    if sublimit is None:
+
+def _cost_cap_exceeded() -> bool:
+    """Правка 3: whether today's estimated spend (db.get_today_cost, priced
+    via config.MODEL_COST_PER_REQUEST) has reached config.DAILY_COST_CAP.
+    DAILY_COST_CAP <= 0 disables the cap entirely (Правка 3.6) — always
+    False, regardless of actual spend."""
+    if DAILY_COST_CAP <= 0:
+        return False
+    return db.get_today_cost() >= DAILY_COST_CAP
+
+
+def _cost_cap_denied_text(model: str) -> str:
+    """Правка 3.2: shown to a FREE-tier user turned away because the shared
+    daily budget (not their own personal limit) is spent — never shown to a
+    paying user, who is never subject to this cap at all."""
+    label = _label_for_model_id(model)
+    tz_abbr = datetime.datetime.now(_QUOTA_TZINFO).strftime("%Z")
+    return (
+        f"«{label}» сегодня временно недоступен на бесплатном тарифе — общий дневной "
+        "бюджет на платные модели исчерпан. Остальные модели работают без ограничений "
+        f"сверх обычного дневного лимита — переключитесь в «{BTN_MODEL}». Бюджет "
+        f"обновится в 00:00 {tz_abbr}."
+    )
+
+
+async def _notify_admins_cost_cap(bot) -> None:
+    """Правка 3.4: tells every admin, once per calendar day (QUOTA_TZ), the
+    moment DAILY_COST_CAP actually starts blocking a free-tier request —
+    not on every subsequent blocked request the same day (db.
+    try_mark_cost_cap_alert_sent is the once-per-day gate)."""
+    if not db.try_mark_cost_cap_alert_sent():
+        return
+    cost_today = db.get_today_cost()
+    text = (
+        f"⚠️ Дневной бюджет на платные модели исчерпан: потрачено ~{cost_today:.2f}₽ из "
+        f"{DAILY_COST_CAP:.2f}₽ (оценка по средней цене, не факт списания у провайдера). "
+        "Платные модели и резервный откат на них отключены для бесплатных пользователей "
+        "до полуночи — у подписчиков и купивших пакет доступ не меняется."
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            logger.exception("Cost-cap admin notification failed for admin_id=%s", admin_id)
+
+
+def _record_model_cost(model: str) -> None:
+    """Правка 2.2: adds this model's estimated per-request price (rubles,
+    config.MODEL_COST_PER_REQUEST) to today's running spend. Call exactly
+    once, only AFTER ai.ask_ai has actually returned a successful response
+    — never before the request, and never on a path that ends in
+    ai.AIError/an exception, so a failed request never counts against the
+    budget (db.record_model_cost also no-ops for a zero/unlisted price, so
+    this is safe to call unconditionally for any model)."""
+    db.record_model_cost(model, MODEL_COST_PER_REQUEST.get(model, 0.0))
+
+
+async def _enforce_model_sublimit(
+    user_id: int, model: str, status: dict, bot
+) -> tuple[bool, str | None, bool]:
+    """Правка 1: paying tiers (see _is_paid_tier) keep the daily sub-limit
+    that lives INSIDE the normal quota (config.MODEL_DAILY_SUBLIMITS),
+    unchanged from before. The free tier instead draws down a lifetime
+    trial (config.MODEL_TRIAL_TOTALS) that never resets — and, on top of
+    that, Правка 3's shared daily cost cap can turn a costed model away for
+    free users specifically even before their personal trial runs out,
+    protecting the shared budget rather than any one user's own allowance.
+    Buying a package/subscription switches a user onto the daily counter
+    immediately; remaining trial uses are neither restored nor burned
+    (Правка 1.3) — if paid access later lapses, whatever trial balance is
+    still on record (often none) is what's left.
+
+    Call this right after try_consume_message has already succeeded for
+    the same request, and before the model is actually asked anything.
+    `status` is that same try_consume_message result (has
+    subscription_until/unlimited_until/bonus_credits for _is_paid_tier).
+    `bot` is only used to notify admins if this trip is what makes the
+    cost cap start blocking requests (Правка 3.4).
+
+    Returns (ok, denial_text, consumed):
+      - model has no sub-limit/trial: (True, None, False) — nothing to do.
+      - consumed successfully: (True, None, True) — caller must
+        _refund_model_sublimit(user_id, model, status) if the request
+        later fails.
+      - denied (sub-limit/trial exhausted, or cost cap tripped for a free
+        user): (False, denial_text, False) — caller must refund the normal
+        quota it already took (refund_consumed_message) and show
+        denial_text instead of proceeding."""
+    if _is_paid_tier(status):
+        sublimit = MODEL_DAILY_SUBLIMITS.get(model)
+        if sublimit is None:
+            return True, None, False
+        limit = sublimit["paid"]
+        ok, sub_status = db.try_consume_model_sublimit(user_id, model, limit)
+        if ok:
+            return True, None, True
+        return False, _sublimit_denied_text(model, limit, sub_status["used_today"]), False
+
+    if MODEL_COST_PER_REQUEST.get(model, 0.0) > 0 and _cost_cap_exceeded():
+        await _notify_admins_cost_cap(bot)
+        return False, _cost_cap_denied_text(model), False
+
+    trial_total = MODEL_TRIAL_TOTALS.get(model)
+    if trial_total is None:
         return True, None, False
-    limit = sublimit["paid"] if _is_paid_tier(status) else sublimit["free"]
-    ok, sub_status = db.try_consume_model_sublimit(user_id, model, limit)
+    ok, trial_status = db.try_consume_model_trial(user_id, model, trial_total)
     if ok:
         return True, None, True
-    return False, _sublimit_denied_text(model, limit, sub_status["used_today"]), False
+    return False, _trial_denied_text(model, trial_total, trial_status["used_total"]), False
+
+
+def _refund_model_sublimit(user_id: int, model: str, status: dict) -> None:
+    """Reverses whichever counter _enforce_model_sublimit consumed for this
+    request — the paying tier's daily sub-limit or the free tier's lifetime
+    trial — picked the same way _enforce_model_sublimit picked it
+    (_is_paid_tier), so callers don't need to re-derive which one it was."""
+    if _is_paid_tier(status):
+        db.refund_model_sublimit(user_id, model)
+    else:
+        db.refund_model_trial(user_id, model)
 
 
 async def _ask_ai_with_fallback(
@@ -676,6 +802,7 @@ async def _ask_ai_with_fallback(
     model: str,
     *,
     user_id: int,
+    is_paid: bool,
     notes: list[str] | None = None,
     reasoning_effort: str | None = None,
     max_tokens: int | None = None,
@@ -692,24 +819,34 @@ async def _ask_ai_with_fallback(
     reductions are exhausted) — any other AIError (bad key, malformed
     request, anything else) means something is actually broken and is
     re-raised immediately, never routed to the fallback. Also skipped if
-    FALLBACK_MODEL is empty, the primary model already IS FALLBACK_MODEL, or
-    the daily fallback spend caps (FALLBACK_DAILY_CAP / FALLBACK_USER_DAILY_CAP)
-    are exhausted — in every one of those cases this just re-raises the
-    original error unchanged, so the caller's existing `except ai.AIError`
-    handling covers it exactly as before this existed.
+    FALLBACK_MODEL is empty, the primary model already IS FALLBACK_MODEL, the
+    daily fallback spend caps (FALLBACK_DAILY_CAP / FALLBACK_USER_DAILY_CAP)
+    are exhausted, or — Правка 3.3 — `is_paid` is False and the shared daily
+    cost cap has already tripped (the reserve fallback costs real money too;
+    once the budget's gone, a free user's failed request just fails, exactly
+    as if FALLBACK_MODEL were unset — a paying user is never affected). In
+    every one of those cases this just re-raises the original error
+    unchanged, so the caller's existing `except ai.AIError` handling covers
+    it exactly as before this existed. `is_paid` should be _is_paid_tier of
+    the same try_consume_message status this request was billed against.
 
     Returns (text, sources, answered_model) — answered_model is whichever
     model actually produced the text, for a truthful "model used" footer
     (Правка 4.4: the user is never told about the substitution, but the
-    footer must never claim a model that didn't actually answer)."""
+    footer must never claim a model that didn't actually answer). Правка
+    2.2: every successful return also records that model's estimated cost
+    (a no-op for a free/Groq model — see _record_model_cost)."""
     try:
         text, sources = await ai.ask_ai(
             history, content, model, notes=notes, reasoning_effort=reasoning_effort,
             max_tokens=max_tokens, enable_search=enable_search,
         )
+        _record_model_cost(model)
         return text, sources, model
     except ai.AIError as e:
         if not FALLBACK_MODEL or not e.is_limit_error or model == FALLBACK_MODEL:
+            raise
+        if not is_paid and _cost_cap_exceeded():
             raise
         if not db.try_consume_fallback(user_id, FALLBACK_DAILY_CAP, FALLBACK_USER_DAILY_CAP):
             raise
@@ -721,6 +858,7 @@ async def _ask_ai_with_fallback(
             history, content, FALLBACK_MODEL, notes=notes, reasoning_effort=reasoning_effort,
             max_tokens=max_tokens, enable_search=enable_search,
         )
+        _record_model_cost(FALLBACK_MODEL)
         return text, sources, FALLBACK_MODEL
 
 
@@ -1065,9 +1203,9 @@ MODEL_MENU_TEXT = (
     "⚡/💎 — бесплатные модели, работают в рамках обычного дневного лимита, без "
     "дополнительных ограничений.\n\n"
     "🧠 Умный режим сам видит фото и файлы и отвечает за секунды — но каждый его "
-    "запрос стоит денег, поэтому у него отдельный дневной счётчик: "
-    f"{MODEL_DAILY_SUBLIMITS['gemini-3.5-flash-lite']['paid']} в день у подписки/пакета, "
-    f"{MODEL_DAILY_SUBLIMITS['gemini-3.5-flash-lite']['free']} — на бесплатном тарифе."
+    "запрос стоит денег: на бесплатном тарифе доступно "
+    f"{MODEL_TRIAL_TOTALS['gemini-3.5-flash-lite']} пробных запросов навсегда, "
+    f"у подписки/пакета — {MODEL_DAILY_SUBLIMITS['gemini-3.5-flash-lite']['paid']} в день."
 )
 
 
@@ -2081,6 +2219,13 @@ async def cb_admin_help_category(callback: CallbackQuery) -> None:
 def _admin_stats_text() -> str:
     s = db.get_admin_stats()
     fallback_used_today = db.get_fallback_usage_today()
+    cost = db.get_cost_summary()
+    cap_line = (
+        f" из {DAILY_COST_CAP:.2f}₽/день" if DAILY_COST_CAP > 0 else " (потолок расходов отключён)"
+    )
+    model_lines = "\n".join(
+        f"  · {_label_for_model_id(m)}: {c:.2f}₽" for m, c in cost["today_by_model"]
+    ) or "  · сегодня ещё не было платных запросов"
     return (
         "📊 <b>Статистика</b>\n\n"
         f"Всего пользователей: <b>{s['total_users']}</b>\n"
@@ -2093,7 +2238,14 @@ def _admin_stats_text() -> str:
         # backstop today — a rising number here means Groq is struggling,
         # not that anything in the bot is broken.
         f"🆘 Откатов на резерв сегодня: <b>{fallback_used_today}</b> "
-        f"(лимит {FALLBACK_DAILY_CAP}/день)"
+        f"(лимит {FALLBACK_DAILY_CAP}/день)\n\n"
+        # Правка 2.5: this whole block is an ESTIMATE off MODEL_COST_PER_REQUEST,
+        # not what the provider actually billed — say so, every time.
+        f"💸 Расход на платные модели (оценка по средней цене, не факт списания "
+        f"у провайдера):\n"
+        f"Сегодня: <b>{cost['today']:.2f}₽</b>{cap_line}\n"
+        f"За 7 дней: <b>{cost['7d']:.2f}₽</b> · за 30 дней: <b>{cost['30d']:.2f}₽</b>\n"
+        f"По моделям сегодня:\n{model_lines}"
     )
 
 
@@ -2735,7 +2887,9 @@ async def _answer_text_query(
     model, reasoning_effort = opt["model"], opt["reasoning"]
     notes = [content for _id, content in db.list_notes(user_id)]
 
-    sublimit_ok, sublimit_denial, sublimit_consumed = _enforce_model_sublimit(user_id, model, status)
+    sublimit_ok, sublimit_denial, sublimit_consumed = await _enforce_model_sublimit(
+        user_id, model, status, message.bot
+    )
     if not sublimit_ok:
         db.refund_consumed_message(user_id, status["consumed"])
         await message.answer(sublimit_denial)
@@ -2748,7 +2902,7 @@ async def _answer_text_query(
     t0 = time.monotonic()
     try:
         reply_text, sources, answered_model = await _ask_ai_with_fallback(
-            history, text, model, user_id=user_id, notes=notes,
+            history, text, model, user_id=user_id, is_paid=_is_paid_tier(status), notes=notes,
             reasoning_effort=reasoning_effort, enable_search=True,
         )
         elapsed = time.monotonic() - t0
@@ -2770,13 +2924,13 @@ async def _answer_text_query(
         # them pay again to retry.
         db.refund_consumed_message(user_id, status["consumed"])
         if sublimit_consumed:
-            db.refund_model_sublimit(user_id, model)
+            _refund_model_sublimit(user_id, model, status)
         await message.answer(e.user_message)
         return
     except Exception:
         db.refund_consumed_message(user_id, status["consumed"])
         if sublimit_consumed:
-            db.refund_model_sublimit(user_id, model)
+            _refund_model_sublimit(user_id, model, status)
         raise
 
     # Referral bonus accounting is secondary to the reply above — a bug here
@@ -2966,7 +3120,9 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
         model, reasoning_effort = opt["model"], opt["reasoning"]
         notes = [content for _id, content in db.list_notes(user_id)]
 
-        sublimit_ok, sublimit_denial, sublimit_consumed = _enforce_model_sublimit(user_id, model, status)
+        sublimit_ok, sublimit_denial, sublimit_consumed = await _enforce_model_sublimit(
+            user_id, model, status, message.bot
+        )
         if not sublimit_ok:
             db.refund_consumed_message(user_id, status["consumed"])
             await message.answer(sublimit_denial)
@@ -2975,7 +3131,7 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
         def _refund_all() -> None:
             db.refund_consumed_message(user_id, status["consumed"])
             if sublimit_consumed:
-                db.refund_model_sublimit(user_id, model)
+                _refund_model_sublimit(user_id, model, status)
 
         caption = await _strip_mention(message, message.caption) or "Кратко перескажи документ и выдели главное."
         history = (
@@ -3019,6 +3175,7 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
                 reply_text, _ = await ai.ask_ai(
                     history, content, model, notes=notes, reasoning_effort=reasoning_effort
                 )
+                _record_model_cost(model)
             except ai.AIError as e:
                 _refund_all()
                 await message.answer(e.user_message)
@@ -3066,7 +3223,8 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
 
             try:
                 reply_text, _, _ = await _ask_ai_with_fallback(
-                    history, prompt, model, user_id=user_id, notes=notes, reasoning_effort=reasoning_effort
+                    history, prompt, model, user_id=user_id, is_paid=_is_paid_tier(status),
+                    notes=notes, reasoning_effort=reasoning_effort,
                 )
             except ai.AIError as e:
                 _refund_all()
@@ -3136,7 +3294,9 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
     opt = _model_option(status)
     model = opt["model"]
 
-    sublimit_ok, sublimit_denial, sublimit_consumed = _enforce_model_sublimit(user_id, model, status)
+    sublimit_ok, sublimit_denial, sublimit_consumed = await _enforce_model_sublimit(
+        user_id, model, status, message.bot
+    )
     if not sublimit_ok:
         db.refund_consumed_message(user_id, status["consumed"])
         await message.answer(sublimit_denial)
@@ -3145,7 +3305,7 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
     def _refund_all() -> None:
         db.refund_consumed_message(user_id, status["consumed"])
         if sublimit_consumed:
-            db.refund_model_sublimit(user_id, model)
+            _refund_model_sublimit(user_id, model, status)
 
     caption = await _strip_mention(message, message.caption) or (
         "Реши задание на фото. Если это не задание — опиши, что на фото."
@@ -3189,6 +3349,7 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
             reply_text, _ = await ai.ask_ai(
                 history, content, model, notes=notes, reasoning_effort=opt["reasoning"], max_tokens=6144
             )
+            _record_model_cost(model)
         except ai.AIError as e:
             _refund_all()
             await status_msg.edit_text(e.user_message)
@@ -3279,8 +3440,8 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
     )
     try:
         reply_text, _, _ = await _ask_ai_with_fallback(
-            history, solve_prompt, PREMIUM_MODEL, user_id=user_id, notes=notes,
-            reasoning_effort="high", max_tokens=6144,
+            history, solve_prompt, PREMIUM_MODEL, user_id=user_id, is_paid=_is_paid_tier(status),
+            notes=notes, reasoning_effort="high", max_tokens=6144,
         )
     except ai.AIError as e:
         _refund_all()
