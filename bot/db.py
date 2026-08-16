@@ -343,6 +343,33 @@ for (_backfill_code,) in _backfill_rows:
 if _backfill_rows:
     _conn.commit()
 
+# Правка 1.3: one-time cleanup for balances that already went negative
+# before add_bonus_credits/admin_add_bonus_credits started clamping at 0 —
+# a no-op on every startup after the first (WHERE bonus_credits < 0 matches
+# nothing once they're all fixed), so this is safe to leave running
+# unconditionally rather than gating it behind a "did we already migrate"
+# flag.
+_conn.execute("UPDATE players SET bonus_credits = 0 WHERE bonus_credits < 0")
+
+# Правка 4.4: when this user's row was first created — set only at INSERT
+# time by _ensure_player from here on (never touched by the ON CONFLICT
+# UPDATE branch, unlike last_active_at), so it stays a true "first seen"
+# date going forward. Existing rows get a one-time backfill to the
+# earliest known sign of activity: their earliest chat_log entry if they
+# have one, falling back to last_active_at (the only thing guaranteed to
+# exist) for a row with none — an honest "earliest we actually know about",
+# not a fabricated exact join date.
+_ensure_column("players", "first_seen_at", "TEXT")
+_conn.execute(
+    """
+    UPDATE players
+    SET first_seen_at = COALESCE(
+        (SELECT MIN(created_at) FROM chat_log WHERE chat_log.user_id = players.user_id),
+        last_active_at
+    )
+    WHERE first_seen_at IS NULL
+    """
+)
 _conn.commit()
 
 
@@ -386,18 +413,37 @@ def _today_start_utc() -> str:
     )
 
 
+def _local_midnight_utc(days_ago: int) -> str:
+    """Same conversion as _today_start_utc, generalized to N calendar days
+    back — the UTC instant of QUOTA_TZ-local midnight `days_ago` days
+    before today. Used only by get_retention_stats to bucket
+    first_seen_at/last_active_at into "yesterday"/"last N days" windows
+    without drifting by the timezone offset near midnight."""
+    local_midnight = datetime.datetime.now(_QUOTA_TZINFO).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - datetime.timedelta(days=days_ago)
+    return (
+        local_midnight.astimezone(datetime.timezone.utc)
+        .replace(tzinfo=None)
+        .isoformat(timespec="seconds")
+    )
+
+
 def _ensure_player(user_id: int, username: str | None) -> None:
     # COALESCE keeps the previously known username when this call passes None
     # (e.g. admin actions that only have a user_id) instead of blanking it out.
+    # first_seen_at is only in the INSERT column list, not the ON CONFLICT
+    # UPDATE SET — so it's written once, on this user's very first row, and
+    # never touched again (see get_retention_stats).
     _conn.execute(
         """
-        INSERT INTO players (user_id, username, quota_date, messages_used_today, bonus_credits, model_pref, last_active_at)
-        VALUES (?, ?, ?, 0, 0, 'fast', ?)
+        INSERT INTO players (user_id, username, quota_date, messages_used_today, bonus_credits, model_pref, last_active_at, first_seen_at)
+        VALUES (?, ?, ?, 0, 0, 'fast', ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             username = COALESCE(excluded.username, players.username),
             last_active_at = excluded.last_active_at
         """,
-        (user_id, username, _today(), _now()),
+        (user_id, username, _today(), _now(), _now()),
     )
     _conn.commit()
 
@@ -978,10 +1024,15 @@ def try_mark_cost_cap_alert_sent() -> bool:
 
 
 def add_bonus_credits(user_id: int, username: str | None, amount: int) -> int:
+    """Правка 1: clamped at 0 via MAX(0, ...), same as refund_payment already
+    does — a deduction larger than what's on hand zeroes the balance out
+    instead of going negative. Only ever called with a positive amount in
+    practice (referral bonuses), but the clamp costs nothing and keeps this
+    function's own invariant ("never negative") true regardless of caller."""
     with _lock:
         _ensure_player(user_id, username)
         _conn.execute(
-            "UPDATE players SET bonus_credits = bonus_credits + ? WHERE user_id = ?",
+            "UPDATE players SET bonus_credits = MAX(0, bonus_credits + ?) WHERE user_id = ?",
             (amount, user_id),
         )
         _conn.commit()
@@ -989,23 +1040,38 @@ def add_bonus_credits(user_id: int, username: str | None, amount: int) -> int:
         return cur.fetchone()[0]
 
 
-def admin_add_bonus_credits(user_id: int, amount: int) -> int | None:
+def admin_add_bonus_credits(user_id: int, amount: int) -> tuple[int, int] | None:
     """Grants/deducts bonus credits for an admin action: unlike
     add_bonus_credits, doesn't touch last_active_at (this isn't the user
     being active) and doesn't create a new player row for an unknown id
-    (returns None instead, so the admin gets a clear "not found")."""
+    (returns None instead, so the admin gets a clear "not found").
+
+    Правка 1: never takes the balance negative — a deduction larger than
+    what's on hand (e.g. the admin card's "-10" button, or /grant with a
+    negative amount, on a user who has less than 10) zeroes it out
+    (MAX(0, ...), same clamp as refund_payment) rather than going negative
+    and quietly eating into the credit from the user's NEXT purchase — this
+    was reproduced live: balance at -6, bought a 25-message package, ended
+    up with 19 instead of 25.
+
+    Returns (before, after) so the caller can tell whether the requested
+    amount was actually fully applied (after - before == amount) or
+    clamped, and show the admin exactly what happened — or None if the
+    user isn't found."""
     with _lock:
         cur = _conn.execute("SELECT bonus_credits FROM players WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
         if row is None:
             return None
+        before = row[0]
         _conn.execute(
-            "UPDATE players SET bonus_credits = bonus_credits + ? WHERE user_id = ?",
+            "UPDATE players SET bonus_credits = MAX(0, bonus_credits + ?) WHERE user_id = ?",
             (amount, user_id),
         )
         _conn.commit()
         cur = _conn.execute("SELECT bonus_credits FROM players WHERE user_id = ?", (user_id,))
-        return cur.fetchone()[0]
+        after = cur.fetchone()[0]
+        return before, after
 
 
 def try_consume_bonus_credits(user_id: int, username: str | None, cost: int) -> tuple[bool, int]:
@@ -1587,6 +1653,55 @@ def get_admin_stats() -> dict:
         }
 
 
+def get_retention_stats() -> dict:
+    """Правка 4: how many of the users a push (e.g. a blogger ad) brought
+    in actually come back — the question that matters right after one, as
+    opposed to get_admin_stats's flat "active today" count. Every boundary
+    here is a QUOTA_TZ calendar day (via _local_midnight_utc), matching
+    every other daily boundary in this file. Relies on players.first_seen_at
+    (see _ensure_player/the startup backfill) — a user who only ever
+    existed before that column was backfilled still has a value (their
+    earliest known chat_log entry, or last_active_at as a last resort), so
+    this works for the whole existing user base, not just new signups."""
+    with _lock:
+        today_start = _local_midnight_utc(0)
+        yesterday_start = _local_midnight_utc(1)
+        week_start = _local_midnight_utc(6)  # today + 6 full days back = a 7-day window
+        three_day_start = _local_midnight_utc(2)  # today + 2 full days back = a 3-day window
+
+        cur = _conn.execute(
+            "SELECT COUNT(*) FROM players WHERE first_seen_at >= ? AND first_seen_at < ?",
+            (yesterday_start, today_start),
+        )
+        (new_yesterday,) = cur.fetchone()
+
+        cur = _conn.execute(
+            "SELECT COUNT(*) FROM players WHERE first_seen_at >= ? AND first_seen_at < ? "
+            "AND last_active_at >= ?",
+            (yesterday_start, today_start, today_start),
+        )
+        (returned_today,) = cur.fetchone()
+
+        cur = _conn.execute(
+            "SELECT COUNT(*) FROM players WHERE first_seen_at >= ?", (week_start,)
+        )
+        (new_7d,) = cur.fetchone()
+
+        cur = _conn.execute(
+            "SELECT COUNT(*) FROM players WHERE first_seen_at >= ? AND last_active_at >= ?",
+            (week_start, three_day_start),
+        )
+        (new_7d_active_3d,) = cur.fetchone()
+
+        return {
+            "new_yesterday": new_yesterday,
+            "returned_today": returned_today,
+            "returned_today_pct": round(returned_today / new_yesterday * 100) if new_yesterday else 0,
+            "new_7d": new_7d,
+            "new_7d_active_3d": new_7d_active_3d,
+        }
+
+
 FUNNEL_EVENTS = ("buy_opened", "invoice_sent", "paid", "promo_join")
 
 
@@ -2064,6 +2179,66 @@ def list_promo_codes() -> list[dict]:
         )
         rows = cur.fetchall()
         return [{**_promo_code_row_to_dict(row), **_promo_stats(row[0])} for row in rows]
+
+
+def count_promo_visitors(code: str) -> int:
+    with _lock:
+        cur = _conn.execute("SELECT COUNT(*) FROM promo_visits WHERE code = ?", (code,))
+        return cur.fetchone()[0]
+
+
+def list_promo_visitors(code: str, limit: int, offset: int) -> list[dict]:
+    """Правка 3.1: per-visitor detail for /promo_users — who actually
+    clicked this code's link, when, whether they've used the bot at all,
+    whether they bought anything attributed to this code, and whether
+    they're still inside their own attribution window right now. Newest
+    visit first, paginated the same way list_users() is for /users.
+
+    "messages_sent" counts chat_log rows (role='user') for that visitor —
+    bounded by CHATLOG_RETENTION_DAYS like every other chat_log read in
+    this file (delete_old_chat_log purges old rows), not a true unbounded
+    lifetime count; there's no separate counter that survives the purge."""
+    with _lock:
+        cur = _conn.execute("SELECT window_days FROM promo_codes WHERE code = ?", (code,))
+        row = cur.fetchone()
+        window_days = row[0] if row else 0
+
+        cur = _conn.execute(
+            "SELECT pv.user_id, p.username, pv.joined_at FROM promo_visits pv "
+            "LEFT JOIN players p ON p.user_id = pv.user_id "
+            "WHERE pv.code = ? ORDER BY pv.joined_at DESC LIMIT ? OFFSET ?",
+            (code, limit, offset),
+        )
+        rows = cur.fetchall()
+
+        now = _utcnow_naive()
+        result = []
+        for user_id, username, joined_at in rows:
+            cur2 = _conn.execute(
+                "SELECT COUNT(*) FROM chat_log WHERE user_id = ? AND role = 'user'", (user_id,)
+            )
+            (messages_sent,) = cur2.fetchone()
+            cur3 = _conn.execute(
+                "SELECT COUNT(*) FROM payments WHERE promo_code = ? AND user_id = ? AND status = 'paid'",
+                (code, user_id),
+            )
+            (payments_count,) = cur3.fetchone()
+            try:
+                joined_dt = datetime.datetime.fromisoformat(joined_at)
+                in_window = now <= joined_dt + datetime.timedelta(days=window_days)
+            except ValueError:
+                in_window = False
+            result.append(
+                {
+                    "user_id": user_id,
+                    "username": username,
+                    "joined_at": joined_at,
+                    "messages_sent": messages_sent,
+                    "purchased": payments_count > 0,
+                    "in_window": in_window,
+                }
+            )
+        return result
 
 
 def backup_database(dest_path: str) -> None:

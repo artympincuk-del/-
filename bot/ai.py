@@ -22,6 +22,7 @@ from bot.config import (
     FAST_MODEL,
     GROQ_API_KEY,
     GROQ_MAX_CONCURRENT,
+    GROQ_MAX_RETRIES,
     MODEL_RESPONSE_TOKENS,
     MODEL_TOKEN_CEILINGS,
     POLLINATIONS_API_KEY,
@@ -103,7 +104,7 @@ SEARCH_TOOL_SCHEMA = [
     }
 ]
 
-_client = groq.AsyncGroq(api_key=GROQ_API_KEY)
+_client = groq.AsyncGroq(api_key=GROQ_API_KEY, max_retries=GROQ_MAX_RETRIES)
 
 # Второй провайдер: OpenAI-совместимый агрегатор с оплатой в рублях. Клиент
 # создаётся только если задан ключ — без него бот работает как раньше, на

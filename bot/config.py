@@ -236,6 +236,21 @@ GROQ_MAX_CONCURRENT = int(os.environ.get("GROQ_MAX_CONCURRENT", "5"))
 # or a runaway loop burns through the balance in minutes.
 AITUNNEL_MAX_CONCURRENT = int(os.environ.get("AITUNNEL_MAX_CONCURRENT", "3"))
 
+# Правка 6: the groq SDK retries a 429/5xx/connection error internally,
+# with its own backoff, BEFORE it ever raises anything our code can see —
+# invisible retries, invisible delay. Measured live: the same fast model
+# answered in 0.5s one moment and 34.6s the next, because the SDK's
+# default (2 retries = up to 3 attempts, each waiting on Groq's own
+# Retry-After) silently ate 30+ seconds before finally giving up and
+# raising, at which point handlers._ask_ai_with_fallback would have
+# already routed to the reserve model in a fraction of that time. Lowering
+# this makes Groq give up and hand off to the fallback sooner — the
+# fallback logic itself (daily caps, honest "who answered" footer) is
+# unchanged, this only controls how many attempts happen before Groq's own
+# client concedes. Only applies to the Groq client — AITUNNEL keeps the
+# SDK default, it's not what this was slow on.
+GROQ_MAX_RETRIES = int(os.environ.get("GROQ_MAX_RETRIES", "1"))
+
 # Timezone the daily free-message quota resets in, and unlimited-until times
 # are displayed in — IANA name for zoneinfo. UTC would reset at 3am Moscow
 # time, which is confusing for a bot whose users are mostly there.
