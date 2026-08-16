@@ -289,6 +289,73 @@ def _prepare_image(raw: bytes) -> bytes:
     return buf.getvalue()
 
 
+_HTML_ALLOWED_TAGS = {"b", "i", "u", "s", "code", "pre"}
+_HTML_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)>")
+
+
+def _escape_html_text(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _sanitize_model_html(text: str) -> str:
+    """The model is told to format with a handful of Telegram HTML tags, but
+    it also sometimes writes literal '<'/'>' in ordinary math ("x < 5/4").
+    Sent as-is, Telegram tries to parse those as tags and rejects the whole
+    message. This escapes every '&'/'<'/'>' that isn't part of a genuinely
+    well-formed, properly PAIRED whitelist tag — including a stray/unclosed
+    <b> with no matching </b> — so Telegram always accepts the message and
+    the user only ever sees real formatting or real characters, never raw
+    markup and never a silently dropped reply."""
+    tokens = []
+    pos = 0
+    for m in _HTML_TAG_RE.finditer(text):
+        if m.start() > pos:
+            tokens.append(("text", text[pos : m.start()]))
+        tokens.append(("tag", bool(m.group(1)), m.group(2).lower(), m.group(0)))
+        pos = m.end()
+    if pos < len(text):
+        tokens.append(("text", text[pos:]))
+
+    # Only a tag that is both whitelisted AND properly nested/closed is kept
+    # as real markup — everything else (unknown tags, mismatched or
+    # never-closed whitelist tags) gets escaped and shown as literal text.
+    valid = [False] * len(tokens)
+    stack = []
+    for idx, tok in enumerate(tokens):
+        if tok[0] != "tag":
+            continue
+        _, is_close, name, _ = tok
+        if name not in _HTML_ALLOWED_TAGS:
+            continue
+        if not is_close:
+            stack.append((idx, name))
+        elif stack and stack[-1][1] == name:
+            open_idx, _ = stack.pop()
+            valid[open_idx] = True
+            valid[idx] = True
+        # a close tag that doesn't match the top of the stack is left
+        # invalid (escaped) rather than force-closing something else
+
+    parts = []
+    for idx, tok in enumerate(tokens):
+        if tok[0] == "text":
+            parts.append(_escape_html_text(tok[1]))
+        else:
+            _, is_close, name, raw = tok
+            parts.append((f"</{name}>" if is_close else f"<{name}>") if valid[idx] else _escape_html_text(raw))
+    return "".join(parts)
+
+
+def _strip_to_plain_text(sanitized_html: str) -> str:
+    """Last-resort fallback for _send_long, used only if Telegram still
+    rejects the already-sanitized HTML — removes the (by construction, only
+    valid whitelist) tags and un-escapes entities back to literal characters,
+    since a plain-mode message doesn't decode HTML entities at all. The user
+    never sees raw markup, at worst just loses the bold/italic formatting."""
+    without_tags = _HTML_TAG_RE.sub("", sanitized_html)
+    return without_tags.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
 TELEGRAM_MAX_MESSAGE_LEN = 4000
 
 
@@ -296,9 +363,10 @@ async def _send_long(
     message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None
 ) -> None:
     """Telegram rejects messages over ~4096 chars outright; split instead of crashing.
-    Sends with the bot's default HTML parse mode so the model's <b>/<i>/<code>
-    formatting renders; if the model ever emits malformed markup, fall back to
-    plain text for that chunk instead of losing the reply entirely. `reply_markup`
+    Each chunk is run through _sanitize_model_html first so the model's <b>/<i>/<code>
+    formatting renders while stray '<'/'>' (e.g. from math) can never break parsing.
+    If Telegram still rejects a chunk for some other reason, the fallback strips
+    markup down to plain text instead of ever showing raw tags. `reply_markup`
     (if given) is attached only to the last chunk."""
     chunks = [
         text[i : i + TELEGRAM_MAX_MESSAGE_LEN]
@@ -306,10 +374,11 @@ async def _send_long(
     ] or [""]
     for i, chunk in enumerate(chunks):
         markup = reply_markup if i == len(chunks) - 1 else None
+        safe_chunk = _sanitize_model_html(chunk)
         try:
-            await message.answer(chunk, reply_markup=markup)
+            await message.answer(safe_chunk, reply_markup=markup)
         except TelegramBadRequest:
-            await message.answer(chunk, parse_mode=None, reply_markup=markup)
+            await message.answer(_strip_to_plain_text(safe_chunk), parse_mode=None, reply_markup=markup)
 
 
 QUICK_ACTIONS = {
@@ -1522,13 +1591,54 @@ async def handle_image_edit_state(message: Message, state: FSMContext) -> None:
         )
 
 
+# Notes get mixed into the system prompt for every future reply (see
+# ai._build_system_prompt), so a note asking the bot to swear/insult/be rude
+# would otherwise let any single user push that tone onto themselves — the
+# audience is schoolchildren, so these are rejected at save time rather than
+# relying on the model to refuse. Plain substring check, no model call.
+# Extend this list as new phrasings show up in practice.
+NOTE_BLOCKED_PHRASES = (
+    "матерись",
+    "материться",
+    "мат в ответ",
+    "с матом",
+    "используй мат",
+    "используй маты",
+    "добавляй маты",
+    "добавь маты",
+    "маты в ответ",
+    "матом",
+    "нецензур",
+    "оскорбляй",
+    "груби",
+    "будь груб",
+    "хами",
+    "унижай",
+    "ругайся",
+)
+
+NOTE_REJECTED_TEXT = (
+    "Не могу сохранить такую заметку — она просит грубость, мат или неуместный тон, "
+    "это здесь запрещено."
+)
+
+
+def _note_is_disallowed(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in NOTE_BLOCKED_PHRASES)
+
+
 @router.message(Command("remember"))
 async def cmd_remember(message: Message) -> None:
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         await message.answer("Укажи, что запомнить: /remember &lt;текст&gt;")
         return
-    note_id = db.add_note(message.from_user.id, parts[1].strip())
+    note_text = parts[1].strip()
+    if _note_is_disallowed(note_text):
+        await message.answer(NOTE_REJECTED_TEXT)
+        return
+    note_id = db.add_note(message.from_user.id, note_text)
     await message.answer(f"✅ Запомнил (заметка №{note_id}).")
 
 
@@ -1569,7 +1679,8 @@ ADMIN_PAGE_SIZE = 8
 ADMIN_MENU_TEXT = (
     "🔑 <b>Админ-панель</b>\n\n"
     "Команды по-прежнему работают: /grant, /users, /chatlog "
-    "&lt;@username или id&gt;, /refund &lt;telegram_payment_charge_id&gt;, "
+    "&lt;@username или id&gt;, /notes_of &lt;@username или id&gt;, "
+    "/refund &lt;telegram_payment_charge_id&gt;, "
     "/promo_add, /promo_off, /promo_list, /promo_stat, /promo_owner "
     "&lt;код&gt; &lt;@username или id&gt;, /promo_token, /backup."
 )
@@ -1938,6 +2049,33 @@ async def cmd_chatlog(message: Message) -> None:
     await message.answer(_chatlog_text(parts[1], rows), parse_mode=None)
 
 
+@router.message(Command("notes_of"))
+async def cmd_notes_of(message: Message) -> None:
+    """Lets admins see a specific user's /remember notes when triaging a
+    complaint (e.g. a report about the bot's tone) — the notes themselves
+    stay per-user and private otherwise."""
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /notes_of &lt;@username или id&gt;")
+        return
+    target_id = _resolve_target(parts[1])
+    if target_id is None:
+        await message.answer(f"Пользователь {parts[1]} не найден (он должен хотя бы раз написать боту).")
+        return
+    notes = db.list_notes(target_id)
+    if not notes:
+        await message.answer(f"У пользователя {parts[1]} нет сохранённых заметок.")
+        return
+    lines = [f"📝 Заметки пользователя {parts[1]} (id {target_id}):\n"]
+    for note_id, content in notes:
+        lines.append(f"{note_id}. {content}")
+    # Note text is raw user input, not guaranteed safe HTML — plain text,
+    # same reasoning as cmd_chatlog above.
+    await message.answer("\n".join(lines), parse_mode=None)
+
+
 PROMO_CODE_RE = re.compile(r"^[a-z0-9]{1,16}$")
 
 
@@ -2270,6 +2408,9 @@ async def _process_text_query(message: Message, state: FSMContext, text: str) ->
         if lowered.startswith(prefix):
             note_text = text.strip()[len(prefix):].strip()
             if note_text:
+                if _note_is_disallowed(note_text):
+                    await message.answer(NOTE_REJECTED_TEXT)
+                    return
                 note_id = db.add_note(message.from_user.id, note_text)
                 await message.answer(f"✅ Запомнил (заметка №{note_id}).")
                 return
@@ -2337,6 +2478,33 @@ async def handle_chat_message(message: Message, state: FSMContext) -> None:
         await _process_text_query(message, state, text)
 
 
+# Whisper doesn't admit "I heard silence/noise" — on a quiet or noisy
+# recording it instead hallucinates fragments of its training data (video
+# subtitle credits, outro lines). Left unchecked, the bot took these at face
+# value, spent a real AI answer on them, and charged the user's quota for
+# it. Plain substring check against known artifacts, no model call —
+# pluggable, extend as new ones show up in practice.
+VOICE_HALLUCINATION_PHRASES = (
+    "субтитры создавал",
+    "субтитры делал",
+    "редактор субтитров",
+    "субтитры конец",
+    "продолжение следует",
+    "спасибо за просмотр",
+    "подписывайтесь на канал",
+    "dimatorzok",
+)
+
+MIN_VOICE_TEXT_CHARS = 3
+
+
+def _looks_like_voice_hallucination(text: str) -> bool:
+    if len(text) < MIN_VOICE_TEXT_CHARS:
+        return True
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in VOICE_HALLUCINATION_PHRASES)
+
+
 @router.message(F.voice)
 async def handle_voice_message(message: Message, state: FSMContext) -> None:
     if not await _should_respond_in_group(message):
@@ -2361,6 +2529,18 @@ async def handle_voice_message(message: Message, state: FSMContext) -> None:
             return
 
         await message.answer(f"🎙 <i>Распознано:</i> {text}")
+
+        if _looks_like_voice_hallucination(text):
+            # No quota has been touched yet at this point — try_consume_message
+            # only runs inside _answer_text_query below, which this
+            # deliberately never reaches, so there's nothing to refund; the
+            # attempt is simply never billed in the first place.
+            await message.answer(
+                "Не разобрал голосовое — похоже, запись слишком тихая или зашумлённая. "
+                "Попробуй записать ещё раз, ближе к микрофону."
+            )
+            return
+
         await _process_text_query(message, state, text)
 
 
