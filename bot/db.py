@@ -159,6 +159,38 @@ _conn.execute(
     """
 )
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_visits_code ON promo_visits (code)")
+
+# Per-(user, model) daily counter for config.MODEL_DAILY_SUBLIMITS — one row
+# per pair, reused across days (quota_date + used_today reset lazily on the
+# next write, same pattern as players.quota_date/_reset_if_new_day) rather
+# than one row per day, so there's nothing to prune.
+_conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS model_sublimit_usage (
+        user_id INTEGER NOT NULL,
+        model TEXT NOT NULL,
+        quota_date TEXT NOT NULL,
+        used_today INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, model)
+    )
+    """
+)
+
+# Per-(user, day) counter for the Groq-outage fallback to AITUNNEL (see
+# config.FALLBACK_MODEL / handlers._ask_ai_with_fallback). One row per user
+# per day (not a single running counter) so both the global cap
+# (SUM over today's rows) and the per-user cap can be read from the same
+# table, and old days just age out without needing a cleanup job.
+_conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS fallback_usage (
+        user_id INTEGER NOT NULL,
+        quota_date TEXT NOT NULL,
+        used_today INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, quota_date)
+    )
+    """
+)
 _conn.commit()
 
 MAX_NOTES_PER_USER = 30
@@ -641,6 +673,128 @@ def refund_consumed_message(user_id: int, consumed: dict | None) -> None:
                 (amount, user_id),
             )
         _conn.commit()
+
+
+def try_consume_model_sublimit(user_id: int, model: str, daily_limit: int) -> tuple[bool, dict]:
+    """A per-model daily cap that lives INSIDE the normal quota (see
+    config.MODEL_DAILY_SUBLIMITS) — this does not touch messages_used_today/
+    premium_messages_used_today/bonus_credits at all, it's a second,
+    independent check the caller runs right after try_consume_message
+    already succeeded for the same request (and before actually asking the
+    model anything). The caller is responsible for refunding BOTH counters
+    if the request then fails — this function only knows about its own.
+
+    Assumes the player row already exists (the caller always calls this
+    after try_consume_message/get_status, which both already ensure it).
+
+    Returns (allowed, status); status has "used_today" for display and
+    "consumed" (True/False) for refund_model_sublimit."""
+    with _lock:
+        today = _today()
+        cur = _conn.execute(
+            "SELECT quota_date, used_today FROM model_sublimit_usage WHERE user_id = ? AND model = ?",
+            (user_id, model),
+        )
+        row = cur.fetchone()
+        used = row[1] if row and row[0] == today else 0
+
+        if used >= daily_limit:
+            return False, {"used_today": used, "consumed": False}
+
+        new_used = used + 1
+        _conn.execute(
+            "INSERT INTO model_sublimit_usage (user_id, model, quota_date, used_today) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, model) DO UPDATE SET quota_date = excluded.quota_date, "
+            "used_today = excluded.used_today",
+            (user_id, model, today, new_used),
+        )
+        _conn.commit()
+        return True, {"used_today": new_used, "consumed": True}
+
+
+def refund_model_sublimit(user_id: int, model: str) -> None:
+    """Reverses one try_consume_model_sublimit() call for a request that
+    consumed the sub-limit but failed before producing an answer — the
+    sub-limit counterpart to refund_consumed_message. No-op (via MAX(0, ...))
+    if today's counter is already at 0."""
+    with _lock:
+        today = _today()
+        _conn.execute(
+            "UPDATE model_sublimit_usage SET used_today = MAX(0, used_today - 1) "
+            "WHERE user_id = ? AND model = ? AND quota_date = ?",
+            (user_id, model, today),
+        )
+        _conn.commit()
+
+
+def get_model_sublimit_usage(user_id: int, model: str) -> int:
+    """Read-only lookup for display (the model menu's "осталось X из Y") —
+    doesn't consume or write anything. Returns 0 for a stored row from a
+    previous day without resetting it on disk; the actual lazy reset
+    happens the next time try_consume_model_sublimit runs for real."""
+    with _lock:
+        today = _today()
+        cur = _conn.execute(
+            "SELECT quota_date, used_today FROM model_sublimit_usage WHERE user_id = ? AND model = ?",
+            (user_id, model),
+        )
+        row = cur.fetchone()
+        return row[1] if row and row[0] == today else 0
+
+
+def try_consume_fallback(user_id: int, daily_cap: int, user_daily_cap: int) -> bool:
+    """Gates the Groq-outage fallback to AITUNNEL (config.FALLBACK_MODEL,
+    see handlers._ask_ai_with_fallback) behind two ceilings, both reset at
+    local midnight (QUOTA_TZ) by virtue of being keyed per calendar day: a
+    global cap across all users (protects the AITUNNEL balance from a
+    Groq-wide outage triggering a flood of paid fallback calls at once) and
+    a per-user cap (protects against one user's retry loop or bug burning
+    the shared daily budget alone).
+
+    Consumed on every fallback ATTEMPT that's about to be dispatched to
+    AITUNNEL, regardless of whether that attempt then itself succeeds or
+    fails — the money is spent on the call either way. This is a pure spend
+    brake, not a per-request refundable quota like try_consume_message, so
+    there is no matching refund function."""
+    with _lock:
+        today = _today()
+        cur = _conn.execute(
+            "SELECT COALESCE(SUM(used_today), 0) FROM fallback_usage WHERE quota_date = ?",
+            (today,),
+        )
+        (global_used,) = cur.fetchone()
+        if global_used >= daily_cap:
+            return False
+
+        cur = _conn.execute(
+            "SELECT used_today FROM fallback_usage WHERE user_id = ? AND quota_date = ?",
+            (user_id, today),
+        )
+        row = cur.fetchone()
+        user_used = row[0] if row else 0
+        if user_used >= user_daily_cap:
+            return False
+
+        _conn.execute(
+            "INSERT INTO fallback_usage (user_id, quota_date, used_today) VALUES (?, ?, 1) "
+            "ON CONFLICT(user_id, quota_date) DO UPDATE SET used_today = used_today + 1",
+            (user_id, today),
+        )
+        _conn.commit()
+        return True
+
+
+def get_fallback_usage_today() -> int:
+    """Total fallback-to-AITUNNEL invocations today across all users —
+    surfaced in admin stats as a live signal for how often Groq itself is
+    failing over (see ADMIN_MENU_TEXT/_admin_stats_text)."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT COALESCE(SUM(used_today), 0) FROM fallback_usage WHERE quota_date = ?",
+            (_today(),),
+        )
+        return cur.fetchone()[0]
 
 
 def add_bonus_credits(user_id: int, username: str | None, amount: int) -> int:
