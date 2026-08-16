@@ -166,6 +166,19 @@ def _is_paid_tier(status: dict) -> bool:
     )
 
 
+def _paid_sublimit_limit(status: dict, sublimit: dict) -> int:
+    """Which of MODEL_DAILY_SUBLIMITS[model]'s two paid-tier numbers
+    applies, once _is_paid_tier(status) is already True: an active monthly
+    subscription gets the larger "subscription" figure (worth more than a
+    one-off purchase), everything else that counts as paid — a bought
+    message package, a purchased or admin-granted unlimited-hour pass —
+    gets the base "paid" figure. Shared by model_keyboard's display and
+    _enforce_model_sublimit's actual check, so the two can never disagree."""
+    if status.get("subscription_until") is not None:
+        return sublimit["subscription"]
+    return sublimit["paid"]
+
+
 # Default (gptoss) labels for the "you can pick a model" mention in the
 # /start welcome and HELP_TEXT — pulled from MODEL_OPTIONS so they can never
 # drift out of sync with what the "Модель" menu actually offers.
@@ -562,7 +575,7 @@ def model_keyboard(status: dict, user_id: int) -> InlineKeyboardMarkup:
         if _is_paid_tier(status):
             sublimit = MODEL_DAILY_SUBLIMITS.get(model_id)
             if sublimit is not None:
-                limit = sublimit["paid"]
+                limit = _paid_sublimit_limit(status, sublimit)
                 used = db.get_model_sublimit_usage(user_id, model_id)
                 text = f"{text} — осталось {max(0, limit - used)} из {limit}"
         else:
@@ -766,7 +779,7 @@ async def _enforce_model_sublimit(
         sublimit = MODEL_DAILY_SUBLIMITS.get(model)
         if sublimit is None:
             return True, None, False
-        limit = sublimit["paid"]
+        limit = _paid_sublimit_limit(status, sublimit)
         ok, sub_status = db.try_consume_model_sublimit(user_id, model, limit)
         if ok:
             return True, None, True
@@ -1205,7 +1218,8 @@ MODEL_MENU_TEXT = (
     "🧠 Умный режим сам видит фото и файлы и отвечает за секунды — но каждый его "
     "запрос стоит денег: на бесплатном тарифе доступно "
     f"{MODEL_TRIAL_TOTALS['gemini-3.5-flash-lite']} пробных запросов навсегда, "
-    f"у подписки/пакета — {MODEL_DAILY_SUBLIMITS['gemini-3.5-flash-lite']['paid']} в день."
+    f"у пакета сообщений или часа безлимита — {MODEL_DAILY_SUBLIMITS['gemini-3.5-flash-lite']['paid']} "
+    f"в день, у подписки — {MODEL_DAILY_SUBLIMITS['gemini-3.5-flash-lite']['subscription']} в день."
 )
 
 
@@ -1421,7 +1435,13 @@ async def cb_reminder_action(callback: CallbackQuery) -> None:
     await _edit_or_send(callback, _reminder_text(status), _reminder_keyboard(status))
 
 
-BUY_TEXT = "💎 <b>Купить сообщения за Telegram Stars</b>\n\nВыберите пакет:"
+BUY_TEXT = (
+    "💎 <b>Купить сообщения за Telegram Stars</b>\n\n"
+    f"🧠 Умный режим (Gemini): {MODEL_DAILY_SUBLIMITS['gemini-3.5-flash-lite']['paid']} "
+    "запросов в день с пакетом сообщений или часом безлимита, "
+    f"{MODEL_DAILY_SUBLIMITS['gemini-3.5-flash-lite']['subscription']} в день — с подпиской.\n\n"
+    "Выберите пакет:"
+)
 
 
 @router.message(Command("buy"))
@@ -1485,12 +1505,13 @@ async def cb_buy_subscription(callback: CallbackQuery) -> None:
     # (send_invoice/answer_invoice has no subscription_period parameter at
     # all) — the link is then handed to the user as a "Pay" button rather
     # than opening the payment sheet directly like the one-off invoices above.
+    gemini_sub_limit = MODEL_DAILY_SUBLIMITS["gemini-3.5-flash-lite"]["subscription"]
     link = await callback.bot.create_invoice_link(
         title="Подписка на месяц",
         description=(
             f"До {SUBSCRIPTION_DAILY_MESSAGES} быстрых и {SUBSCRIPTION_DAILY_PREMIUM_MESSAGES} "
-            f"премиум-запросов в день на {SUBSCRIPTION['days']} дней, автопродление через "
-            "Telegram Stars."
+            f"премиум-запросов в день, {gemini_sub_limit} запросов в день к Умному режиму "
+            f"(Gemini), на {SUBSCRIPTION['days']} дней, автопродление через Telegram Stars."
         ),
         payload=f"subscription:{PRICE_VERSION}:0",
         currency="XTR",
@@ -1507,7 +1528,9 @@ async def cb_buy_subscription(callback: CallbackQuery) -> None:
     await callback.message.answer(
         f"⭐ <b>Подписка на месяц — {SUBSCRIPTION['stars']} ⭐/мес</b>\n\n"
         f"До {SUBSCRIPTION_DAILY_MESSAGES} быстрых и {SUBSCRIPTION_DAILY_PREMIUM_MESSAGES} "
-        f"премиум-запросов в день, автопродление каждые {SUBSCRIPTION['days']} дней. "
+        f"премиум-запросов в день, {gemini_sub_limit} запросов в день к Умному режиму "
+        "(Gemini) — вдвое больше, чем у пакета сообщений или часа безлимита. "
+        f"Автопродление каждые {SUBSCRIPTION['days']} дней. "
         "Отменить в любой момент можно в «Баланс».",
         reply_markup=kb,
     )
@@ -2100,8 +2123,9 @@ ADMIN_HELP_CATEGORIES = {
             "<code>/notes_of &lt;@username или id&gt;</code>\n"
             "Заметки пользователя, сохранённые через /remember — пригождается при "
             "разборе жалоб на тон ответов.\n\n"
-            "💡 То же самое, плюс кнопки +10/+50/-10 к балансу и возврат оплаты в один "
-            "тап, доступно без единой команды — через «👥 Пользователи» в главном меню."
+            "💡 То же самое, плюс кнопки +10/+50/-10 к балансу, подарок безлимита/подписки "
+            "и возврат оплаты в один тап, доступно без единой команды — через "
+            "«👥 Пользователи» в главном меню."
         ),
     },
     "payments": {
@@ -2346,6 +2370,8 @@ def _admin_user_text(p: dict, payments: list[tuple]) -> str:
     ]
     if p["unlimited_until"]:
         lines.append(f"Безлимит до: {_format_local_time(p['unlimited_until'])}")
+    if p["subscription_until"]:
+        lines.append(f"Подписка до: {_format_local_time(p['subscription_until'])}")
     lines.append(f"Последняя активность: {p['last_active_at']}")
 
     if payments:
@@ -2363,6 +2389,16 @@ def admin_user_keyboard(uid: int, page: int, payments: list[tuple]) -> InlineKey
             InlineKeyboardButton(text="+10", callback_data=f"admin:grant:{uid}:10:{page}"),
             InlineKeyboardButton(text="+50", callback_data=f"admin:grant:{uid}:50:{page}"),
             InlineKeyboardButton(text="-10", callback_data=f"admin:grant:{uid}:-10:{page}"),
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"🎁 Безлимит {TIME_PACKAGES[0]['label']}",
+                callback_data=f"admin:unlim:{uid}:{page}",
+            ),
+            InlineKeyboardButton(
+                text=f"🎁 Подписка {SUBSCRIPTION['days']}д",
+                callback_data=f"admin:sub:{uid}:{page}",
+            ),
         ],
         [InlineKeyboardButton(text="💬 Чатлог", callback_data=f"admin:chatlog:{uid}:{page}")],
     ]
@@ -2408,6 +2444,50 @@ async def cb_admin_grant(callback: CallbackQuery) -> None:
         await callback.answer("Пользователь не найден.", show_alert=True)
         return
     await callback.answer(f"Готово: {new_balance} сообщений")
+    p = db.get_player(uid)
+    payments = db.list_recent_payments(uid, ADMIN_RECENT_PAYMENTS)
+    await _edit_or_send(callback, _admin_user_text(p, payments), admin_user_keyboard(uid, page, payments))
+
+
+@router.callback_query(F.data.startswith("admin:unlim:"))
+async def cb_admin_grant_unlimited(callback: CallbackQuery) -> None:
+    """Admin gift of TIME_PACKAGES[0] (currently 1 hour) — same
+    db.activate_unlimited a real purchase uses, so it stacks on an
+    already-active window and behaves identically for quota purposes (this
+    is the "paid" tier, not "subscription" — see _paid_sublimit_limit)."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    _, _, uid_str, page_str = callback.data.split(":")
+    uid, page = int(uid_str), int(page_str)
+    p = db.get_player(uid)
+    if p is None:
+        await callback.answer("Пользователь не найден.", show_alert=True)
+        return
+    minutes = TIME_PACKAGES[0]["minutes"]
+    new_expiry = db.activate_unlimited(uid, p["username"], minutes)
+    await callback.answer(f"Готово: безлимит до {_format_local_time(new_expiry)}")
+    p = db.get_player(uid)
+    payments = db.list_recent_payments(uid, ADMIN_RECENT_PAYMENTS)
+    await _edit_or_send(callback, _admin_user_text(p, payments), admin_user_keyboard(uid, page, payments))
+
+
+@router.callback_query(F.data.startswith("admin:sub:"))
+async def cb_admin_grant_subscription(callback: CallbackQuery) -> None:
+    """Admin gift of a subscription period (see db.admin_grant_subscription
+    — no real Stars charge behind it, so it can't be managed through
+    Telegram's own subscription-cancel API, only expires on its own)."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    _, _, uid_str, page_str = callback.data.split(":")
+    uid, page = int(uid_str), int(page_str)
+    p = db.get_player(uid)
+    if p is None:
+        await callback.answer("Пользователь не найден.", show_alert=True)
+        return
+    new_expiry = db.admin_grant_subscription(uid, p["username"], SUBSCRIPTION["days"])
+    await callback.answer(f"Готово: подписка до {_format_local_time(new_expiry)}")
     p = db.get_player(uid)
     payments = db.list_recent_payments(uid, ADMIN_RECENT_PAYMENTS)
     await _edit_or_send(callback, _admin_user_text(p, payments), admin_user_keyboard(uid, page, payments))

@@ -1169,14 +1169,17 @@ def get_player(user_id: int) -> dict | None:
     with _lock:
         cur = _conn.execute(
             "SELECT user_id, username, messages_used_today, premium_messages_used_today, "
-            "bonus_credits, model_pref, model_choice, unlimited_until, last_active_at "
-            "FROM players WHERE user_id = ?",
+            "bonus_credits, model_pref, model_choice, unlimited_until, subscription_until, "
+            "last_active_at FROM players WHERE user_id = ?",
             (user_id,),
         )
         row = cur.fetchone()
         if row is None:
             return None
-        uid, uname, used, premium_used, bonus, pref, choice, unlimited_raw, last_active = row
+        (
+            uid, uname, used, premium_used, bonus, pref, choice,
+            unlimited_raw, subscription_raw, last_active,
+        ) = row
         return {
             "user_id": uid,
             "username": uname,
@@ -1186,6 +1189,7 @@ def get_player(user_id: int) -> dict | None:
             "model_pref": pref,
             "model_choice": choice,
             "unlimited_until": _active_unlimited_until(unlimited_raw),
+            "subscription_until": _active_unlimited_until(subscription_raw),
             "last_active_at": last_active,
         }
 
@@ -1219,6 +1223,37 @@ def activate_unlimited(user_id: int, username: str | None, minutes: int) -> str:
         new_expiry = (base + datetime.timedelta(minutes=minutes)).isoformat(timespec="seconds")
         _conn.execute(
             "UPDATE players SET unlimited_until = ? WHERE user_id = ?", (new_expiry, user_id)
+        )
+        _conn.commit()
+        return new_expiry
+
+
+def admin_grant_subscription(user_id: int, username: str | None, days: int) -> str:
+    """Admin-only equivalent of a subscription purchase (mirrors
+    record_payment_and_credit's 'subscription' branch) — grants/extends
+    subscription_until by `days`, stacking on an already-active window
+    exactly like a real renewal would. Deliberately does NOT create a
+    payment row or a subscription_charge_id: there's no real Stars charge
+    behind this, so it can't be auto-renewed or canceled through Telegram's
+    subscription API the way a bought one can — cb_subscription_toggle
+    already handles a missing charge_id gracefully (tells the user to
+    contact support if they try to cancel it), which is fine here: an
+    admin gift isn't something to un-toggle, it just expires on its own."""
+    with _lock:
+        _ensure_player(user_id, username)
+        cur = _conn.execute(
+            "SELECT subscription_until FROM players WHERE user_id = ?", (user_id,)
+        )
+        (current_raw,) = cur.fetchone()
+        base = _utcnow_naive()
+        active = _active_unlimited_until(current_raw)
+        if active:
+            base = datetime.datetime.fromisoformat(active)
+        new_expiry = (base + datetime.timedelta(days=days)).isoformat(timespec="seconds")
+        _conn.execute(
+            "UPDATE players SET subscription_until = ?, subscription_status = 'active' "
+            "WHERE user_id = ?",
+            (new_expiry, user_id),
         )
         _conn.commit()
         return new_expiry

@@ -81,12 +81,23 @@ DEFAULT_MODEL_RESPONSE_TOKENS = 2048
 # sub-limited model spends one unit from the normal quota AND one from this
 # counter, never a separate budget stacked on top of it. Exists for
 # AITUNNEL models that bill real money per call (unlike Groq). Only applies
-# to an active subscription, active purchased unlimited pass, or spent
-# bonus_credits (see handlers._is_paid_tier) — the free tier uses
+# to an active subscription, active purchased/admin-granted unlimited pass,
+# or spent bonus_credits (see handlers._is_paid_tier) — the free tier uses
 # MODEL_TRIAL_TOTALS below instead, not this dict.
 MODEL_DAILY_SUBLIMIT_PAID = int(os.environ.get("MODEL_DAILY_SUBLIMIT_PAID", "5"))
+# A recurring monthly subscription gets DOUBLE the base paid limit — worth
+# more than a one-off message package or a single purchased/gifted hour of
+# unlimited access, both of which stay at MODEL_DAILY_SUBLIMIT_PAID. Its own
+# env var (not "paid * 2" inlined at every call site) so it can be retuned
+# independently later; defaults to exactly double.
+MODEL_DAILY_SUBLIMIT_SUBSCRIPTION = int(
+    os.environ.get("MODEL_DAILY_SUBLIMIT_SUBSCRIPTION", str(MODEL_DAILY_SUBLIMIT_PAID * 2))
+)
 MODEL_DAILY_SUBLIMITS = {
-    "gemini-3.5-flash-lite": {"paid": MODEL_DAILY_SUBLIMIT_PAID},
+    "gemini-3.5-flash-lite": {
+        "paid": MODEL_DAILY_SUBLIMIT_PAID,
+        "subscription": MODEL_DAILY_SUBLIMIT_SUBSCRIPTION,
+    },
 }
 
 # Правка 1: the free tier gets a one-time TRIAL instead of a recurring daily
