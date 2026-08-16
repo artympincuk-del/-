@@ -69,6 +69,10 @@ MODEL_RESPONSE_TOKENS = {
     "qwen/qwen3.6-27b": 4096,
     "llama-3.1-8b-instant": 1024,
     "llama-3.3-70b-versatile": 4096,
+    # AITUNNEL models have no per-minute ceiling (see MODEL_TOKEN_CEILINGS
+    # above), so there's no reason to squeeze them down to the 2048 default.
+    "qwen3.7-flash": 4096,
+    "gemini-3.5-flash-lite": 4096,
 }
 DEFAULT_MODEL_RESPONSE_TOKENS = 2048
 
@@ -121,6 +125,12 @@ CHATLOG_RETENTION_DAYS = int(os.environ.get("CHATLOG_RETENTION_DAYS", "30"))
 # itself. Free tier is 30 RPM; a handful of concurrent requests is plenty for
 # normal multi-user load without needlessly serializing everything.
 GROQ_MAX_CONCURRENT = int(os.environ.get("GROQ_MAX_CONCURRENT", "5"))
+
+# Same idea as GROQ_MAX_CONCURRENT, but for AITUNNEL — separate cap because
+# the reason isn't a provider rate limit (AITUNNEL doesn't have Groq's TPM
+# ceiling), it's money: AITUNNEL is billed per call, so an unbounded burst
+# or a runaway loop burns through the balance in minutes.
+AITUNNEL_MAX_CONCURRENT = int(os.environ.get("AITUNNEL_MAX_CONCURRENT", "3"))
 
 # Timezone the daily free-message quota resets in, and unlimited-until times
 # are displayed in — IANA name for zoneinfo. UTC would reset at 3am Moscow

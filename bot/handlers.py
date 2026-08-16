@@ -124,6 +124,13 @@ def _model_option(status: dict) -> dict:
     key = (status["model_pref"], status.get("model_choice") or "gptoss")
     return MODEL_OPTIONS.get(key, MODEL_OPTIONS[(status["model_pref"], "gptoss")])
 
+
+# Default (gptoss) labels for the "you can pick a model" mention in the
+# /start welcome and HELP_TEXT — pulled from MODEL_OPTIONS so they can never
+# drift out of sync with what the "Модель" menu actually offers.
+_FAST_MODEL_LABEL = MODEL_OPTIONS[("fast", "gptoss")]["label"]
+_PREMIUM_MODEL_LABEL = MODEL_OPTIONS[("premium", "gptoss")]["label"]
+
 BTN_BALANCE = "💰 Баланс / Пополнить"
 BTN_BUY = "💎 Пополнить"
 BTN_MODEL = "🧠 Модель"
@@ -674,6 +681,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "Пиши текстом, голосом, присылай фото или PDF — отвечу на всё.\n\n"
         f"Бесплатно: <b>{DAILY_FREE_MESSAGES}</b> сообщений в день "
         f"(+{DAILY_FREE_PREMIUM_MESSAGES} премиум), сброс в 00:00.\n\n"
+        f"Есть быстрая модель ({_FAST_MODEL_LABEL}) для простых вопросов и более "
+        f"сильная ({_PREMIUM_MODEL_LABEL}) для разбора сложных задач — переключить "
+        f"можно кнопкой «{BTN_MODEL}».\n\n"
         "Переписка сохраняется и может просматриваться поддержкой при разборе "
         "обращений и ошибок.\n\n"
         "Кнопка «📋 Меню» внизу — всегда под рукой. Подробнее — «Помощь».",
@@ -747,6 +757,9 @@ else:
 HELP_TEXT = (
     "🤖 <b>Что я умею</b>\n\n"
     "• <b>Текст, голос, фото, PDF</b> — присылай как есть, отвечу.\n"
+    f"• <b>Модель</b> — по умолчанию быстрая ({_FAST_MODEL_LABEL}) для простых "
+    f"вопросов, для сложных задач есть более сильная ({_PREMIUM_MODEL_LABEL}) — "
+    f"переключить можно кнопкой «{BTN_MODEL}».\n"
     "• <b>Фото</b> — можно с подписью-вопросом, распознаю содержимое.\n"
     "• <b>Голосовые</b> — распознаю речь и отвечу как на текст.\n"
     "• <b>PDF</b> — прочитаю файл и отвечу по содержимому.\n"

@@ -15,6 +15,7 @@ from ddgs import DDGS
 from bot.config import (
     AITUNNEL_API_KEY,
     AITUNNEL_BASE_URL,
+    AITUNNEL_MAX_CONCURRENT,
     AITUNNEL_MODELS,
     DEFAULT_MODEL_RESPONSE_TOKENS,
     DEFAULT_MODEL_TOKEN_CEILING,
@@ -136,12 +137,20 @@ def _client_for(model: str):
             )
         return _aitunnel_client
     return _client
+
+
 # Guards every actual Groq API call in this module (chat completions, STT,
 # image-prompt translation) — a single user firing off several messages at
 # once can't run more than GROQ_MAX_CONCURRENT requests against Groq
 # simultaneously, which would otherwise burn through the shared free-tier
 # rate limit for everyone.
 _groq_semaphore = asyncio.Semaphore(GROQ_MAX_CONCURRENT)
+
+# Separate cap for AITUNNEL calls, not a shared/reused semaphore — the
+# reason isn't a provider rate limit like Groq's (AITUNNEL has none), it's
+# money: AITUNNEL is billed per call, so an unbounded burst or a runaway
+# loop would burn through the balance in minutes without this.
+_aitunnel_semaphore = asyncio.Semaphore(AITUNNEL_MAX_CONCURRENT)
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _UNCLOSED_THINK_RE = re.compile(r"<think>.*", re.DOTALL)
@@ -435,11 +444,9 @@ async def _complete_once(
     # model that keeps wanting to search can't loop forever.
     for _round in range(3):
         try:
-            if via_aitunnel:
+            semaphore = _aitunnel_semaphore if via_aitunnel else _groq_semaphore
+            async with semaphore:
                 response = await client.chat.completions.create(**kwargs)
-            else:
-                async with _groq_semaphore:
-                    response = await client.chat.completions.create(**kwargs)
         except _API_STATUS_ERRORS as e:
             if e.status_code == 413:
                 # Not an immediate refusal — ask_ai's caller-side retry loop
