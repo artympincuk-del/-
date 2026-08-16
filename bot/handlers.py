@@ -366,6 +366,87 @@ def _prepare_image(raw: bytes) -> bytes:
     return buf.getvalue()
 
 
+# Правка 5: LaTeX delimiter wrappers — unwrapped to their inner content
+# (the delimiters themselves carry no useful information for a Telegram
+# message, which can't render actual typeset math). $$ is matched before
+# lone $ so a display-math block isn't half-eaten by the inline-math
+# pattern first. A lone $...$ pair is inherently ambiguous with a currency
+# mention ("$5 или $10") — a known, accepted tradeoff for a bot whose core
+# content is math, not prices.
+_LATEX_PAREN_RE = re.compile(r"\\\((.*?)\\\)", re.DOTALL)
+_LATEX_BRACKET_RE = re.compile(r"\\\[(.*?)\\\]", re.DOTALL)
+_LATEX_DISPLAY_DOLLAR_RE = re.compile(r"\$\$(.*?)\$\$", re.DOTALL)
+_LATEX_INLINE_DOLLAR_RE = re.compile(r"\$(.*?)\$", re.DOTALL)
+
+_LATEX_FRAC_RE = re.compile(r"\\frac\{([^{}]*)\}\{([^{}]*)\}")
+_LATEX_SUP_RE = re.compile(r"\^\{([^{}]*)\}")
+_LATEX_SUB_RE = re.compile(r"_\{([^{}]*)\}")
+_LATEX_SQRT_RE = re.compile(r"\\sqrt\{([^{}]*)\}")
+
+# Symbols with a direct, unambiguous plain-text equivalent. \leq/\geq/\ne
+# are the long forms of \le/\ge/\neq — not in the literal spec list, but
+# left unhandled they'd fall through to the bare-command-delete rule below
+# and silently drop the comparison operator entirely (worse than not
+# converting at all), so they're aliased to the same symbol.
+_LATEX_SYMBOLS = {
+    "cdot": "·", "times": "×",
+    "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥",
+    "neq": "≠", "ne": "≠", "pm": "±", "infty": "∞",
+    "pi": "π", "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ",
+    "epsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ", "iota": "ι",
+    "kappa": "κ", "lambda": "λ", "mu": "μ", "nu": "ν", "xi": "ξ",
+    "omicron": "ο", "rho": "ρ", "sigma": "σ", "tau": "τ", "upsilon": "υ",
+    "phi": "φ", "chi": "χ", "psi": "ψ", "omega": "ω",
+    "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ", "Xi": "Ξ",
+    "Pi": "Π", "Sigma": "Σ", "Upsilon": "Υ", "Phi": "Φ", "Psi": "Ψ",
+    "Omega": "Ω",
+}
+# Sorted longest-name-first so "\leq" matches whole, not as "\le" + "q" —
+# re's alternation picks the first matching branch, not the longest.
+_LATEX_SYMBOL_RE = re.compile(
+    r"\\(" + "|".join(sorted(_LATEX_SYMBOLS, key=len, reverse=True)) + r")(?![a-zA-Z])"
+)
+# Catch-all for any other \command{content} (e.g. \text{см}, \mathrm{kg}) —
+# drop the command, keep what's in the braces. Must run before the
+# bare-command catch-all below, or \text{см} would first lose "\text" and
+# leave stray "{см}" braces behind.
+_LATEX_COMMAND_WITH_ARG_RE = re.compile(r"\\[a-zA-Z]+\{([^{}]*)\}")
+# Final catch-all: any remaining \command with no braces (e.g. \left(,
+# \right), \displaystyle) — drop just the command token, leave whatever
+# follows (a real delimiter like "(" isn't part of the command, so it
+# survives untouched).
+_LATEX_BARE_COMMAND_RE = re.compile(r"\\[a-zA-Z]+")
+
+
+def _convert_latex(text: str) -> str:
+    """The system prompt tells the model not to use LaTeX, but it sometimes
+    does anyway (\\(2x^2 - 4x\\), $$...$$, \\frac{a}{b}) — Telegram has no
+    LaTeX renderer, so the user would otherwise see the raw markup. Runs
+    BEFORE _convert_markdown and HTML escaping (see _send_long) — escaping
+    first would turn a literal backslash/brace into an HTML entity before
+    this ever gets a chance to parse it.
+
+    Deliberately approximate, not a full LaTeX parser: \\frac/^{}/_{}/\\sqrt
+    only match a single, non-nested brace group, so a nested expression
+    like \\frac{1}{x+\\sqrt{2}} only partially simplifies — an accepted
+    limit for a point-fix, not a structural one (the leftover LaTeX is
+    still visible rather than mis-rendered or dropped)."""
+    text = _LATEX_PAREN_RE.sub(r"\1", text)
+    text = _LATEX_BRACKET_RE.sub(r"\1", text)
+    text = _LATEX_DISPLAY_DOLLAR_RE.sub(r"\1", text)
+    text = _LATEX_INLINE_DOLLAR_RE.sub(r"\1", text)
+
+    text = _LATEX_FRAC_RE.sub(r"\1/\2", text)
+    text = _LATEX_SUP_RE.sub(r"^\1", text)
+    text = _LATEX_SUB_RE.sub(r"\1", text)
+    text = _LATEX_SQRT_RE.sub(r"√\1", text)
+
+    text = _LATEX_SYMBOL_RE.sub(lambda m: _LATEX_SYMBOLS[m.group(1)], text)
+    text = _LATEX_COMMAND_WITH_ARG_RE.sub(r"\1", text)
+    text = _LATEX_BARE_COMMAND_RE.sub("", text)
+    return text
+
+
 _MD_CODE_RE = re.compile(r"`([^`\n]+?)`")
 _MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__", re.DOTALL)
 _MD_ITALIC_RE = re.compile(r"(?<!\*)\*([^\n*]+?)\*(?!\*)|(?<!_)_([^\n_]+?)_(?!_)")
@@ -515,25 +596,27 @@ async def _send_long(
     trusted_suffix: str = "",
 ) -> None:
     """Telegram rejects messages over ~4096 chars outright; split instead of crashing.
-    Each chunk goes through _convert_markdown (turns stray **bold**/`code` the
-    model wrote despite instructions not to into real tags) and then
-    _sanitize_model_html, so the model's <b>/<i>/<code> formatting renders
-    while stray '<'/'>' (e.g. from math) can never break parsing. If Telegram
-    still rejects a chunk for some other reason, the fallback strips markup
-    down to plain text instead of ever showing raw tags. `reply_markup` (if
-    given) is attached only to the last chunk. `trusted_suffix` (if given) is
-    caller-vetted HTML — e.g. _build_sources_html's source-links block, built
-    from data this bot fetched itself, not model output — appended to the
-    LAST chunk AFTER sanitization, never sanitized itself, so its
-    <a href="..."> links survive (_sanitize_model_html doesn't allow <a> at
-    all, on purpose)."""
+    Each chunk goes through _convert_latex, then _convert_markdown (turns
+    stray **bold**/`code` the model wrote despite instructions not to into
+    real tags), then _sanitize_model_html — strictly in that order, so
+    escaping never runs on a backslash/brace before LaTeX has had a chance
+    to parse it. _sanitize_model_html renders the model's <b>/<i>/<code>
+    formatting while stray '<'/'>' (e.g. from math) can never break
+    parsing. If Telegram still rejects a chunk for some other reason, the
+    fallback strips markup down to plain text instead of ever showing raw
+    tags. `reply_markup` (if given) is attached only to the last chunk.
+    `trusted_suffix` (if given) is caller-vetted HTML — e.g.
+    _build_sources_html's source-links block, built from data this bot
+    fetched itself, not model output — appended to the LAST chunk AFTER
+    sanitization, never sanitized itself, so its <a href="..."> links
+    survive (_sanitize_model_html doesn't allow <a> at all, on purpose)."""
     chunks = [
         text[i : i + TELEGRAM_MAX_MESSAGE_LEN]
         for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LEN)
     ] or [""]
     for i, chunk in enumerate(chunks):
         markup = reply_markup if i == len(chunks) - 1 else None
-        safe_chunk = _sanitize_model_html(_convert_markdown(chunk))
+        safe_chunk = _sanitize_model_html(_convert_markdown(_convert_latex(chunk)))
         if i == len(chunks) - 1 and trusted_suffix:
             safe_chunk += trusted_suffix
         try:
@@ -905,10 +988,23 @@ async def _apply_referral(message: Message) -> None:
 async def _apply_promo(message: Message) -> None:
     """Registers a promo-code visit and grants its time-based bonus —
     parallel to _apply_referral above, entirely independent data (promo_visits
-    vs. referrals/players.referred_by). Silent no-op (just the normal
-    greeting) for every "nothing to do" case: no/expired/disabled code, the
-    owner clicking their own link, or a user who already visited some promo
-    code before — none of these are errors worth surfacing to the user."""
+    vs. referrals/players.referred_by).
+
+    Four "nothing to grant" cases, only two of them silent (Правка 2):
+    - code missing, unknown, or disabled: SILENT — never confirms or denies
+      whether a code exists, so this can't be used to enumerate/probe
+      other people's codes.
+    - the code's own owner clicking their own link: SILENT — nothing to
+      grant, and announcing that would be a strange, unrequested reply to
+      an action the owner didn't take by accident.
+    - already attributed to a DIFFERENT code (visited some other promo
+      link before this one): tells the user their bonus was already
+      granted earlier and isn't granted twice — never names the earlier
+      code, that's not this click's business.
+    - revisiting the SAME code again: tells the user the bonus is already
+      active, and until when if it's still active — silently doing
+      nothing here reads exactly like a broken bot to someone re-clicking
+      a link they were told to save."""
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].startswith("promo_"):
         return
@@ -921,9 +1017,24 @@ async def _apply_promo(message: Message) -> None:
     user_id = message.from_user.id
     if promo["owner_user_id"] == user_id:
         return
-    if not db.record_promo_visit(user_id, code):
-        return
     username = message.from_user.username
+    if not db.record_promo_visit(user_id, code):
+        visit = db.get_promo_visit(user_id)
+        if visit is not None and visit["code"] == code:
+            status = db.get_status(user_id, username)
+            if status["promo_bonus_until"]:
+                until_local = _format_local_time(status["promo_bonus_until"])
+                await message.answer(
+                    f"Бонус по этому промокоду уже активирован. Действует до <b>{until_local}</b>."
+                )
+            else:
+                await message.answer("Бонус по этому промокоду уже был получен, срок его действия закончился.")
+        else:
+            await message.answer(
+                "Бонус по промокоду уже был получен ранее по другой ссылке — повторно не "
+                "начисляется. Бот работает как обычно."
+            )
+        return
     new_expiry = db.activate_promo_bonus(user_id, username, promo["bonus_minutes"])
     db.log_event(user_id, "promo_join")
     until_local = _format_local_time(new_expiry)
@@ -2153,6 +2264,9 @@ ADMIN_HELP_CATEGORIES = {
             "Список всех промокодов со статусом и статистикой. Без аргументов.\n\n"
             "<code>/promo_stat &lt;код&gt;</code>\n"
             "Подробная статистика по одному промокоду.\n\n"
+            "<code>/promo_users &lt;код&gt;</code>\n"
+            "Кто именно перешёл: username или id, дата, сколько сообщений отправил, "
+            "покупал ли что-то, внутри окна атрибуции или нет. Постранично по 10.\n\n"
             "<code>/promo_owner &lt;код&gt; &lt;@username или id&gt;</code>\n"
             "Назначить владельца промокода — ему становится доступна статистика через "
             "/mypromo. <code>0</code> вместо адресата — снять владельца.\n\n"
@@ -2242,6 +2356,7 @@ async def cb_admin_help_category(callback: CallbackQuery) -> None:
 
 def _admin_stats_text() -> str:
     s = db.get_admin_stats()
+    retention = db.get_retention_stats()
     fallback_used_today = db.get_fallback_usage_today()
     cost = db.get_cost_summary()
     cap_line = (
@@ -2255,6 +2370,14 @@ def _admin_stats_text() -> str:
         f"Всего пользователей: <b>{s['total_users']}</b>\n"
         f"Активны сегодня: <b>{s['active_today']}</b>\n"
         f"Докупленных сообщений на руках: <b>{s['bonus_outstanding']}</b>\n\n"
+        # Правка 4: the question that matters right after a promo push —
+        # how many of the people it brought in actually come back, not
+        # just how many are active today.
+        f"🔁 Возврат:\n"
+        f"Пришли вчера: <b>{retention['new_yesterday']}</b>, вернулись сегодня: "
+        f"<b>{retention['returned_today']}</b> ({retention['returned_today_pct']}%)\n"
+        f"Пришли за 7 дней: <b>{retention['new_7d']}</b>, активны из них за 3 дня: "
+        f"<b>{retention['new_7d_active_3d']}</b>\n\n"
         f"⭐ Доход сегодня: <b>{s['revenue_today']}</b> ({s['payments_today']} плат.)\n"
         f"⭐ Доход за 7 дней: <b>{s['revenue_7d']}</b> ({s['payments_7d']} плат.)\n"
         f"⭐ Доход всего: <b>{s['revenue_all']}</b> ({s['payments_all']} плат.)\n\n"
@@ -2439,11 +2562,17 @@ async def cb_admin_grant(callback: CallbackQuery) -> None:
         return
     _, _, uid_str, amount_str, page_str = callback.data.split(":")
     uid, amount, page = int(uid_str), int(amount_str), int(page_str)
-    new_balance = db.admin_add_bonus_credits(uid, amount)
-    if new_balance is None:
+    result = db.admin_add_bonus_credits(uid, amount)
+    if result is None:
         await callback.answer("Пользователь не найден.", show_alert=True)
         return
-    await callback.answer(f"Готово: {new_balance} сообщений")
+    before, after = result
+    # Правка 1.2: a deduction can be clamped by the balance itself — say so
+    # explicitly rather than silently reporting only the requested amount.
+    if amount < 0 and after - before != amount:
+        await callback.answer(f"Списано {before - after} из {-amount} (на балансе было меньше). Осталось: {after}")
+    else:
+        await callback.answer(f"Готово: {after} сообщений")
     p = db.get_player(uid)
     payments = db.list_recent_payments(uid, ADMIN_RECENT_PAYMENTS)
     await _edit_or_send(callback, _admin_user_text(p, payments), admin_user_keyboard(uid, page, payments))
@@ -2607,11 +2736,18 @@ async def cmd_grant(message: Message) -> None:
         await message.answer(f"Пользователь {parts[1]} не найден (он должен хотя бы раз написать боту).")
         return
     amount = int(parts[2])
-    new_balance = db.admin_add_bonus_credits(target_id, amount)
-    if new_balance is None:
+    result = db.admin_add_bonus_credits(target_id, amount)
+    if result is None:
         await message.answer(f"Пользователь {parts[1]} не найден (он должен хотя бы раз написать боту).")
         return
-    await message.answer(f"Готово. Баланс пользователя {parts[1]}: {new_balance} сообщений.")
+    before, after = result
+    if amount < 0 and after - before != amount:
+        await message.answer(
+            f"Списано {before - after} из {-amount} (на балансе было меньше). "
+            f"Баланс пользователя {parts[1]}: {after} сообщений."
+        )
+    else:
+        await message.answer(f"Готово. Баланс пользователя {parts[1]}: {after} сообщений.")
 
 
 @router.message(Command("users"))
@@ -2770,8 +2906,8 @@ async def cmd_promo_list(message: Message) -> None:
         status = "активен" if c["active"] else "выключен"
         lines.append(
             f"<code>{c['code']}</code> — {c['title']} · {status} · "
-            f"переходов {c['total_visits']} · оплат {c['payments_count']} на "
-            f"{c['revenue_stars']}⭐ (доля {c['partner_share_stars']}⭐)"
+            f"переходов {c['total_visits']} (активных {c['active_users']}) · "
+            f"оплат {c['payments_count']} на {c['revenue_stars']}⭐ (доля {c['partner_share_stars']}⭐)"
         )
     await _send_long(message, "\n".join(lines))
 
@@ -2790,6 +2926,72 @@ async def cmd_promo_stat(message: Message) -> None:
         await message.answer(f"Промокод <code>{code}</code> не найден.")
         return
     await _send_long(message, _promo_stats_text(stats, admin_view=True))
+
+
+PROMO_USERS_PAGE_SIZE = 10
+
+
+def _promo_users_text(code: str, page: int, total: int, visitors: list[dict]) -> str:
+    lines = [f"👥 <b>Перешедшие по «{code}»</b> ({total}) — стр. {page + 1}\n"]
+    if not visitors:
+        lines.append("Пока никто не переходил.")
+    for v in visitors:
+        name = f"@{v['username']}" if v["username"] else str(v["user_id"])
+        joined_local = _format_local_time(v["joined_at"])
+        window_label = "внутри окна" if v["in_window"] else "окно истекло"
+        purchase_label = "покупал" if v["purchased"] else "не покупал"
+        lines.append(
+            f"{name} — {joined_local} · сообщений: {v['messages_sent']} · "
+            f"{purchase_label} · {window_label}"
+        )
+    return "\n".join(lines)
+
+
+def _promo_users_keyboard(code: str, page: int, total: int) -> InlineKeyboardMarkup:
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"admin:promousers:{code}:{page - 1}"))
+    if (page + 1) * PROMO_USERS_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"admin:promousers:{code}:{page + 1}"))
+    return InlineKeyboardMarkup(inline_keyboard=[nav] if nav else [])
+
+
+@router.message(Command("promo_users"))
+async def cmd_promo_users(message: Message) -> None:
+    """Правка 3.1: who actually clicked a partner's link, one page at a
+    time — /promo_list and /promo_stat only ever show aggregates; this is
+    the one admin-only screen with per-visitor detail (never exposed to
+    the partner themselves via /mypromo — see _promo_stats_text)."""
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /promo_users &lt;код&gt;")
+        return
+    code = parts[1].strip().lower()
+    if db.get_promo_code(code) is None:
+        await message.answer(f"Промокод <code>{code}</code> не найден.")
+        return
+    total = db.count_promo_visitors(code)
+    visitors = db.list_promo_visitors(code, PROMO_USERS_PAGE_SIZE, 0)
+    await message.answer(
+        _promo_users_text(code, 0, total, visitors), reply_markup=_promo_users_keyboard(code, 0, total)
+    )
+
+
+@router.callback_query(F.data.startswith("admin:promousers:"))
+async def cb_admin_promo_users(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    _, _, code, page_str = callback.data.split(":")
+    page = int(page_str)
+    await callback.answer()
+    total = db.count_promo_visitors(code)
+    visitors = db.list_promo_visitors(code, PROMO_USERS_PAGE_SIZE, page * PROMO_USERS_PAGE_SIZE)
+    await _edit_or_send(
+        callback, _promo_users_text(code, page, total, visitors), _promo_users_keyboard(code, page, total)
+    )
 
 
 @router.message(Command("promo_owner"))
