@@ -76,19 +76,30 @@ MODEL_RESPONSE_TOKENS = {
 }
 DEFAULT_MODEL_RESPONSE_TOKENS = 2048
 
-# Per-model daily sub-limit — checked and consumed IN ADDITION to (not
-# instead of) the normal daily quota above: a request to a sub-limited
-# model spends one unit from the normal quota AND one from this counter,
-# never a separate budget stacked on top of it. Exists for AITUNNEL models
-# that bill real money per call (unlike Groq): a free-tier user costs the
-# model's actual price while paying nothing themselves, so the free-tier
-# cap is deliberately smaller than what a paying user (active subscription,
-# active purchased unlimited pass, or spending a purchased message package)
-# gets — set via two separate env vars for exactly that reason.
+# Per-model daily sub-limit for PAYING tiers — checked and consumed IN
+# ADDITION to (not instead of) the normal daily quota above: a request to a
+# sub-limited model spends one unit from the normal quota AND one from this
+# counter, never a separate budget stacked on top of it. Exists for
+# AITUNNEL models that bill real money per call (unlike Groq). Only applies
+# to an active subscription, active purchased unlimited pass, or spent
+# bonus_credits (see handlers._is_paid_tier) — the free tier uses
+# MODEL_TRIAL_TOTALS below instead, not this dict.
 MODEL_DAILY_SUBLIMIT_PAID = int(os.environ.get("MODEL_DAILY_SUBLIMIT_PAID", "10"))
-MODEL_DAILY_SUBLIMIT_FREE = int(os.environ.get("MODEL_DAILY_SUBLIMIT_FREE", "2"))
 MODEL_DAILY_SUBLIMITS = {
-    "gemini-3.5-flash-lite": {"paid": MODEL_DAILY_SUBLIMIT_PAID, "free": MODEL_DAILY_SUBLIMIT_FREE},
+    "gemini-3.5-flash-lite": {"paid": MODEL_DAILY_SUBLIMIT_PAID},
+}
+
+# Правка 1: the free tier gets a one-time TRIAL instead of a recurring daily
+# allowance — a "N per day, forever, for every free user" allowance has no
+# upper bound as the user count grows (this was written after a ~100-user
+# spike was expected from a one-off blogger promo: at the old 2/day free
+# rate, that alone was projected to burn the whole manually-topped-up
+# budget in about two weeks, with no ceiling on it). A trial does have a
+# ceiling: at most MODEL_TRIAL_TOTAL_FREE per free user, ever, never
+# refilled — see db.model_trial_usage / handlers._enforce_model_sublimit.
+MODEL_TRIAL_TOTAL_FREE = int(os.environ.get("MODEL_TRIAL_TOTAL_FREE", "5"))
+MODEL_TRIAL_TOTALS = {
+    "gemini-3.5-flash-lite": MODEL_TRIAL_TOTAL_FREE,
 }
 
 # Models that accept an image/file directly in the request and don't need
@@ -111,6 +122,52 @@ FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "qwen3.7-flash")
 # heavy user can't eat the whole day's budget alone.
 FALLBACK_DAILY_CAP = int(os.environ.get("FALLBACK_DAILY_CAP", "300"))
 FALLBACK_USER_DAILY_CAP = int(os.environ.get("FALLBACK_USER_DAILY_CAP", "20"))
+
+
+def _parse_cost_map(raw: str) -> dict:
+    """Parses "model_id=price,model_id=price" into {model_id: price}. Same
+    "comma list in an env var, set() or dict() at import time" convention
+    as AITUNNEL_MODELS above — silently skips a malformed entry rather than
+    crashing startup over a typo in an operational tuning value."""
+    result = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        model_id, _, price = pair.partition("=")
+        model_id = model_id.strip()
+        try:
+            result[model_id] = float(price.strip())
+        except ValueError:
+            continue
+    return result
+
+
+# Правка 2: rough estimated cost per request, in rubles — this bot's OWN
+# running tally of spend (see db.record_model_cost / get_cost_summary and
+# DAILY_COST_CAP below), never the provider's real invoice; that's only
+# ever knowable on the provider's own billing dashboard. Read from the
+# environment (not hardcoded) so the average can be retuned as real billing
+# data comes in without a deploy. Any model not listed here — every Groq
+# model, image generation, STT — costs nothing and is never charged against
+# DAILY_COST_CAP. Defaults are from actual measured AITUNNEL billing:
+# Gemini ran 0.12-0.53₽/request, ~0.3₽ on average; Qwen (the fallback) ran
+# ~0.05₽.
+MODEL_COST_PER_REQUEST = _parse_cost_map(
+    os.environ.get("MODEL_COST_PER_REQUEST", "gemini-3.5-flash-lite=0.3,qwen3.7-flash=0.05")
+)
+
+# Правка 3: once today's estimated spend (db.get_today_cost, using the
+# prices above) reaches this many rubles, paid models (and the reserve
+# fallback to Qwen) stop being offered to FREE-tier users for the rest of
+# the day — Groq-based models keep working for them as always, and a
+# subsequent Groq outage just fails normally rather than falling back to a
+# paid provider on someone else's dime. Never affects a paying user
+# (active subscription, unlimited pass, or bonus_credits on hand) — they
+# already paid for their allowance, so cutting them off isn't an option.
+# 0 disables the whole cap: free users keep getting paid models exactly as
+# the trial/sub-limit above already governs, with no extra spend ceiling.
+DAILY_COST_CAP = float(os.environ.get("DAILY_COST_CAP", "30"))
 
 DAILY_FREE_MESSAGES = int(os.environ.get("DAILY_FREE_MESSAGES", "10"))
 DAILY_FREE_PREMIUM_MESSAGES = int(os.environ.get("DAILY_FREE_PREMIUM_MESSAGES", "5"))

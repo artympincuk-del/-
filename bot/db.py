@@ -191,6 +191,49 @@ _conn.execute(
     )
     """
 )
+
+# Правка 1: the free tier's one-time trial per (user, model) — deliberately
+# has no quota_date/reset at all, unlike every other counter in this file.
+# used_total only ever goes up (except for a same-request refund on
+# failure) and is never zeroed by a day rolling over.
+_conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS model_trial_usage (
+        user_id INTEGER NOT NULL,
+        model TEXT NOT NULL,
+        used_total INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, model)
+    )
+    """
+)
+
+# Правка 2: this bot's own estimated running spend on paid models
+# (config.MODEL_COST_PER_REQUEST), bucketed per (day, model) rather than one
+# row per request — enough to answer "how much today/7d/30d, and by which
+# model" without an unbounded per-request log. One row per model per
+# calendar day is negligible in size, so unlike chat_log this needs no
+# retention/pruning job.
+_conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS model_cost_daily (
+        quota_date TEXT NOT NULL,
+        model TEXT NOT NULL,
+        cost_rub REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (quota_date, model)
+    )
+    """
+)
+
+# Правка 3.4: one row per calendar day once the DAILY_COST_CAP admin
+# notification has been sent — existence of today's row is the "already
+# notified today" flag, checked/set atomically via INSERT OR IGNORE.
+_conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS cost_cap_alerts (
+        quota_date TEXT PRIMARY KEY
+    )
+    """
+)
 _conn.commit()
 
 MAX_NOTES_PER_USER = 30
@@ -795,6 +838,143 @@ def get_fallback_usage_today() -> int:
             (_today(),),
         )
         return cur.fetchone()[0]
+
+
+def try_consume_model_trial(user_id: int, model: str, trial_total: int) -> tuple[bool, dict]:
+    """Правка 1: the free tier's counterpart to try_consume_model_sublimit
+    above — a per-(user, model) counter that NEVER resets (no quota_date at
+    all) instead of a daily one, for a one-time trial rather than a
+    recurring allowance. Same calling convention: run this right after
+    try_consume_message has already succeeded for the same request, before
+    the model is actually asked anything; the caller refunds via
+    refund_model_trial if the request then fails.
+
+    Returns (allowed, status); status has "used_total" for display/denial
+    text and "consumed" (True/False) for refund_model_trial."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT used_total FROM model_trial_usage WHERE user_id = ? AND model = ?",
+            (user_id, model),
+        )
+        row = cur.fetchone()
+        used = row[0] if row else 0
+
+        if used >= trial_total:
+            return False, {"used_total": used, "consumed": False}
+
+        new_used = used + 1
+        _conn.execute(
+            "INSERT INTO model_trial_usage (user_id, model, used_total) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, model) DO UPDATE SET used_total = excluded.used_total",
+            (user_id, model, new_used),
+        )
+        _conn.commit()
+        return True, {"used_total": new_used, "consumed": True}
+
+
+def refund_model_trial(user_id: int, model: str) -> None:
+    """Reverses one try_consume_model_trial() call for a request that
+    consumed a trial use but then failed before producing an answer — a
+    failed attempt must not cost the user one of their (small, one-time,
+    never-refilled) trial uses. No-op if the counter is already 0."""
+    with _lock:
+        _conn.execute(
+            "UPDATE model_trial_usage SET used_total = MAX(0, used_total - 1) "
+            "WHERE user_id = ? AND model = ?",
+            (user_id, model),
+        )
+        _conn.commit()
+
+
+def get_model_trial_usage(user_id: int, model: str) -> int:
+    """Read-only lookup for display (the model menu's "осталось X из Y
+    пробных") — doesn't consume or write anything."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT used_total FROM model_trial_usage WHERE user_id = ? AND model = ?",
+            (user_id, model),
+        )
+        row = cur.fetchone()
+        return row[0] if row else 0
+
+
+def record_model_cost(model: str, cost_rub: float) -> None:
+    """Правка 2: adds one successful paid-model request's estimated cost
+    (config.MODEL_COST_PER_REQUEST, rubles) to today's running total,
+    bucketed per (day, model) so admin stats can break today's spend down
+    by model without scanning a per-request log. Call exactly once, only
+    after the request has actually SUCCEEDED (see
+    handlers._record_model_cost and its call sites) — a failed request
+    never reaches this, so unlike the sub-limit/trial counters above there
+    is deliberately no matching refund function."""
+    if cost_rub <= 0:
+        return
+    with _lock:
+        today = _today()
+        _conn.execute(
+            "INSERT INTO model_cost_daily (quota_date, model, cost_rub) VALUES (?, ?, ?) "
+            "ON CONFLICT(quota_date, model) DO UPDATE SET cost_rub = cost_rub + excluded.cost_rub",
+            (today, model, cost_rub),
+        )
+        _conn.commit()
+
+
+def get_today_cost() -> float:
+    """Today's total estimated spend across all paid models — the live
+    number config.DAILY_COST_CAP is compared against (see
+    handlers._cost_cap_exceeded), also shown in admin stats."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT COALESCE(SUM(cost_rub), 0) FROM model_cost_daily WHERE quota_date = ?",
+            (_today(),),
+        )
+        return cur.fetchone()[0]
+
+
+def get_cost_summary() -> dict:
+    """Admin stats (Правка 2.4): total estimated spend today/7d/30d, plus
+    today's breakdown by model. Everything here is an ESTIMATE derived from
+    config.MODEL_COST_PER_REQUEST, never the provider's actual invoice —
+    say so wherever this gets displayed."""
+    with _lock:
+        today = _today()
+        today_date = datetime.datetime.now(_QUOTA_TZINFO).date()
+        since_7d = (today_date - datetime.timedelta(days=6)).isoformat()
+        since_30d = (today_date - datetime.timedelta(days=29)).isoformat()
+
+        def _sum_since(since: str) -> float:
+            cur = _conn.execute(
+                "SELECT COALESCE(SUM(cost_rub), 0) FROM model_cost_daily WHERE quota_date >= ?",
+                (since,),
+            )
+            return cur.fetchone()[0]
+
+        cur = _conn.execute(
+            "SELECT model, cost_rub FROM model_cost_daily WHERE quota_date = ? ORDER BY cost_rub DESC",
+            (today,),
+        )
+        today_by_model = cur.fetchall()
+
+        return {
+            "today": _sum_since(today),
+            "7d": _sum_since(since_7d),
+            "30d": _sum_since(since_30d),
+            "today_by_model": today_by_model,
+        }
+
+
+def try_mark_cost_cap_alert_sent() -> bool:
+    """Правка 3.4's once-per-day gate for the admin cap-exceeded
+    notification: True the first time this is called on a given calendar
+    day (and records it), False on every later call the same day — so a
+    burst of denied free-tier requests doesn't send admins one message per
+    denial."""
+    with _lock:
+        cur = _conn.execute(
+            "INSERT OR IGNORE INTO cost_cap_alerts (quota_date) VALUES (?)", (_today(),)
+        )
+        _conn.commit()
+        return cur.rowcount > 0
 
 
 def add_bonus_credits(user_id: int, username: str | None, amount: int) -> int:
