@@ -9,9 +9,13 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 import groq
+import openai
 from ddgs import DDGS
 
 from bot.config import (
+    AITUNNEL_API_KEY,
+    AITUNNEL_BASE_URL,
+    AITUNNEL_MODELS,
     DEFAULT_MODEL_RESPONSE_TOKENS,
     DEFAULT_MODEL_TOKEN_CEILING,
     FAST_MODEL,
@@ -99,6 +103,39 @@ SEARCH_TOOL_SCHEMA = [
 ]
 
 _client = groq.AsyncGroq(api_key=GROQ_API_KEY)
+
+# Второй провайдер: OpenAI-совместимый агрегатор с оплатой в рублях. Клиент
+# создаётся только если задан ключ — без него бот работает как раньше, на
+# одном Groq, и ни один вызов сюда не уходит.
+_aitunnel_client = (
+    openai.AsyncOpenAI(api_key=AITUNNEL_API_KEY, base_url=AITUNNEL_BASE_URL)
+    if AITUNNEL_API_KEY
+    else None
+)
+
+# Ошибки у двух SDK разных классов, но с одинаковым интерфейсом, поэтому
+# ловим их одним кортежем, а не двумя ветками except.
+_API_STATUS_ERRORS = (groq.APIStatusError, openai.APIStatusError)
+_API_CONNECTION_ERRORS = (groq.APIConnectionError, openai.APIConnectionError)
+
+
+def is_aitunnel_model(model: str) -> bool:
+    """Модель обслуживается агрегатором, а не Groq."""
+    return model in AITUNNEL_MODELS
+
+
+def _client_for(model: str):
+    """Клиент под конкретную модель. Если модель числится за агрегатором, но
+    ключ не задан, честно падаем с понятной ошибкой, а не шлём её в Groq,
+    который такой модели не знает."""
+    if is_aitunnel_model(model):
+        if _aitunnel_client is None:
+            raise AIError(
+                f"AITUNNEL model {model} requested without AITUNNEL_API_KEY",
+                user_message="Эта модель сейчас недоступна. Выберите другую в меню «Модель».",
+            )
+        return _aitunnel_client
+    return _client
 # Guards every actual Groq API call in this module (chat completions, STT,
 # image-prompt translation) — a single user firing off several messages at
 # once can't run more than GROQ_MAX_CONCURRENT requests against Groq
@@ -376,15 +413,21 @@ async def _complete_once(
     Returns the answer text, or None if the model ran out of its token
     budget on reasoning without producing one (caller may retry cheaper)."""
     kwargs = {"model": model, "max_tokens": max_tokens, "messages": list(messages)}
-    if model.startswith("openai/gpt-oss"):
-        kwargs["reasoning_effort"] = reasoning_effort or "medium"
-        kwargs["include_reasoning"] = False
-    elif model.startswith("qwen/"):
-        kwargs["reasoning_effort"] = reasoning_effort or "default"
-        kwargs["reasoning_format"] = "hidden"
+    via_aitunnel = is_aitunnel_model(model)
+    client = _client_for(model)
+    # reasoning_effort/include_reasoning/reasoning_format — расширения Groq.
+    # Агрегатор их не понимает и отвечает ошибкой, поэтому для его моделей
+    # шлём чистый OpenAI-совместимый запрос.
+    if not via_aitunnel:
+        if model.startswith("openai/gpt-oss"):
+            kwargs["reasoning_effort"] = reasoning_effort or "medium"
+            kwargs["include_reasoning"] = False
+        elif model.startswith("qwen/"):
+            kwargs["reasoning_effort"] = reasoning_effort or "default"
+            kwargs["reasoning_format"] = "hidden"
 
     # Tool calling is only wired up for gpt-oss (OpenAI-compatible tool_calls).
-    if enable_search and model.startswith("openai/gpt-oss"):
+    if enable_search and not via_aitunnel and model.startswith("openai/gpt-oss"):
         kwargs["tools"] = SEARCH_TOOL_SCHEMA
         kwargs["tool_choice"] = "auto"
 
@@ -392,9 +435,12 @@ async def _complete_once(
     # model that keeps wanting to search can't loop forever.
     for _round in range(3):
         try:
-            async with _groq_semaphore:
-                response = await _client.chat.completions.create(**kwargs)
-        except groq.APIStatusError as e:
+            if via_aitunnel:
+                response = await client.chat.completions.create(**kwargs)
+            else:
+                async with _groq_semaphore:
+                    response = await client.chat.completions.create(**kwargs)
+        except _API_STATUS_ERRORS as e:
             if e.status_code == 413:
                 # Not an immediate refusal — ask_ai's caller-side retry loop
                 # catches this, shrinks the request, and tries again before
@@ -405,9 +451,9 @@ async def _complete_once(
                     "Groq API error: 429",
                     user_message="Сейчас слишком много запросов. Попробуйте через несколько секунд.",
                 ) from e
-            raise AIError(f"Groq API error: {e.status_code}") from e
-        except groq.APIConnectionError as e:
-            raise AIError("Groq API connection error") from e
+            raise AIError(f"API error: {e.status_code}") from e
+        except _API_CONNECTION_ERRORS as e:
+            raise AIError("API connection error") from e
 
         choice = response.choices[0]
         message = choice.message

@@ -104,6 +104,19 @@ MODEL_OPTIONS = {
         "reasoning": None,
         "label": "💎🦙 Llama 3.3 70B",
     },
+    # Модели второго провайдера (AITUNNEL). Идут в премиум-тариф: у них нет
+    # минутных лимитов Groq, но каждый запрос стоит денег с баланса, поэтому
+    # бесплатному тарифу их не отдаём.
+    ("premium", "qwen37"): {
+        "model": "qwen3.7-flash",
+        "reasoning": None,
+        "label": "💎 Qwen 3.7 Flash",
+    },
+    ("premium", "gemini"): {
+        "model": "gemini-3.5-flash-lite",
+        "reasoning": None,
+        "label": "💎 Gemini 3.5 Flash Lite",
+    },
 }
 
 
@@ -498,6 +511,8 @@ def model_keyboard(current_pref: str, current_choice: str) -> InlineKeyboardMark
             [InlineKeyboardButton(text=label("fast", "gptoss"), callback_data="model:fast:gptoss")],
             [InlineKeyboardButton(text=label("premium", "llama"), callback_data="model:premium:llama")],
             [InlineKeyboardButton(text=label("premium", "gptoss"), callback_data="model:premium:gptoss")],
+            [InlineKeyboardButton(text=label("premium", "qwen37"), callback_data="model:premium:qwen37")],
+            [InlineKeyboardButton(text=label("premium", "gemini"), callback_data="model:premium:gemini")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")],
         ]
     )

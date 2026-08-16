@@ -28,12 +28,33 @@ PREMIUM_CREDIT_COST = int(os.environ.get("PREMIUM_CREDIT_COST", "3"))
 # Groq's own tariff limit (https://console.groq.com/docs/rate-limits), not
 # something this bot controls — update this dict if the Groq account ever
 # moves off the free/developer plan and gets higher limits.
+# AITUNNEL — российский агрегатор с OpenAI-совместимым API и оплатой рублями.
+# Подключён вторым провайдером: у него нет минутных лимитов Groq, поэтому он
+# используется как запас, когда Groq упирается в свой TPM. Ключ пустой =
+# провайдер выключен, бот работает как раньше, только на Groq.
+AITUNNEL_API_KEY = os.environ.get("AITUNNEL_API_KEY", "")
+AITUNNEL_BASE_URL = os.environ.get("AITUNNEL_BASE_URL", "https://api.aitunnel.ru/v1/")
+# Модели, которые нужно слать в AITUNNEL, а не в Groq. Список, а не префикс:
+# у агрегатора id вида "qwen3.7-flash" ничем не отличаются от груковских по
+# форме, угадывать нельзя.
+AITUNNEL_MODELS = {
+    m.strip()
+    for m in os.environ.get(
+        "AITUNNEL_MODELS", "qwen3.7-flash,gemini-3.5-flash-lite"
+    ).split(",")
+    if m.strip()
+}
+
 MODEL_TOKEN_CEILINGS = {
     "openai/gpt-oss-20b": 8000,
     "openai/gpt-oss-120b": 8000,
     "qwen/qwen3.6-27b": 8000,
     "llama-3.1-8b-instant": 6000,
     "llama-3.3-70b-versatile": 12000,
+    # У агрегатора нет минутного лимита, ограничение только по балансу,
+    # поэтому потолок ставим по размеру контекста, а не по тарифу.
+    "qwen3.7-flash": 128000,
+    "gemini-3.5-flash-lite": 128000,
 }
 DEFAULT_MODEL_TOKEN_CEILING = 8000  # fallback for a model not listed above
 
