@@ -10,9 +10,13 @@ import groq
 from ddgs import DDGS
 
 from bot.config import (
+    DEFAULT_MODEL_RESPONSE_TOKENS,
+    DEFAULT_MODEL_TOKEN_CEILING,
     FAST_MODEL,
     GROQ_API_KEY,
     GROQ_MAX_CONCURRENT,
+    MODEL_RESPONSE_TOKENS,
+    MODEL_TOKEN_CEILINGS,
     POLLINATIONS_API_KEY,
     PREMIUM_MODEL,
     REQUEST_TOKEN_BUDGET,
@@ -161,11 +165,12 @@ def _build_system_prompt(notes: list[str] | None) -> str:
     )
 
 
-# Rough, no-dependency token estimate — real tokenization would need a
-# tokenizer library we don't otherwise use. ~4 chars/token is the usual rule
-# of thumb for English text, but this bot's users write mostly Cyrillic,
-# which tends to run fewer chars per token — use a smaller divisor so the
-# estimate leans toward *overestimating* real usage rather than under.
+# Rough, no-dependency token estimate — NOT an exact token count, just an
+# upper-bound guess. A real tokenizer would need a library we don't
+# otherwise use. ~4 chars/token is the usual rule of thumb for English text,
+# but this bot's users write mostly Cyrillic, which tends to run fewer chars
+# per token — use a smaller divisor so the estimate leans toward
+# *overestimating* real usage rather than under.
 _CHARS_PER_TOKEN = 2.5
 
 
@@ -220,19 +225,22 @@ def _trim_history_to_budget(
 
 
 _TRUNCATION_NOTE = (
-    "[начало сообщения обрезано из-за технического ограничения размера запроса]\n\n"
+    "\n\n[конец сообщения обрезан из-за технического ограничения размера запроса]"
 )
 
 
 def _truncate_content_half(content):
-    """Last resort before giving up on a 413 (see ask_ai): halves the
-    current message's text, keeping the END — callers by convention put the
-    actual question/instruction last, after any recognized/quoted text — and
-    prepends a short note so the model knows the start was cut, without ever
-    surfacing token/limit language to the user themselves."""
+    """Last resort before giving up on a 413 (see ask_ai): cuts the current
+    message's text down to its first half by character count (i.e. trims
+    away the second half) and appends a short note marking the cut, so the
+    model knows the text was shortened — without ever surfacing token/limit
+    language to the user themselves. Keeps the BEGINNING on purpose: callers
+    like the photo-solving prompt put the actual recognized problem first
+    and boilerplate instructions last, so losing the tail costs less than
+    losing the problem statement itself."""
     if isinstance(content, str):
         half = len(content) // 2
-        return _TRUNCATION_NOTE + content[-half:] if half else content
+        return content[:half] + _TRUNCATION_NOTE if half else content
     if isinstance(content, list):
         new_content = []
         for block in content:
@@ -241,7 +249,7 @@ def _truncate_content_half(content):
                 half = len(text) // 2
                 block = {
                     **block,
-                    "text": (_TRUNCATION_NOTE + text[-half:]) if half else text,
+                    "text": (text[:half] + _TRUNCATION_NOTE) if half else text,
                 }
             new_content.append(block)
         return new_content
@@ -259,6 +267,46 @@ def _extract_error_detail(e: "groq.APIStatusError") -> str:
             return str(err.get("message", body))[:500]
         return str(body)[:500]
     return str(body)[:500] if body is not None else str(e)[:500]
+
+
+# Cushion for our estimate being approximate, subtracted on top of a
+# model's own MODEL_TOKEN_CEILINGS entry — and the floor for what still
+# counts as a useful answer: below this, ask_ai trims history further
+# rather than shrinking the response, and it's also the value a 413 retry
+# falls back to (see ask_ai).
+_RESPONSE_MARGIN = 300
+_MIN_RESPONSE_TOKENS = 400
+
+
+def _fit_response_budget(
+    hist: list[dict], system_content: str, content, model: str, requested_max_tokens: int
+) -> tuple[list[dict], int]:
+    """Groq reserves max_tokens against the very same per-minute token
+    budget as the prompt itself (MODEL_TOKEN_CEILINGS — Groq's own tariff
+    limit per model), so a generous max_tokens on an already-big request can
+    trip a 413 all on its own, even when the prompt alone would have fit.
+    Shrinks history — never the system prompt or the current message —
+    until there's at least _MIN_RESPONSE_TOKENS of headroom left for the
+    response; cutting history further is preferred over silently capping
+    the answer below a useful minimum. Returns the (possibly further-
+    trimmed) history and the max_tokens to actually send."""
+    ceiling = MODEL_TOKEN_CEILINGS.get(model, DEFAULT_MODEL_TOKEN_CEILING)
+    base_tokens = _estimate_tokens(system_content) + _estimate_message_tokens(content)
+    while True:
+        request_tokens = base_tokens + sum(_estimate_message_tokens(t.get("content")) for t in hist)
+        available = ceiling - request_tokens - _RESPONSE_MARGIN
+        if available >= _MIN_RESPONSE_TOKENS or not hist:
+            break
+        hist = hist[1:]
+    effective_max_tokens = min(requested_max_tokens, available)
+    if effective_max_tokens < _MIN_RESPONSE_TOKENS:
+        # No real headroom even with history fully dropped (the system
+        # prompt + current message alone are already large relative to this
+        # model's ceiling) — send anyway with the floor value and let
+        # Groq's own 413 (handled by ask_ai's retry sequence) decide, same
+        # "let Groq decide" principle as an over-budget lone message.
+        effective_max_tokens = _MIN_RESPONSE_TOKENS
+    return hist, effective_max_tokens
 
 
 # Both gpt-oss models and qwen sit on Groq's free-tier 8000 TPM cap, so we
@@ -374,22 +422,35 @@ async def ask_ai(
     model: str,
     notes: list[str] | None = None,
     reasoning_effort: str | None = None,
-    max_tokens: int = 4096,
+    max_tokens: int | None = None,
     enable_search: bool = False,
 ) -> str:
     """`user_content` is either a plain string (text-only turn) or a list of
-    content blocks (e.g. text + image_url) for multimodal turns.
+    content blocks (e.g. text + image_url) for multimodal turns. `max_tokens`
+    is the caller's desired response budget; if omitted, a per-model default
+    (MODEL_RESPONSE_TOKENS) is used. Either way it's then clamped dynamically
+    against the model's own Groq TPM ceiling and this specific request's
+    size (see _fit_response_budget) — Groq reserves max_tokens against the
+    same per-minute budget as the prompt, so a generous max_tokens on a big
+    request can trip a 413 all on its own.
 
     History is trimmed to REQUEST_TOKEN_BUDGET before the first attempt (see
-    _trim_history_to_budget), and if Groq still rejects the request as too
-    large (413) — e.g. a long photo-recognized problem plus history — this
-    retries up to two more times before ever giving up: first with history
-    dropped entirely, then with the current message's own text halved too.
-    Only a third 413 in a row produces a plain-language refusal; a success on
-    any attempt reaches the caller as an ordinary answer, no retry visible."""
+    _trim_history_to_budget, further tightened by _fit_response_budget if
+    needed to leave room for the response), and if Groq still rejects the
+    request as too large (413) — e.g. a long photo-recognized problem plus
+    history — this retries up to two more times before ever giving up: first
+    with history dropped and max_tokens cut to the floor, then with the
+    current message's own text halved too. Only a third 413 in a row
+    produces a plain-language refusal; a success on any attempt reaches the
+    caller as an ordinary answer, no retry visible."""
     system_content = _build_system_prompt(notes)
     trimmed_history = _trim_history_to_budget(
         history, system_content, user_content, REQUEST_TOKEN_BUDGET
+    )
+    requested_max_tokens = (
+        max_tokens
+        if max_tokens is not None
+        else MODEL_RESPONSE_TOKENS.get(model, DEFAULT_MODEL_RESPONSE_TOKENS)
     )
 
     if reasoning_effort is not None:
@@ -401,19 +462,32 @@ async def ask_ai(
     else:
         effort = None
 
-    # attempt 1: budget-trimmed history, full message
-    # attempt 2 (only if attempt 1 gets a 413): no history, full message
-    # attempt 3 (only if attempt 2 also gets a 413): no history, halved message
-    attempts_history = [trimmed_history, [], []]
+    fitted_history, first_attempt_max_tokens = _fit_response_budget(
+        trimmed_history, system_content, user_content, model, requested_max_tokens
+    )
+
+    # attempt 1: budget- and ceiling-fitted history, full message, dynamically
+    #            sized max_tokens
+    # attempt 2 (only if attempt 1 gets a 413): no history, full message,
+    #            max_tokens cut to the floor — a 413 means the estimate was
+    #            already wrong once, so this attempt plays it safe rather
+    #            than trusting the dynamic budget again
+    # attempt 3 (only if attempt 2 also gets a 413): no history, message text
+    #            halved (keeps the beginning, cuts from the end), same
+    #            floor max_tokens
+    attempts = [
+        (fitted_history, user_content, first_attempt_max_tokens),
+        ([], user_content, _MIN_RESPONSE_TOKENS),
+        ([], _truncate_content_half(user_content), _MIN_RESPONSE_TOKENS),
+    ]
     last_detail = ""
-    for attempt_num, hist in enumerate(attempts_history, start=1):
-        content = user_content if attempt_num < 3 else _truncate_content_half(user_content)
+    for attempt_num, (hist, content, attempt_max_tokens) in enumerate(attempts, start=1):
         messages = [{"role": "system", "content": system_content}] + hist + [
             {"role": "user", "content": content}
         ]
         try:
             text = await _complete_with_effort_fallback(
-                messages, model, max_tokens, effort, enable_search
+                messages, model, attempt_max_tokens, effort, enable_search
             )
         except _PayloadTooLargeError as e:
             estimated_size = (
@@ -422,9 +496,10 @@ async def ask_ai(
                 + _estimate_message_tokens(content)
             )
             logger.warning(
-                "Groq 413 on attempt %d/3 (model=%s, estimated ~%d tokens): %s",
+                "Groq 413 on attempt %d/3 (model=%s, max_tokens=%d, estimated ~%d tokens): %s",
                 attempt_num,
                 model,
+                attempt_max_tokens,
                 estimated_size,
                 e.detail,
             )
@@ -439,8 +514,8 @@ async def ask_ai(
     raise AIError(
         f"Groq API error: 413 (exhausted retries; last detail: {last_detail})",
         user_message=(
-            "Запрос получился слишком большим, чтобы обработать его за один раз. "
-            "Пришлите, пожалуйста, один вопрос или один разворот текста за раз — так я смогу ответить."
+            "Документ или фото получились слишком большими, чтобы обработать их за один раз. "
+            "Пришлите, пожалуйста, одну страницу или один вопрос — так я смогу ответить."
         ),
     )
 

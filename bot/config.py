@@ -22,6 +22,35 @@ FAST_REASONING_EFFORT = os.environ.get("FAST_REASONING_EFFORT", "low")
 PREMIUM_REASONING_EFFORT = os.environ.get("PREMIUM_REASONING_EFFORT", "high")
 PREMIUM_CREDIT_COST = int(os.environ.get("PREMIUM_CREDIT_COST", "3"))
 
+# Groq's free-tier tokens-per-minute (TPM) ceiling per model — the hard cap
+# a single request (prompt tokens + the max_tokens reserved for the
+# response) must fit under, or Groq rejects it outright with a 413. This is
+# Groq's own tariff limit (https://console.groq.com/docs/rate-limits), not
+# something this bot controls — update this dict if the Groq account ever
+# moves off the free/developer plan and gets higher limits.
+MODEL_TOKEN_CEILINGS = {
+    "openai/gpt-oss-20b": 8000,
+    "openai/gpt-oss-120b": 8000,
+    "qwen/qwen3.6-27b": 8000,
+    "llama-3.1-8b-instant": 6000,
+    "llama-3.3-70b-versatile": 12000,
+}
+DEFAULT_MODEL_TOKEN_CEILING = 8000  # fallback for a model not listed above
+
+# Default response budget (max_tokens) per model when a caller doesn't ask
+# for something more specific — unchanged (4096) for the gpt-oss models this
+# bot uses by default; noticeably lower for a model with a much smaller
+# ceiling above, where 4096 alone could already eat most of its whole
+# per-minute budget before any prompt tokens are even counted.
+MODEL_RESPONSE_TOKENS = {
+    "openai/gpt-oss-20b": 4096,
+    "openai/gpt-oss-120b": 4096,
+    "qwen/qwen3.6-27b": 4096,
+    "llama-3.1-8b-instant": 1024,
+    "llama-3.3-70b-versatile": 4096,
+}
+DEFAULT_MODEL_RESPONSE_TOKENS = 2048
+
 DAILY_FREE_MESSAGES = int(os.environ.get("DAILY_FREE_MESSAGES", "10"))
 DAILY_FREE_PREMIUM_MESSAGES = int(os.environ.get("DAILY_FREE_PREMIUM_MESSAGES", "5"))
 # Images (generate from scratch AND edit a photo) get their own separate

@@ -78,18 +78,21 @@ class Form(StatesGroup):
 # (tier, choice) -> which actual Groq model + reasoning_effort to use. `tier`
 # ('fast'/'premium') decides which quota bucket a message is billed against;
 # `choice` decides which specific engine runs within that tier — the two
-# GPT-OSS models are the default/recommended pick, the original Llama models
-# are offered alongside them as an alternative "flavor" within the same tier.
+# GPT-OSS models are the default/recommended pick, the original Llama model
+# is offered alongside the premium one as an alternative "flavor" within
+# that tier. Llama 3.1 8B (fast tier) was removed on purpose: its Groq TPM
+# ceiling (6000, see config.MODEL_TOKEN_CEILINGS) is noticeably smaller than
+# gpt-oss-20b's (8000), so it refused even short questions once history and
+# the reserved response budget were counted against it — strictly worse
+# than 20B, which is both faster and stronger. _model_option already falls
+# back to gptoss for any (tier, choice) it doesn't recognize, so an existing
+# user whose stored preference is ("fast", "llama") is switched over
+# automatically, no migration needed.
 MODEL_OPTIONS = {
     ("fast", "gptoss"): {
         "model": FAST_MODEL,
         "reasoning": FAST_REASONING_EFFORT,
         "label": "⚡ GPT-OSS 20B",
-    },
-    ("fast", "llama"): {
-        "model": "llama-3.1-8b-instant",
-        "reasoning": None,
-        "label": "⚡🦙 Llama 3.1 8B",
     },
     ("premium", "gptoss"): {
         "model": PREMIUM_MODEL,
@@ -408,7 +411,6 @@ def model_keyboard(current_pref: str, current_choice: str) -> InlineKeyboardMark
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=label("fast", "llama"), callback_data="model:fast:llama")],
             [InlineKeyboardButton(text=label("fast", "gptoss"), callback_data="model:fast:gptoss")],
             [InlineKeyboardButton(text=label("premium", "llama"), callback_data="model:premium:llama")],
             [InlineKeyboardButton(text=label("premium", "gptoss"), callback_data="model:premium:gptoss")],
@@ -841,6 +843,11 @@ async def btn_model_text(message: Message) -> None:
 @router.callback_query(F.data.startswith("model:"))
 async def cb_model(callback: CallbackQuery) -> None:
     _, tier, choice = callback.data.split(":")
+    if (tier, choice) not in MODEL_OPTIONS:
+        # A stale button from before a model was removed from the menu
+        # (e.g. fast/llama) — same soft fallback as _model_option: settle
+        # on gptoss for that tier instead of a KeyError below.
+        choice = "gptoss"
     db.set_model_pref(callback.from_user.id, callback.from_user.username, tier, choice)
     label = MODEL_OPTIONS[(tier, choice)]["label"]
     await callback.answer(f"Модель: {label}")
