@@ -1937,12 +1937,80 @@ ADMIN_PAGE_SIZE = 8
 
 ADMIN_MENU_TEXT = (
     "🔑 <b>Админ-панель</b>\n\n"
-    "Команды по-прежнему работают: /grant, /users, /chatlog "
-    "&lt;@username или id&gt;, /notes_of &lt;@username или id&gt;, "
-    "/refund &lt;telegram_payment_charge_id&gt;, "
-    "/promo_add, /promo_off, /promo_list, /promo_stat, /promo_owner "
-    "&lt;код&gt; &lt;@username или id&gt;, /promo_token, /backup."
+    "Кнопки ниже — быстрый доступ к статистике и карточкам пользователей "
+    "(баланс, чатлог, возврат — всё оттуда, без команд).\n\n"
+    "Полный список текстовых команд с описанием и примерами — в «📖 Все команды»."
 )
+
+# Reference shown by "📖 Все команды" — every admin-only text command, grouped
+# by topic, with its argument syntax and a one-line description. Exists so an
+# admin can find "how do I do X" without reading handlers.py; keep this in
+# sync whenever an admin command is added, renamed, or its arguments change.
+ADMIN_HELP_CATEGORIES = {
+    "users": {
+        "label": "👤 Пользователи и баланс",
+        "text": (
+            "👤 <b>Пользователи и баланс</b>\n\n"
+            "<code>/users</code>\n"
+            "Список всех пользователей: выбранная модель, использовано сегодня "
+            "(free/premium), бонусные сообщения, последняя активность. Без аргументов.\n\n"
+            "<code>/grant &lt;@username или id&gt; &lt;amount&gt;</code>\n"
+            "Начислить бонусные сообщения. Отрицательное число — списать. "
+            "Пример: <code>/grant @ivan 20</code>\n\n"
+            "<code>/chatlog &lt;@username или id&gt; [N]</code>\n"
+            "Последние N сообщений переписки пользователя с ботом (по умолчанию 20).\n\n"
+            "<code>/notes_of &lt;@username или id&gt;</code>\n"
+            "Заметки пользователя, сохранённые через /remember — пригождается при "
+            "разборе жалоб на тон ответов.\n\n"
+            "💡 То же самое, плюс кнопки +10/+50/-10 к балансу и возврат оплаты в один "
+            "тап, доступно без единой команды — через «👥 Пользователи» в главном меню."
+        ),
+    },
+    "payments": {
+        "label": "💳 Платежи",
+        "text": (
+            "💳 <b>Платежи</b>\n\n"
+            "<code>/refund &lt;telegram_payment_charge_id&gt;</code>\n"
+            "Вернуть звёзды за платёж и списать то, что он дал (сообщения/подписку/"
+            "безлимит). Тот же charge_id, что и у кнопки «Возврат» на карточке "
+            "пользователя (👥 Пользователи → выбрать пользователя → платёж)."
+        ),
+    },
+    "promo": {
+        "label": "🎟 Промокоды",
+        "text": (
+            "🎟 <b>Промокоды</b>\n\n"
+            "<code>/promo_add &lt;код&gt; &lt;название партнёра&gt; &lt;бонус_минут&gt; "
+            "&lt;доля_%&gt; &lt;окно_дней&gt;</code>\n"
+            "Создать промокод для партнёра. Пример: "
+            "<code>/promo_add tt1 Иван TikTok 4320 40 30</code>\n\n"
+            "<code>/promo_off &lt;код&gt;</code>\n"
+            "Выключить промокод. Уже привязанные пользователи и их оплаты внутри окна "
+            "атрибуции продолжают засчитываться.\n\n"
+            "<code>/promo_list</code>\n"
+            "Список всех промокодов со статусом и статистикой. Без аргументов.\n\n"
+            "<code>/promo_stat &lt;код&gt;</code>\n"
+            "Подробная статистика по одному промокоду.\n\n"
+            "<code>/promo_owner &lt;код&gt; &lt;@username или id&gt;</code>\n"
+            "Назначить владельца промокода — ему становится доступна статистика через "
+            "/mypromo. <code>0</code> вместо адресата — снять владельца.\n\n"
+            "<code>/promo_token &lt;код&gt; [new]</code>\n"
+            "Показать секретное слово для привязки промокода партнёром (командой "
+            "/promo). С <code>new</code> — перегенерировать; старое слово перестаёт "
+            "работать."
+        ),
+    },
+    "system": {
+        "label": "🛠 Система",
+        "text": (
+            "🛠 <b>Система</b>\n\n"
+            "<code>/backup</code>\n"
+            "Прислать дамп базы данных .db файлом лично тебе в этот чат. Без аргументов."
+        ),
+    },
+}
+
+ADMIN_HELP_INDEX_TEXT = "📖 <b>Все команды</b>\n\nВыбери раздел:"
 
 
 def admin_menu_keyboard() -> InlineKeyboardMarkup:
@@ -1951,7 +2019,23 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
             [InlineKeyboardButton(text="📈 Воронка покупок", callback_data="admin:funnel")],
             [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users:0")],
+            [InlineKeyboardButton(text="📖 Все команды", callback_data="admin:help")],
         ]
+    )
+
+
+def admin_help_index_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=category["label"], callback_data=f"admin:help:{key}")]
+        for key, category in ADMIN_HELP_CATEGORIES.items()
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ В меню", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_help_category_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ Ко всем командам", callback_data="admin:help")]]
     )
 
 
@@ -1969,6 +2053,29 @@ async def cb_admin_menu(callback: CallbackQuery) -> None:
         return
     await callback.answer()
     await _edit_or_send(callback, ADMIN_MENU_TEXT, admin_menu_keyboard())
+
+
+@router.callback_query(F.data == "admin:help")
+async def cb_admin_help(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.answer()
+    await _edit_or_send(callback, ADMIN_HELP_INDEX_TEXT, admin_help_index_keyboard())
+
+
+@router.callback_query(F.data.startswith("admin:help:"))
+async def cb_admin_help_category(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    key = callback.data.split(":", 2)[2]
+    category = ADMIN_HELP_CATEGORIES.get(key)
+    if category is None:
+        await callback.answer()
+        return
+    await callback.answer()
+    await _edit_or_send(callback, category["text"], admin_help_category_keyboard())
 
 
 def _admin_stats_text() -> str:
