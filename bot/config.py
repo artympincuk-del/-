@@ -84,7 +84,7 @@ DEFAULT_MODEL_RESPONSE_TOKENS = 2048
 # to an active subscription, active purchased unlimited pass, or spent
 # bonus_credits (see handlers._is_paid_tier) — the free tier uses
 # MODEL_TRIAL_TOTALS below instead, not this dict.
-MODEL_DAILY_SUBLIMIT_PAID = int(os.environ.get("MODEL_DAILY_SUBLIMIT_PAID", "10"))
+MODEL_DAILY_SUBLIMIT_PAID = int(os.environ.get("MODEL_DAILY_SUBLIMIT_PAID", "5"))
 MODEL_DAILY_SUBLIMITS = {
     "gemini-3.5-flash-lite": {"paid": MODEL_DAILY_SUBLIMIT_PAID},
 }
