@@ -378,11 +378,6 @@ _LATEX_BRACKET_RE = re.compile(r"\\\[(.*?)\\\]", re.DOTALL)
 _LATEX_DISPLAY_DOLLAR_RE = re.compile(r"\$\$(.*?)\$\$", re.DOTALL)
 _LATEX_INLINE_DOLLAR_RE = re.compile(r"\$(.*?)\$", re.DOTALL)
 
-_LATEX_FRAC_RE = re.compile(r"\\frac\{([^{}]*)\}\{([^{}]*)\}")
-_LATEX_SUP_RE = re.compile(r"\^\{([^{}]*)\}")
-_LATEX_SUB_RE = re.compile(r"_\{([^{}]*)\}")
-_LATEX_SQRT_RE = re.compile(r"\\sqrt\{([^{}]*)\}")
-
 # Symbols with a direct, unambiguous plain-text equivalent. \leq/\geq/\ne
 # are the long forms of \le/\ge/\neq — not in the literal spec list, but
 # left unhandled they'd fall through to the bare-command-delete rule below
@@ -406,16 +401,126 @@ _LATEX_SYMBOLS = {
 _LATEX_SYMBOL_RE = re.compile(
     r"\\(" + "|".join(sorted(_LATEX_SYMBOLS, key=len, reverse=True)) + r")(?![a-zA-Z])"
 )
-# Catch-all for any other \command{content} (e.g. \text{см}, \mathrm{kg}) —
-# drop the command, keep what's in the braces. Must run before the
-# bare-command catch-all below, or \text{см} would first lose "\text" and
-# leave stray "{см}" braces behind.
-_LATEX_COMMAND_WITH_ARG_RE = re.compile(r"\\[a-zA-Z]+\{([^{}]*)\}")
-# Final catch-all: any remaining \command with no braces (e.g. \left(,
-# \right), \displaystyle) — drop just the command token, leave whatever
-# follows (a real delimiter like "(" isn't part of the command, so it
-# survives untouched).
+# Commands that carry no argument and no readable symbol equivalent —
+# LaTeX spacing (\; \, \: \!), forced line breaks (\\, \newline) and
+# \quad/\qquad (wider spacing) — dropped outright rather than falling
+# through to the bare-command rule below (which only matches [a-zA-Z]+ and
+# would otherwise leave the non-letter ones — \; \, \: \! — untouched).
+_LATEX_NOARG_RE = re.compile(r"\\(?:quad|qquad|newline|;|,|:|!|\\)")
+# Generic bare \command with no following '{' (e.g. \left(, \right),
+# \displaystyle) — only a fallback once frac/sqrt/^/_ /symbols/no-arg/
+# braced-generic have all had a chance to match first.
 _LATEX_BARE_COMMAND_RE = re.compile(r"\\[a-zA-Z]+")
+
+
+def _find_matching_brace(text: str, open_idx: int) -> int:
+    """text[open_idx] is a '{' — returns the index of its true matching
+    '}', tracking nesting depth so an argument that itself contains a
+    nested command (e.g. \\frac{3 \\pm \\sqrt{9+16}}{2} — the numerator's
+    closing '}' must skip over \\sqrt's own inner braces) is found
+    correctly. Returns -1 if the braces never balance (malformed input —
+    the caller falls back to treating '{' as a literal character)."""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _latex_wrap_if_needed(inner: str) -> str:
+    """Parens around a \\frac/\\sqrt/^{}/_{} argument are only dropped when
+    it's a single character or a plain number (^{2} -> ^2, \\sqrt{16} ->
+    √16) — anything longer gets wrapped ((3 ± √(9+16))/2, not
+    3±√9+16/2, which silently changes what the expression means)."""
+    inner = inner.strip()
+    if len(inner) <= 1 or re.fullmatch(r"-?\d+(\.\d+)?", inner):
+        return inner
+    return f"({inner})"
+
+
+def _process_latex_spans(text: str) -> str:
+    """The brace-aware half of _convert_latex — everything that needs real
+    nesting support (\\frac, \\sqrt, ^{}, _{}, and the generic
+    \\command{...} catch-all) instead of a regex that only ever matches a
+    single flat {...} group. Recurses into each argument it extracts, so
+    \\frac{3 \\pm \\sqrt{9+16}}{2} resolves the inner \\sqrt before the
+    outer \\frac ever decides whether its numerator needs wrapping in
+    parens."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "\\" and ch != "^" and ch != "_":
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "^" or ch == "_":
+            if i + 1 < n and text[i + 1] == "{":
+                close = _find_matching_brace(text, i + 1)
+                if close != -1:
+                    inner = _process_latex_spans(text[i + 2 : close])
+                    wrapped = _latex_wrap_if_needed(inner)
+                    out.append(f"^{wrapped}" if ch == "^" else wrapped)
+                    i = close + 1
+                    continue
+            out.append(ch)
+            i += 1
+            continue
+
+        # ch == "\\" from here on.
+        if text[i : i + 5] == "\\frac" and text[i + 5 : i + 6] == "{":
+            close1 = _find_matching_brace(text, i + 5)
+            if close1 != -1 and text[close1 + 1 : close1 + 2] == "{":
+                close2 = _find_matching_brace(text, close1 + 1)
+                if close2 != -1:
+                    num = _process_latex_spans(text[i + 6 : close1])
+                    den = _process_latex_spans(text[close1 + 2 : close2])
+                    out.append(f"{_latex_wrap_if_needed(num)}/{_latex_wrap_if_needed(den)}")
+                    i = close2 + 1
+                    continue
+        if text[i : i + 5] == "\\sqrt" and text[i + 5 : i + 6] == "{":
+            close = _find_matching_brace(text, i + 5)
+            if close != -1:
+                inner = _process_latex_spans(text[i + 6 : close])
+                out.append(f"√{_latex_wrap_if_needed(inner)}")
+                i = close + 1
+                continue
+
+        m = _LATEX_SYMBOL_RE.match(text, i)
+        if m:
+            out.append(_LATEX_SYMBOLS[m.group(1)])
+            i = m.end()
+            continue
+
+        m = _LATEX_NOARG_RE.match(text, i)
+        if m:
+            i = m.end()
+            continue
+
+        m = re.match(r"\\[a-zA-Z]+", text[i:])
+        if m and text[i + m.end() : i + m.end() + 1] == "{":
+            open_idx = i + m.end()
+            close = _find_matching_brace(text, open_idx)
+            if close != -1:
+                out.append(_process_latex_spans(text[open_idx + 1 : close]))
+                i = close + 1
+                continue
+        if m:
+            i += m.end()
+            continue
+
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _convert_latex(text: str) -> str:
@@ -426,25 +531,17 @@ def _convert_latex(text: str) -> str:
     first would turn a literal backslash/brace into an HTML entity before
     this ever gets a chance to parse it.
 
-    Deliberately approximate, not a full LaTeX parser: \\frac/^{}/_{}/\\sqrt
-    only match a single, non-nested brace group, so a nested expression
-    like \\frac{1}{x+\\sqrt{2}} only partially simplifies — an accepted
-    limit for a point-fix, not a structural one (the leftover LaTeX is
-    still visible rather than mis-rendered or dropped)."""
+    Delimiter unwrapping ($$/$/\\(/\\[) is flat regex — those markers never
+    nest. Everything else goes through _process_latex_spans, which DOES
+    handle nesting (a regex matching a single {...} group got \\frac{3 \\pm
+    \\sqrt{9+16}}{2} wrong: the denominator came out as a stray "{2}"
+    because the nested \\sqrt's braces confused where the numerator's own
+    closing brace was)."""
     text = _LATEX_PAREN_RE.sub(r"\1", text)
     text = _LATEX_BRACKET_RE.sub(r"\1", text)
     text = _LATEX_DISPLAY_DOLLAR_RE.sub(r"\1", text)
     text = _LATEX_INLINE_DOLLAR_RE.sub(r"\1", text)
-
-    text = _LATEX_FRAC_RE.sub(r"\1/\2", text)
-    text = _LATEX_SUP_RE.sub(r"^\1", text)
-    text = _LATEX_SUB_RE.sub(r"\1", text)
-    text = _LATEX_SQRT_RE.sub(r"√\1", text)
-
-    text = _LATEX_SYMBOL_RE.sub(lambda m: _LATEX_SYMBOLS[m.group(1)], text)
-    text = _LATEX_COMMAND_WITH_ARG_RE.sub(r"\1", text)
-    text = _LATEX_BARE_COMMAND_RE.sub("", text)
-    return text
+    return _process_latex_spans(text)
 
 
 _MD_CODE_RE = re.compile(r"`([^`\n]+?)`")
