@@ -1241,16 +1241,18 @@ if POLLINATIONS_API_KEY:
     _HELP_IMAGE_BULLET = (
         "• <b>Картинки</b> — кнопка «Картинка» в меню (или «нарисуй ...») рисует "
         "с нуля; фото с подписью там же — редактирует именно это фото (например: "
-        "«добавь усы»). Кнопки «Ещё раз» / «Изменить» под готовой картинкой — "
-        "повторить или доработать.\n"
+        "«добавь усы»). Под готовой картинкой — кнопки «Ещё раз» / «Изменить» "
+        "(повторить или доработать) и «Новая картинка» / «Меню» — не нужно "
+        "искать старое сообщение, чтобы продолжить.\n"
     )
 else:
     _HELP_IMAGE_BULLET = (
         "• <b>Картинки</b> — кнопка «Картинка» в меню (или «нарисуй ...») рисует "
         "с нуля; фото с подписью там же — нарисует похожую картинку с учётом "
         "правки (не точное редактирование пикселей, а новая картинка по "
-        "описанию фото). Кнопки «Ещё раз» / «Изменить» под готовой картинкой — "
-        "повторить или доработать.\n"
+        "описанию фото). Под готовой картинкой — кнопки «Ещё раз» / «Изменить» "
+        "(повторить или доработать) и «Новая картинка» / «Меню» — не нужно "
+        "искать старое сообщение, чтобы продолжить.\n"
     )
 
 HELP_TEXT = (
@@ -1935,7 +1937,14 @@ def image_actions_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="🔁 Ещё раз", callback_data="img:retry"),
                 InlineKeyboardButton(text="✏️ Изменить", callback_data="img:edit"),
-            ]
+            ],
+            # Правка: without these, continuing to generate or getting back
+            # to the menu meant scrolling up to find the original "Картинка"
+            # menu message — now both are one tap from the result itself.
+            [
+                InlineKeyboardButton(text="🎨 Новая картинка", callback_data="img:new"),
+                InlineKeyboardButton(text="◀️ Меню", callback_data="menu:back"),
+            ],
         ]
     )
 
@@ -2191,6 +2200,18 @@ async def cb_image_edit(callback: CallbackQuery, state: FSMContext) -> None:
             "✏️ Опишите, что изменить (например: «сделай фон синим», «добавь очки») — "
             "сгенерирую картинку заново с учётом правки."
         )
+
+
+@router.callback_query(F.data == "img:new")
+async def cb_image_new(callback: CallbackQuery, state: FSMContext) -> None:
+    """Starts a brand-new generation (not "ещё раз" with the same prompt,
+    not "изменить" on top of the current image) right from the result
+    itself, without touching last_image_prompt/last_image_mode — those
+    stay pointed at the picture just sent, so "Ещё раз"/"Изменить" under
+    it keep working even after this button is used elsewhere."""
+    await callback.answer()
+    await state.set_state(Form.waiting_for_image_prompt)
+    await callback.message.answer(IMAGE_INTRO_TEXT)
 
 
 @router.message(Form.waiting_for_image_edit, F.text & ~F.text.startswith("/"))
@@ -2788,14 +2809,28 @@ async def cmd_refund(message: Message) -> None:
 
 
 def _chatlog_text(target_label: str, rows: list[tuple]) -> str:
-    lines = [f"Чат с {target_label} (последние {len(rows)}):\n"]
+    """Was one dense block — no blank lines between turns, no bold, raw
+    stored UTC timestamps — hard to scan for more than a couple of
+    messages. Now each turn is its own paragraph with a bold speaker label
+    and a local-time timestamp. Message content is raw user/model text and
+    can contain literal '<'/'&' that would otherwise break HTML parsing
+    (bit the old plain-text-only version of this screen before) — escaped
+    via _escape_html_text, so only the speaker label/timestamp (written by
+    this function itself, never from user content) render as real markup."""
+    header = f"💬 <b>Чат с {_escape_html_text(target_label)}</b> (последние {len(rows)})"
+    turns = []
     for role, content, created_at in rows:
-        who = "[Я]" if role == "user" else "[Бот]"
+        who = "🙋 Пользователь" if role == "user" else "🤖 Бот"
+        when = _format_local_time(created_at)
         text = content if len(content) <= 300 else content[:300] + "…"
-        lines.append(f"{who} [{created_at}] {text}")
-    full_text = "\n".join(lines)
+        turns.append(f"<b>{who}</b> · <i>{when}</i>\n{_escape_html_text(text)}")
+    full_text = header + "\n\n" + "\n\n".join(turns)
     if len(full_text) > 3500:
         full_text = full_text[-3500:]
+        # Don't start mid-paragraph after the cut, if avoidable.
+        cut = full_text.find("\n\n")
+        if cut != -1:
+            full_text = full_text[cut + 2 :]
     return full_text
 
 
@@ -2814,10 +2849,10 @@ async def cb_admin_chatlog(callback: CallbackQuery) -> None:
     if not rows:
         await _edit_or_send(callback, "Нет сообщений для этого пользователя.", kb)
         return
-    # Chat content is raw user/model text and can contain stray '<'/'&' that
-    # would crash HTML parsing (this bit the old menus before), so this
-    # screen is sent as plain text rather than risking that.
-    await _edit_or_send(callback, _chatlog_text(str(uid), rows), kb, parse_mode=None)
+    # _chatlog_text escapes the raw content itself now (see its docstring),
+    # so this renders as real HTML (bold speaker labels) instead of the
+    # plain-text fallback this screen used before.
+    await _edit_or_send(callback, _chatlog_text(str(uid), rows), kb)
 
 
 @router.message(Command("grant"))
@@ -2883,7 +2918,7 @@ async def cmd_chatlog(message: Message) -> None:
     if not rows:
         await message.answer("Нет сообщений для этого пользователя.")
         return
-    await message.answer(_chatlog_text(parts[1], rows), parse_mode=None)
+    await message.answer(_chatlog_text(parts[1], rows))
 
 
 @router.message(Command("notes_of"))
