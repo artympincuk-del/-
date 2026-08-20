@@ -22,11 +22,10 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     LabeledPrice,
     Message,
     PreCheckoutQuery,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from PIL import Image
 from pypdf import PdfReader
@@ -219,17 +218,15 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+# Правка: this used to be a persistent reply-keyboard ("📋 Меню" pinned
+# under the compose box on every message) that did exactly what /menu
+# already does — a second, always-visible path to the same one action,
+# permanently eating screen space for no extra function. Removed; /menu is
+# already a registered command (shows in Telegram's own "/" list). The
+# text constant survives only so btn_legacy_persistent_menu below can still
+# recognize a still-pinned button on a chat that hasn't seen the removal
+# yet — see cmd_start's ReplyKeyboardRemove().
 PERSISTENT_MENU_BTN = "📋 Меню"
-
-
-def persistent_keyboard() -> ReplyKeyboardMarkup:
-    """Small always-visible bottom keyboard so the menu is reachable even
-    after the inline menu card has scrolled out of view — unlike inline
-    keyboards, this stays pinned regardless of how much the chat scrolls."""
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=PERSISTENT_MENU_BTN)]],
-        resize_keyboard=True,
-    )
 
 
 def is_admin(user_id: int) -> bool:
@@ -1185,8 +1182,11 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         f"можно кнопкой «{BTN_MODEL}».\n\n"
         "Переписка сохраняется и может просматриваться поддержкой при разборе "
         "обращений и ошибок.\n\n"
-        "Кнопка «📋 Меню» внизу — всегда под рукой. Подробнее — «Помощь».",
-        reply_markup=persistent_keyboard(),
+        "Открыть меню в любой момент — команда /menu. Подробнее — «Помощь».",
+        # Клавиатура-плашка с одной кнопкой «Меню» (дублировала /menu) убрана —
+        # ReplyKeyboardRemove() снимает её, если она ещё висит у вернувшегося
+        # пользователя с прошлой версии бота.
+        reply_markup=ReplyKeyboardRemove(),
     )
     await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
 
@@ -1198,7 +1198,14 @@ async def cmd_menu(message: Message, state: FSMContext) -> None:
 
 
 @router.message(F.text == PERSISTENT_MENU_BTN)
-async def btn_persistent_menu(message: Message, state: FSMContext) -> None:
+async def btn_legacy_persistent_menu(message: Message, state: FSMContext) -> None:
+    """Compatibility shim, not something newly offered: a user who hasn't
+    re-run /start since the persistent reply-keyboard was removed may still
+    have "📋 Меню" pinned client-side (Telegram keeps a reply keyboard until
+    something explicitly replaces/clears it). Without this, tapping that
+    stale button would just send its text as an ordinary message and get
+    treated as a chat question, wasting a quota slot on nothing. Safe to
+    delete once it's reasonable to assume nobody has the old button anymore."""
     await state.set_state(None)
     await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
 
@@ -2336,20 +2343,25 @@ ADMIN_MENU_TEXT = (
 # by topic, with its argument syntax and a one-line description. Exists so an
 # admin can find "how do I do X" without reading handlers.py; keep this in
 # sync whenever an admin command is added, renamed, or its arguments change.
+#
+# Commands are bold (<b>), never <code> — Telegram auto-detects a bare
+# "/command" token as a tappable bot-command entity, but suppresses that
+# detection inside <code>/<pre> (meant to render literally, unlinked). Bold
+# still reads as visually distinct without losing tap-to-fill.
 ADMIN_HELP_CATEGORIES = {
     "users": {
         "label": "👤 Пользователи и баланс",
         "text": (
             "👤 <b>Пользователи и баланс</b>\n\n"
-            "<code>/users</code>\n"
+            "<b>/users</b>\n"
             "Список всех пользователей: выбранная модель, использовано сегодня "
             "(free/premium), бонусные сообщения, последняя активность. Без аргументов.\n\n"
-            "<code>/grant &lt;@username или id&gt; &lt;amount&gt;</code>\n"
+            "<b>/grant</b> &lt;@username или id&gt; &lt;amount&gt;\n"
             "Начислить бонусные сообщения. Отрицательное число — списать. "
-            "Пример: <code>/grant @ivan 20</code>\n\n"
-            "<code>/chatlog &lt;@username или id&gt; [N]</code>\n"
+            "Пример: <b>/grant</b> @ivan 20\n\n"
+            "<b>/chatlog</b> &lt;@username или id&gt; [N]\n"
             "Последние N сообщений переписки пользователя с ботом (по умолчанию 20).\n\n"
-            "<code>/notes_of &lt;@username или id&gt;</code>\n"
+            "<b>/notes_of</b> &lt;@username или id&gt;\n"
             "Заметки пользователя, сохранённые через /remember — пригождается при "
             "разборе жалоб на тон ответов.\n\n"
             "💡 То же самое, плюс кнопки +10/+50/-10 к балансу, подарок безлимита/подписки "
@@ -2361,7 +2373,7 @@ ADMIN_HELP_CATEGORIES = {
         "label": "💳 Платежи",
         "text": (
             "💳 <b>Платежи</b>\n\n"
-            "<code>/refund &lt;telegram_payment_charge_id&gt;</code>\n"
+            "<b>/refund</b> &lt;telegram_payment_charge_id&gt;\n"
             "Вернуть звёзды за платёж и списать то, что он дал (сообщения/подписку/"
             "безлимит). Тот же charge_id, что и у кнопки «Возврат» на карточке "
             "пользователя (👥 Пользователи → выбрать пользователя → платёж)."
@@ -2371,24 +2383,24 @@ ADMIN_HELP_CATEGORIES = {
         "label": "🎟 Промокоды",
         "text": (
             "🎟 <b>Промокоды</b>\n\n"
-            "<code>/promo_add &lt;код&gt; &lt;название партнёра&gt; &lt;бонус_минут&gt; "
-            "&lt;доля_%&gt; &lt;окно_дней&gt;</code>\n"
+            "<b>/promo_add</b> &lt;код&gt; &lt;название партнёра&gt; &lt;бонус_минут&gt; "
+            "&lt;доля_%&gt; &lt;окно_дней&gt;\n"
             "Создать промокод для партнёра. Пример: "
-            "<code>/promo_add tt1 Иван TikTok 4320 40 30</code>\n\n"
-            "<code>/promo_off &lt;код&gt;</code>\n"
+            "<b>/promo_add</b> tt1 Иван TikTok 4320 40 30\n\n"
+            "<b>/promo_off</b> &lt;код&gt;\n"
             "Выключить промокод. Уже привязанные пользователи и их оплаты внутри окна "
             "атрибуции продолжают засчитываться.\n\n"
-            "<code>/promo_list</code>\n"
+            "<b>/promo_list</b>\n"
             "Список всех промокодов со статусом и статистикой. Без аргументов.\n\n"
-            "<code>/promo_stat &lt;код&gt;</code>\n"
+            "<b>/promo_stat</b> &lt;код&gt;\n"
             "Подробная статистика по одному промокоду.\n\n"
-            "<code>/promo_users &lt;код&gt;</code>\n"
+            "<b>/promo_users</b> &lt;код&gt;\n"
             "Кто именно перешёл: username или id, дата, сколько сообщений отправил, "
             "покупал ли что-то, внутри окна атрибуции или нет. Постранично по 10.\n\n"
-            "<code>/promo_owner &lt;код&gt; &lt;@username или id&gt;</code>\n"
+            "<b>/promo_owner</b> &lt;код&gt; &lt;@username или id&gt;\n"
             "Назначить владельца промокода — ему становится доступна статистика через "
             "/mypromo. <code>0</code> вместо адресата — снять владельца.\n\n"
-            "<code>/promo_token &lt;код&gt; [new]</code>\n"
+            "<b>/promo_token</b> &lt;код&gt; [new]\n"
             "Показать секретное слово для привязки промокода партнёром (командой "
             "/promo). С <code>new</code> — перегенерировать; старое слово перестаёт "
             "работать."
@@ -2398,7 +2410,7 @@ ADMIN_HELP_CATEGORIES = {
         "label": "🛠 Система",
         "text": (
             "🛠 <b>Система</b>\n\n"
-            "<code>/backup</code>\n"
+            "<b>/backup</b>\n"
             "Прислать дамп базы данных .db файлом лично тебе в этот чат. Без аргументов."
         ),
     },
