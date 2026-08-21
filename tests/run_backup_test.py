@@ -136,22 +136,35 @@ async def run():
     t.start()
     time.sleep(0.05)  # let the writer get going first
 
-    concurrent_dest = "/tmp/pricing_test/concurrent_backup.db"
-    if os.path.exists(concurrent_dest):
-        os.remove(concurrent_dest)
-    await asyncio.to_thread(db.backup_database, concurrent_dest)
-    stop_writing.set()
-    t.join(timeout=2)
+    # The destination directory is created here and removed with everything
+    # in it, rather than assuming some path already exists on the machine:
+    # this used to point at a hardcoded /tmp/pricing_test/, which only
+    # existed as leftovers from earlier runs — on a clean machine
+    # sqlite3.connect() failed outright with "unable to open database file".
+    with tempfile.TemporaryDirectory() as concurrent_dir:
+        concurrent_dest = os.path.join(concurrent_dir, "concurrent_backup.db")
+        await asyncio.to_thread(db.backup_database, concurrent_dest)
+        stop_writing.set()
+        t.join(timeout=2)
 
-    concurrent_conn = sqlite3.connect(concurrent_dest)
-    cur = concurrent_conn.execute("PRAGMA integrity_check")
-    integrity = cur.fetchone()[0]
-    check(f"backup taken during concurrent writes passes integrity_check (got {integrity!r})", integrity == "ok")
-    cur = concurrent_conn.execute("SELECT COUNT(*) FROM players")
-    (concurrent_players,) = cur.fetchone()
-    check(f"concurrent backup has a plausible player count (got {concurrent_players})", concurrent_players > original_players)
-    concurrent_conn.close()
-    os.remove(concurrent_dest)
+        concurrent_conn = sqlite3.connect(concurrent_dest)
+        try:
+            cur = concurrent_conn.execute("PRAGMA integrity_check")
+            integrity = cur.fetchone()[0]
+            check(
+                f"backup taken during concurrent writes passes integrity_check (got {integrity!r})",
+                integrity == "ok",
+            )
+            cur = concurrent_conn.execute("SELECT COUNT(*) FROM players")
+            (concurrent_players,) = cur.fetchone()
+            check(
+                f"concurrent backup has a plausible player count (got {concurrent_players})",
+                concurrent_players > original_players,
+            )
+        finally:
+            # Must close before the TemporaryDirectory is torn down, or the
+            # open handle keeps the file alive/undeletable on some platforms.
+            concurrent_conn.close()
 
     # --- 5. BACKUP_HOUR=off disables the scheduler ---
     check("_parse_backup_hour('off') -> None", _parse_backup_hour("off") is None)
