@@ -11,6 +11,14 @@ os.environ["DB_PATH"] = os.path.join(tempfile.gettempdir(), "klyaksa_bot_tests",
 os.environ["BOT_TOKEN"] = "dummy"
 os.environ["GROQ_API_KEY"] = "dummy"
 os.environ["ADMIN_IDS"] = "9999"
+# Start from an empty DB like every other test file here — this one reads no
+# stored state, but inheriting a database from a previous run is exactly the
+# kind of machine-state dependency that makes a suite pass locally and fail
+# on a clean checkout.
+for ext in ("", "-wal", "-shm"):
+    p = os.environ["DB_PATH"] + ext
+    if os.path.exists(p):
+        os.remove(p)
 
 from bot import handlers  # noqa: E402
 
