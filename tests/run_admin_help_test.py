@@ -112,7 +112,7 @@ async def run():
     # admin-only command mentioned actually exists as a registered handler.
     # ------------------------------------------------------------------
     all_admin_commands = {
-        "users", "grant", "chatlog", "notes_of", "refund",
+        "users", "grant", "chatlog", "notes_of", "refund", "payers",
         "promo_add", "promo_off", "promo_list", "promo_stat", "promo_users", "promo_owner",
         "promo_token", "backup",
     }

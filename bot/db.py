@@ -1560,6 +1560,86 @@ def list_recent_payments(user_id: int, limit: int = 5) -> list[tuple]:
         return cur.fetchall()
 
 
+def get_payers_summary() -> dict:
+    """Правка 2.5: the header numbers for /payers. `repeat_payers` is the
+    one that actually matters — total revenue says how much came in, but
+    how many people came back for a SECOND purchase says whether the thing
+    is worth selling at all. Refunded payments are excluded everywhere
+    here (a refund isn't revenue, and a refunded first purchase isn't a
+    returning customer either)."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(total), 0) FROM ("
+            "  SELECT SUM(amount_stars) AS total FROM payments "
+            "  WHERE status = 'paid' GROUP BY user_id"
+            ")"
+        )
+        payers, revenue = cur.fetchone()
+
+        cur = _conn.execute(
+            "SELECT COUNT(*) FROM ("
+            "  SELECT user_id FROM payments WHERE status = 'paid' "
+            "  GROUP BY user_id HAVING COUNT(*) > 1"
+            ")"
+        )
+        (repeat_payers,) = cur.fetchone()
+
+        return {"payers": payers, "revenue_stars": revenue, "repeat_payers": repeat_payers}
+
+
+def count_payers() -> int:
+    with _lock:
+        cur = _conn.execute(
+            "SELECT COUNT(*) FROM (SELECT user_id FROM payments WHERE status = 'paid' GROUP BY user_id)"
+        )
+        return cur.fetchone()[0]
+
+
+def list_payers(limit: int, offset: int) -> list[dict]:
+    """One row per person who has ever paid, biggest spender first. Only
+    'paid' rows count toward the totals; a user who has ALSO had a refund
+    is flagged (has_refunds) so that shows up in the list without quietly
+    inflating what they're worth. Joined against players for the live
+    subscription/bonus state, since "paid once, months ago, nothing active
+    now" and "paying subscriber" read very differently."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT p.user_id, "
+            "       COALESCE(pl.username, p.username) AS username, "
+            "       COUNT(*) AS payments_count, "
+            "       SUM(p.amount_stars) AS total_stars, "
+            "       MAX(p.created_at) AS last_paid_at, "
+            "       pl.subscription_until, "
+            "       COALESCE(pl.bonus_credits, 0) AS bonus_credits, "
+            "       EXISTS(SELECT 1 FROM payments r "
+            "              WHERE r.user_id = p.user_id AND r.status = 'refunded') AS has_refunds "
+            "FROM payments p "
+            "LEFT JOIN players pl ON pl.user_id = p.user_id "
+            "WHERE p.status = 'paid' "
+            "GROUP BY p.user_id "
+            "ORDER BY total_stars DESC, last_paid_at DESC "
+            "LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "user_id": uid,
+                "username": username,
+                "payments_count": payments_count,
+                "total_stars": total_stars,
+                "last_paid_at": last_paid_at,
+                "subscription_until": _active_unlimited_until(subscription_until),
+                "bonus_credits": bonus_credits,
+                "has_refunds": bool(has_refunds),
+            }
+            for (
+                uid, username, payments_count, total_stars, last_paid_at,
+                subscription_until, bonus_credits, has_refunds,
+            ) in rows
+        ]
+
+
 def refund_payment(charge_id: str) -> dict | None:
     """Marks a 'paid' payment 'refunded' and reverses its credit: bonus
     credits are clamped at 0 (never taken negative — if the user already
