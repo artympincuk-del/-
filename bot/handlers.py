@@ -600,6 +600,40 @@ def _convert_markdown(text: str) -> str:
     return text
 
 
+# Правка 1: the system prompt already tells the model to keep <code> for
+# real code and formulas only, and it mostly obeys — but it still ships
+# things like «выключи <code>кнопку</code> или <code>выключатель</code>»,
+# which renders as monospace speckle in the middle of a sentence and reads
+# badly on a phone. The instruction lowers the rate; it doesn't fix it, so
+# the tags come off here on the way out too.
+#
+# Only ONE shape is unwrapped: content that is entirely Cyrillic letters,
+# spaces and hyphens. Anything with a digit, a Latin letter, a bracket, an
+# operator or an underscore is left alone — that covers formulas ("x^2 + 1"),
+# identifiers ("print(x)"), bot commands ("/start") and snippets, all of
+# which are exactly what <code> is for.
+_PLAIN_WORD_CODE_RE = re.compile(r"<code>([А-Яа-яЁё][А-Яа-яЁё \-]*)</code>")
+# Everything between <pre> and </pre> is passed through verbatim — a <pre>
+# block is multi-line program output, and even a <code> nested inside one
+# is part of that block, not a stray word in a sentence.
+_PRE_BLOCK_RE = re.compile(r"<pre>.*?</pre>", re.DOTALL)
+
+
+def _unwrap_plain_code(text: str) -> str:
+    """Drops <code>…</code> around ordinary Russian words, leaving <pre>
+    blocks (and their contents) exactly as the model wrote them. The
+    content pattern itself has no newline in its character class, so a
+    multi-line snippet can't match even outside a <pre>."""
+    out = []
+    pos = 0
+    for m in _PRE_BLOCK_RE.finditer(text):
+        out.append(_PLAIN_WORD_CODE_RE.sub(r"\1", text[pos : m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(_PLAIN_WORD_CODE_RE.sub(r"\1", text[pos:]))
+    return "".join(out)
+
+
 _HTML_ALLOWED_TAGS = {"b", "i", "u", "s", "code", "pre"}
 _HTML_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)>")
 # Matches a whole trusted <a href="...">title</a> source-link pair (see
@@ -710,13 +744,16 @@ async def _send_long(
     """Telegram rejects messages over ~4096 chars outright; split instead of crashing.
     Each chunk goes through _convert_latex, then _convert_markdown (turns
     stray **bold**/`code` the model wrote despite instructions not to into
-    real tags), then _sanitize_model_html — strictly in that order, so
-    escaping never runs on a backslash/brace before LaTeX has had a chance
-    to parse it. _sanitize_model_html renders the model's <b>/<i>/<code>
-    formatting while stray '<'/'>' (e.g. from math) can never break
-    parsing. If Telegram still rejects a chunk for some other reason, the
-    fallback strips markup down to plain text instead of ever showing raw
-    tags. `reply_markup` (if given) is attached only to the last chunk.
+    real tags), then _unwrap_plain_code (drops <code> from ordinary Russian
+    words — it runs AFTER _convert_markdown so that backtick-`код` the model
+    wrote in Markdown is unwrapped too, not just literal <code> tags), then
+    _sanitize_model_html — strictly in that order, so escaping never runs on
+    a backslash/brace before LaTeX has had a chance to parse it.
+    _sanitize_model_html renders the model's <b>/<i>/<code> formatting while
+    stray '<'/'>' (e.g. from math) can never break parsing. If Telegram
+    still rejects a chunk for some other reason, the fallback strips markup
+    down to plain text instead of ever showing raw tags.
+    `reply_markup` (if given) is attached only to the last chunk.
     `trusted_suffix` (if given) is caller-vetted HTML — e.g.
     _build_sources_html's source-links block, built from data this bot
     fetched itself, not model output — appended to the LAST chunk AFTER
@@ -728,7 +765,9 @@ async def _send_long(
     ] or [""]
     for i, chunk in enumerate(chunks):
         markup = reply_markup if i == len(chunks) - 1 else None
-        safe_chunk = _sanitize_model_html(_convert_markdown(_convert_latex(chunk)))
+        safe_chunk = _sanitize_model_html(
+            _unwrap_plain_code(_convert_markdown(_convert_latex(chunk)))
+        )
         if i == len(chunks) - 1 and trusted_suffix:
             safe_chunk += trusted_suffix
         try:

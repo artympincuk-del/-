@@ -55,12 +55,23 @@ def history_turn(role, content):
     return {"role": role, "content": content}
 
 
+# The system prompt is untouchable overhead inside REQUEST_TOKEN_BUDGET —
+# only history is trimmed against it. So a synthetic "small budget" has to
+# be expressed RELATIVE to the real prompt, not as a bare number: hardcoding
+# 1200 silently stopped meaning "tight but workable" the moment the prompt
+# itself grew past it (which is exactly what happened when the clarify-
+# instead-of-guess rules were added), and every history turn got dropped.
+_SYSTEM_PROMPT_TOKENS = ai._estimate_tokens(ai._build_system_prompt(None))
+# Room for a couple of the 10 history turns, nowhere near all of them.
+_TIGHT_BUDGET = _SYSTEM_PROMPT_TOKENS + 100
+
+
 async def run():
     # ------------------------------------------------------------------
     # Scenario 1: history trimmed under budget, system + current message
     # always present.
     # ------------------------------------------------------------------
-    ai.REQUEST_TOKEN_BUDGET = 1200  # small budget on purpose, forces trimming
+    ai.REQUEST_TOKEN_BUDGET = _TIGHT_BUDGET  # small budget on purpose, forces trimming
     long_history = [
         history_turn("user" if i % 2 == 0 else "assistant", "слово " * 20)
         for i in range(10)
@@ -92,7 +103,10 @@ async def run():
     # Scenario 5: a lone over-budget current message is sent with NO
     # history, and is not itself truncated on the first attempt.
     # ------------------------------------------------------------------
-    ai.REQUEST_TOKEN_BUDGET = 700  # fits the system prompt alone, not system+huge message
+    # Same reasoning as _TIGHT_BUDGET: expressed relative to the real
+    # prompt. Enough for the system prompt plus a little, nowhere near
+    # enough for the huge message below — so history has to go.
+    ai.REQUEST_TOKEN_BUDGET = _SYSTEM_PROMPT_TOKENS + 50
     huge_message = "очень " * 500  # the message itself is what blows the budget
     small_history = [history_turn("user", "привет"), history_turn("assistant", "привет!")]
     calls.clear()
