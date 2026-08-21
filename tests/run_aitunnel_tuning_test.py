@@ -129,7 +129,10 @@ async def run():
     )
 
     # ------------------------------------------------------------------
-    # 4. /start and HELP_TEXT mention model choice, using constants.
+    # 4. HELP_TEXT explains the model choice, using constants — /start
+    #    deliberately does NOT (Правка 4.4: a brand-new user shouldn't be
+    #    handed a choice between models before seeing a single answer;
+    #    two thirds of arrivals were leaving without sending anything).
     # ------------------------------------------------------------------
     check("help/start: fast model label constant matches MODEL_OPTIONS", handlers._FAST_MODEL_LABEL == handlers.MODEL_OPTIONS[("fast", "gptoss")]["label"])
     check("help/start: premium model label constant matches MODEL_OPTIONS", handlers._PREMIUM_MODEL_LABEL == handlers.MODEL_OPTIONS[("premium", "gptoss")]["label"])
@@ -161,9 +164,13 @@ async def run():
 
     await handlers.cmd_start(FakeStartMessage(), FakeState())
     welcome_text = sent_texts[0]
-    check("/start: mentions the Модель button", handlers.BTN_MODEL in welcome_text)
-    check("/start: mentions the fast model label", handlers._FAST_MODEL_LABEL in welcome_text)
-    check("/start: mentions the premium model label", handlers._PREMIUM_MODEL_LABEL in welcome_text)
+    check("/start: does NOT push the model choice at a brand-new user", handlers.BTN_MODEL not in welcome_text)
+    check("/start: does not name the fast model", handlers._FAST_MODEL_LABEL not in welcome_text)
+    check("/start: does not name the premium model", handlers._PREMIUM_MODEL_LABEL not in welcome_text)
+    check(
+        "/start: the model choice is still reachable — it's in the menu that follows",
+        any("Меню" in t for t in sent_texts),
+    )
 
     # ------------------------------------------------------------------
     # Model menu: Qwen 3.7 Flash removed (Правка 4 of the follow-up task

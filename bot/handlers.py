@@ -195,7 +195,16 @@ BTN_HELP = "❓ Помощь"
 BTN_REMINDER = "🔔 Напоминания"
 
 
+BTN_MORE = "⋯ Ещё"
+
+
 def main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Правка 5: four buttons plus "Ещё", not eight. Eight options on the
+    first screen is a choice a newcomer doesn't want to make — the four kept
+    here are the ones a new user actually needs (and "Помощь" specifically
+    stays on the FIRST level, never behind "Ещё"). Everything else is one
+    tap away under BTN_MORE, with the same callbacks as before, so nothing
+    became unreachable."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -203,17 +212,26 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text=BTN_MODEL, callback_data="menu:model"),
             ],
             [
-                InlineKeyboardButton(text=BTN_NOTES, callback_data="menu:notes"),
                 InlineKeyboardButton(text=BTN_IMAGE, callback_data="menu:image"),
+                InlineKeyboardButton(text=BTN_HELP, callback_data="menu:help"),
+            ],
+            [InlineKeyboardButton(text=BTN_MORE, callback_data="menu:more")],
+        ]
+    )
+
+
+def more_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=BTN_NOTES, callback_data="menu:notes"),
+                InlineKeyboardButton(text=BTN_REMINDER, callback_data="menu:reminder"),
             ],
             [
                 InlineKeyboardButton(text=BTN_INVITE, callback_data="menu:invite"),
                 InlineKeyboardButton(text=BTN_RESET, callback_data="menu:reset"),
             ],
-            [
-                InlineKeyboardButton(text=BTN_REMINDER, callback_data="menu:reminder"),
-                InlineKeyboardButton(text=BTN_HELP, callback_data="menu:help"),
-            ],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")],
         ]
     )
 
@@ -723,20 +741,76 @@ QUICK_ACTIONS = {
     "detail": "Дай больше деталей и разверни предыдущий ответ подробнее.",
     "simpler": "Объясни то же самое проще, другими словами, как для новичка.",
     "example": "Приведи ещё один похожий пример с решением.",
+    # Правка 3.2: re-checks the model's OWN previous answer. Phrased as
+    # "find the mistake", not "confirm it" — asked to confirm, a model
+    # mostly agrees with itself; asked to hunt for an error, it actually
+    # re-derives. Runs on the same model and costs a normal request.
+    "verify": (
+        "Перепроверь свой предыдущий ответ: пересчитай и перечитай условие заново, "
+        "найди в нём ошибку, если она есть. Отдельно проверь, не противоречит ли само "
+        "условие себе и хватает ли данных. Если ошибка есть — напиши исправленное "
+        "решение и укажи, в чём именно была ошибка. Если ошибки нет — коротко "
+        "подтверди ответ и покажи проверку, по которой это видно."
+    ),
 }
 
+# Правка 3.4: markers that make an answer look like it was about a task
+# worth re-checking — the "Перепроверить"/"Решить умной моделью" buttons
+# only show up for these, so an ordinary chat reply doesn't get two extra
+# buttons it has no use for.
+TASK_LIKE_WORDS = (
+    "реши", "решить", "найди", "найти", "вычисли", "посчитай", "сколько",
+    "докажи", "доказать", "уравнени", "задач", "упрости", "сократи",
+    "чему равно", "периметр", "площад", "объём", "объем", "скорость",
+    "процент", "дробь", "корень", "производн", "интеграл", "график",
+)
+_HAS_DIGIT_RE = re.compile(r"\d")
 
-def quick_actions_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🔍 Подробнее", callback_data="qa:detail"),
-                InlineKeyboardButton(text="💡 Проще", callback_data="qa:simpler"),
-                InlineKeyboardButton(text="📝 Пример", callback_data="qa:example"),
-            ],
-            [InlineKeyboardButton(text="📤 Поделиться", callback_data="qa:share")],
+
+def _looks_like_task(text: str) -> bool:
+    """Cheap heuristic (no model call): digits, a task-ish verb, or a plain
+    question mark at the end. Deliberately generous — the cost of a false
+    positive is two extra buttons nobody taps, while a false negative hides
+    the one feature that fixes a wrong answer."""
+    lowered = (text or "").lower()
+    if any(word in lowered for word in TASK_LIKE_WORDS):
+        return True
+    if _HAS_DIGIT_RE.search(lowered):
+        return True
+    return lowered.rstrip().endswith("?")
+
+
+# Правка 3.3: the "solve with the smart model" button targets whatever
+# MODEL_OPTIONS currently calls the premium multimodal option, rather than
+# hardcoding a model id here twice.
+SMART_MODEL_KEY = ("premium", "gemini")
+SMART_MODEL_ID = MODEL_OPTIONS[SMART_MODEL_KEY]["model"]
+
+
+def quick_actions_keyboard(
+    task_like: bool = False, answered_model: str | None = None
+) -> InlineKeyboardMarkup:
+    """`task_like`/`answered_model` come from the question that was just
+    answered (see _looks_like_task): the two extra task buttons are only
+    offered where they make sense, and "Решить умной моделью" is hidden
+    when the smart model is the one that already answered — offering it
+    there would just charge a second sub-limit unit for the same thing."""
+    rows = [
+        [
+            InlineKeyboardButton(text="🔍 Подробнее", callback_data="qa:detail"),
+            InlineKeyboardButton(text="💡 Проще", callback_data="qa:simpler"),
+            InlineKeyboardButton(text="📝 Пример", callback_data="qa:example"),
         ]
-    )
+    ]
+    if task_like:
+        task_row = [InlineKeyboardButton(text="🔎 Перепроверить", callback_data="qa:verify")]
+        if answered_model != SMART_MODEL_ID:
+            task_row.append(
+                InlineKeyboardButton(text="🧠 Решить умной моделью", callback_data="qa:smart")
+            )
+        rows.append(task_row)
+    rows.append([InlineKeyboardButton(text="📤 Поделиться", callback_data="qa:share")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def model_keyboard(status: dict, user_id: int) -> InlineKeyboardMarkup:
@@ -773,6 +847,15 @@ def model_keyboard(status: dict, user_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def _remaining(used: int, cap: int) -> str:
+    """Правка 5.3: "осталось 3 из 10" instead of "3/10". The bare fraction
+    was read backwards by real users — "0/10" looks like "zero available
+    out of ten" to some and "ten left" to others, and there's nothing in
+    the notation to settle it. Only for user-facing screens: the admin
+    card/`/users` keep the compact form (see Правка 5.4)."""
+    return f"осталось {max(0, cap - used)} из {cap}"
+
+
 def quota_denied_text(status: dict) -> str:
     tz_abbr = datetime.datetime.now(_QUOTA_TZINFO).strftime("%Z")
     if status.get("limit_source") == "promo":
@@ -782,34 +865,34 @@ def quota_denied_text(status: dict) -> str:
         if status["model_pref"] == "premium":
             return (
                 f"Дневной лимит бонуса по промокоду на премиум-запросы исчерпан "
-                f"({status['premium_used_today']}/{premium_cap}), а докупленных сообщений "
+                f"({_remaining(status['premium_used_today'], premium_cap)}), а докупленных сообщений "
                 f"не хватает. Бонус ещё действует, лимит обновится завтра в 00:00 {tz_abbr}. "
                 "Можно докупить пакет сообщений или час безлимита: /buy — либо "
                 "переключиться на быструю модель: /model"
             )
         return (
-            f"Дневной лимит бонуса по промокоду исчерпан ({status['used_today']}/{fast_cap} "
-            f"запросов). Бонус ещё действует, лимит обновится завтра в 00:00 {tz_abbr}. "
+            f"Дневной лимит бонуса по промокоду исчерпан "
+            f"({_remaining(status['used_today'], fast_cap)} запросов). Бонус ещё действует, лимит обновится завтра в 00:00 {tz_abbr}. "
             "Можно докупить пакет сообщений или час безлимита: /buy."
         )
     if status.get("limit_source") == "subscription":
         if status["model_pref"] == "premium":
             return (
                 f"Дневной лимит подписки на премиум-запросы исчерпан "
-                f"({status['premium_used_today']}/{SUBSCRIPTION_DAILY_PREMIUM_MESSAGES}), "
+                f"({_remaining(status['premium_used_today'], SUBSCRIPTION_DAILY_PREMIUM_MESSAGES)}), "
                 f"а докупленных сообщений не хватает. Обновится в 00:00 {tz_abbr}. "
                 "Можно докупить пакет сообщений или час безлимита: /buy — либо "
                 "переключиться на быструю модель: /model"
             )
         return (
-            f"Дневной лимит подписки исчерпан ({status['used_today']}/{SUBSCRIPTION_DAILY_MESSAGES} "
-            f"запросов). Обновится в 00:00 {tz_abbr}. Можно докупить пакет сообщений "
+            f"Дневной лимит подписки исчерпан "
+            f"({_remaining(status['used_today'], SUBSCRIPTION_DAILY_MESSAGES)} запросов). Обновится в 00:00 {tz_abbr}. Можно докупить пакет сообщений "
             "или час безлимита: /buy."
         )
     if status["model_pref"] == "premium":
         return (
             f"Бесплатные премиум-запросы на сегодня закончились "
-            f"({status['premium_used_today']}/{DAILY_FREE_PREMIUM_MESSAGES}), "
+            f"({_remaining(status['premium_used_today'], DAILY_FREE_PREMIUM_MESSAGES)}), "
             "а докупленных сообщений не хватает. "
             "Пополните баланс: /buy, либо переключитесь на быструю модель: /model"
         )
@@ -825,8 +908,9 @@ def _image_quota_denied_text(status: dict) -> str:
     premium chat tiers, so this doesn't need any subscription/promo
     branching the way quota_denied_text does."""
     return (
-        f"Дневной лимит картинок исчерпан ({status['images_used_today']}/"
-        f"{DAILY_FREE_IMAGE_MESSAGES}), а докупленных сообщений не хватает "
+        f"Дневной лимит картинок исчерпан "
+        f"({_remaining(status['images_used_today'], DAILY_FREE_IMAGE_MESSAGES)}), "
+        f"а докупленных сообщений не хватает "
         f"({PREMIUM_CREDIT_COST} за картинку). Пополните баланс: /buy — или "
         "дождитесь сброса в полночь."
     )
@@ -842,7 +926,8 @@ def _sublimit_denied_text(model: str, limit: int, used_today: int) -> str:
     label = _label_for_model_id(model)
     tz_abbr = datetime.datetime.now(_QUOTA_TZINFO).strftime("%Z")
     return (
-        f"Дневной лимит запросов к «{label}» на сегодня исчерпан ({used_today}/{limit}). "
+        f"Дневной лимит запросов к «{label}» на сегодня исчерпан "
+        f"({_remaining(used_today, limit)}). "
         "Остальные модели работают без ограничений сверх обычного дневного лимита — "
         f"переключитесь в «{BTN_MODEL}», или дождитесь обновления счётчика в 00:00 {tz_abbr}."
     )
@@ -1167,28 +1252,78 @@ async def _credit_referral_progress(bot, user_id: int) -> None:
         logger.exception("Referral credit failed for user_id=%s", user_id)
 
 
+# Правка 4: measured — 15 people opened the bot from a blogger's link and
+# only 5 ever sent a message. The old welcome opened with a greeting, then
+# explained two quota tiers, then two models, and only mentioned what to
+# actually DO at the very end. Now: the call to action is the first line,
+# limits are one line with no free/premium split (details live in «Помощь»),
+# and models aren't mentioned at all — a brand-new user shouldn't be handed
+# a choice before they've seen a single answer.
+#
+# The storage warning stays, deliberately: it's a notice to the user, not
+# copy to trim. Shortened to one sentence, not removed.
+WELCOME_TEXT = (
+    "📸 <b>Пришли фото задачи или напиши вопрос — решу и объясню по шагам.</b>\n\n"
+    "Понимаю текст, фото, голосовые и PDF.\n\n"
+    f"Бесплатно — {DAILY_FREE_MESSAGES} запросов в день, обновляются в 00:00. "
+    "Переписка сохраняется и может просматриваться поддержкой.\n\n"
+    "Не знаешь, с чего начать — нажми «Показать пример»."
+)
+
+# Static on purpose: this exists to show a hesitant newcomer a result
+# without making them formulate anything, so it must be instant and can't
+# fail — a live model call here would add latency and a failure mode at
+# exactly the moment the person is deciding whether to stay. Costs no quota
+# for the same reason: they haven't asked the bot anything yet.
+EXAMPLE_ANSWER_TEXT = (
+    "Вот как это выглядит. Задача:\n\n"
+    "<i>В корзине яблок втрое больше, чем груш. Всего фруктов 24. "
+    "Сколько груш?</i>\n\n"
+    "<b>Решение:</b>\n"
+    "1. Пусть груш — x, тогда яблок — 3x.\n"
+    "2. Всего: x + 3x = 24, то есть 4x = 24.\n"
+    "3. x = 24 / 4 = 6.\n\n"
+    "<b>Ответ: 6 груш</b> (и 18 яблок).\n\n"
+    "✅ <b>Проверка:</b> 6 + 18 = 24, и 18 в три раза больше 6 — сходится.\n\n"
+    "Теперь пришли своё задание — фото, текстом или голосом."
+)
+
+BTN_EXAMPLE = "✨ Показать пример"
+
+
+def welcome_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=BTN_EXAMPLE, callback_data="menu:example")]
+        ]
+    )
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await _apply_referral(message)
     await _apply_promo(message)
-    await message.answer(
-        "🤖 <b>Привет! Я AI-ассистент.</b>\n"
-        "Пиши текстом, голосом, присылай фото или PDF — отвечу на всё.\n\n"
-        f"Бесплатно: <b>{DAILY_FREE_MESSAGES}</b> сообщений в день "
-        f"(+{DAILY_FREE_PREMIUM_MESSAGES} премиум), сброс в 00:00.\n\n"
-        f"Есть быстрая модель ({_FAST_MODEL_LABEL}) для простых вопросов и более "
-        f"сильная ({_PREMIUM_MODEL_LABEL}) для разбора сложных задач — переключить "
-        f"можно кнопкой «{BTN_MODEL}».\n\n"
-        "Переписка сохраняется и может просматриваться поддержкой при разборе "
-        "обращений и ошибок.\n\n"
-        "Открыть меню в любой момент — команда /menu. Подробнее — «Помощь».",
-        # Клавиатура-плашка с одной кнопкой «Меню» (дублировала /menu) убрана —
-        # ReplyKeyboardRemove() снимает её, если она ещё висит у вернувшегося
-        # пользователя с прошлой версии бота.
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    # Клавиатура-плашка с одной кнопкой «Меню» (дублировала /menu) убрана —
+    # ReplyKeyboardRemove() снимает её, если она ещё висит у вернувшегося
+    # пользователя с прошлой версии бота. Отдельным сообщением, потому что
+    # снять reply-клавиатуру и показать inline-кнопку в одном сообщении
+    # нельзя: reply_markup там один.
+    await message.answer(WELCOME_TEXT, reply_markup=ReplyKeyboardRemove())
     await message.answer("📋 <b>Меню</b>", reply_markup=main_menu_keyboard())
+    await message.answer(
+        "Или посмотри, как я решаю задачи:", reply_markup=welcome_keyboard()
+    )
+
+
+@router.callback_query(F.data == "menu:example")
+async def cb_menu_example(callback: CallbackQuery) -> None:
+    """Правка 4.5: the main lever for the two thirds who open the bot and
+    never type anything — shows a finished result instead of asking them to
+    invent a request first."""
+    await callback.answer()
+    db.log_event(callback.from_user.id, "example_shown")
+    await callback.message.answer(EXAMPLE_ANSWER_TEXT)
 
 
 @router.message(Command("menu"))
@@ -1242,6 +1377,13 @@ async def cb_menu_back(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.set_state(None)
     await _edit_or_send(callback, "📋 <b>Меню</b>", main_menu_keyboard())
+
+
+@router.callback_query(F.data == "menu:more")
+async def cb_menu_more(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(None)
+    await _edit_or_send(callback, "⋯ <b>Ещё</b>", more_menu_keyboard())
 
 
 if POLLINATIONS_API_KEY:
@@ -1379,9 +1521,9 @@ def _balance_text(user_id: int, username: str | None) -> str:
         f"{subscription_line}"
         f"{promo_bonus_line}"
         f"Модель: {model_name}\n"
-        f"Быстрая, {usage_label}: {status['used_today']}/{daily_cap}\n"
-        f"Премиум, {usage_label}: {status['premium_used_today']}/{daily_premium_cap}\n"
-        f"Картинки сегодня: {status['images_used_today']}/{DAILY_FREE_IMAGE_MESSAGES}\n"
+        f"Быстрая, {usage_label}: {_remaining(status['used_today'], daily_cap)}\n"
+        f"Премиум, {usage_label}: {_remaining(status['premium_used_today'], daily_premium_cap)}\n"
+        f"Картинки сегодня: {_remaining(status['images_used_today'], DAILY_FREE_IMAGE_MESSAGES)}\n"
         f"Докупленные сообщения: <b>{status['bonus_credits']}</b>\n\n"
         f"Пополнить прямо здесь — выбери пакет ниже:"
     )
@@ -1956,12 +2098,28 @@ def image_actions_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _refuse_blocked_image(user_id: int) -> str:
+    """Правка 1.3/1.4: one place for what a blocked image request does —
+    log it for the admin counter and hand back the refusal text. Short and
+    without a lecture on purpose: no moralizing, and no list of what's
+    forbidden (that reads as a checklist of things to try next)."""
+    db.log_event(user_id, db.BLOCKED_IMAGE_EVENT)
+    logger.warning("Image prompt blocked by content filter (user_id=%s)", user_id)
+    return ai.IMAGE_BLOCKED_USER_MESSAGE
+
+
 async def _process_image_request(
     message: Message, state: FSMContext, prompt: str, user_id: int, username: str | None
 ) -> None:
     prompt = prompt.strip()
     if not prompt:
         await message.answer(IMAGE_INTRO_TEXT)
+        return
+
+    # Правка 1.3: checked BEFORE try_consume_image — a blocked request must
+    # not cost the user one of their daily images.
+    if ai.image_prompt_is_blocked(prompt):
+        await message.answer(_refuse_blocked_image(user_id))
         return
 
     # Its own daily pool — separate from premium chat, see try_consume_image.
@@ -2035,6 +2193,12 @@ async def _process_image_edit_request(
     prompt = prompt.strip()
     if not prompt:
         await message.answer(IMAGE_INTRO_TEXT)
+        return
+
+    # Same pre-quota filter as _process_image_request — an edit instruction
+    # ("раздень её") reaches the same image service.
+    if ai.image_prompt_is_blocked(prompt):
+        await message.answer(_refuse_blocked_image(user_id))
         return
 
     allowed, status = db.try_consume_image(
@@ -2487,6 +2651,8 @@ async def cb_admin_help_category(callback: CallbackQuery) -> None:
 def _admin_stats_text() -> str:
     s = db.get_admin_stats()
     retention = db.get_retention_stats()
+    activation = db.get_activation_stats()
+    blocked = db.get_blocked_image_stats()
     fallback_used_today = db.get_fallback_usage_today()
     cost = db.get_cost_summary()
     cap_line = (
@@ -2500,6 +2666,12 @@ def _admin_stats_text() -> str:
         f"Всего пользователей: <b>{s['total_users']}</b>\n"
         f"Активны сегодня: <b>{s['active_today']}</b>\n"
         f"Докупленных сообщений на руках: <b>{s['bonus_outstanding']}</b>\n\n"
+        # Активация: сколько из пришедших сегодня вообще что-то написали.
+        # Главный показатель того, работает ли первый экран — замер по
+        # рекламе: 15 переходов, 5 написавших.
+        f"🚀 Активация сегодня:\n"
+        f"Пришли: <b>{activation['new_today']}</b>, написали хотя бы раз: "
+        f"<b>{activation['activated_today']}</b> ({activation['activated_today_pct']}%)\n\n"
         # Правка 4: the question that matters right after a promo push —
         # how many of the people it brought in actually come back, not
         # just how many are active today.
@@ -2516,6 +2688,11 @@ def _admin_stats_text() -> str:
         # not that anything in the bot is broken.
         f"🆘 Откатов на резерв сегодня: <b>{fallback_used_today}</b> "
         f"(лимит {FALLBACK_DAILY_CAP}/день)\n\n"
+        # Правка 1.4: сколько запросов на картинки отклонил фильтр и от
+        # скольких людей — один экспериментатор и двадцать человек это
+        # совершенно разные ситуации.
+        f"🛑 Заблокировано запросов на картинки сегодня: "
+        f"<b>{blocked['blocked_today']}</b> (людей: {blocked['blocked_users_today']})\n\n"
         # Правка 2.5: this whole block is an ESTIMATE off MODEL_COST_PER_REQUEST,
         # not what the provider actually billed — say so, every time.
         f"💸 Расход на платные модели (оценка по средней цене, не факт списания "
@@ -3297,11 +3474,23 @@ REMEMBER_PREFIXES = ("запомни:", "запомни,", "запомни ")
 
 
 async def _answer_text_query(
-    message: Message, state: FSMContext, text: str, user_id: int, username: str | None
+    message: Message, state: FSMContext, text: str, user_id: int, username: str | None,
+    force_model: str | None = None, task_like: bool | None = None,
 ) -> None:
     """Core pipeline for anything that resolves to a text question: typed
     messages, transcribed voice, and quick-action follow-ups alike. Callers
-    have already handled remember/image-prefix detection."""
+    have already handled remember/image-prefix detection.
+
+    `force_model` overrides the user's own model preference for this one
+    request (Правка 3.3's "Решить умной моделью" button) — it does NOT
+    change their stored preference, and the sub-limit/trial check below
+    runs against the forced model, so tapping it spends the smart model's
+    allowance and shows that model's honest remaining count when it's out.
+
+    `task_like` overrides which buttons the answer gets (None = decide from
+    `text` itself): a quick-action follow-up like "Приведи ещё один пример"
+    is worded nothing like a task, but it's still ABOUT one, so callers
+    pass the original question's task-likeness through instead."""
     allowed, status = db.try_consume_message(
         user_id, username, DAILY_FREE_MESSAGES, DAILY_FREE_PREMIUM_MESSAGES, PREMIUM_CREDIT_COST
     )
@@ -3309,8 +3498,12 @@ async def _answer_text_query(
         await message.answer(quota_denied_text(status))
         return
 
-    opt = _model_option(status)
-    model, reasoning_effort = opt["model"], opt["reasoning"]
+    if force_model is not None:
+        opt = MODEL_OPTIONS[SMART_MODEL_KEY] if force_model == SMART_MODEL_ID else _model_option(status)
+        model, reasoning_effort = force_model, opt["reasoning"]
+    else:
+        opt = _model_option(status)
+        model, reasoning_effort = opt["model"], opt["reasoning"]
     notes = [content for _id, content in db.list_notes(user_id)]
 
     sublimit_ok, sublimit_denial, sublimit_consumed = await _enforce_model_sublimit(
@@ -3341,7 +3534,10 @@ async def _answer_text_query(
         await _send_long(
             message,
             reply_text + footer,
-            reply_markup=quick_actions_keyboard(),
+            reply_markup=quick_actions_keyboard(
+                task_like=_looks_like_task(text) if task_like is None else task_like,
+                answered_model=answered_model,
+            ),
             trusted_suffix=_build_sources_html(sources),
         )
     except ai.AIError as e:
@@ -3415,6 +3611,40 @@ async def cb_share(callback: CallbackQuery, state: FSMContext) -> None:
     await _send_long(callback.message, share_text)
 
 
+def _last_user_question(user_id: int) -> str | None:
+    """The most recent thing the user actually asked, from dialog history —
+    used by the task buttons, which act on that question rather than on
+    their own button text."""
+    history = db.get_dialog_history(user_id, MAX_HISTORY_TURNS)
+    for turn in reversed(history):
+        if turn["role"] == "user":
+            return turn["content"]
+    return None
+
+
+@router.callback_query(F.data == "qa:smart")
+async def cb_quick_action_smart(callback: CallbackQuery, state: FSMContext) -> None:
+    """Правка 3.3: re-asks the SAME question on the smart (paid,
+    multimodal) model. Never automatic — this only ever runs on an explicit
+    tap, and the model preference the user chose themselves is left
+    untouched. _answer_text_query's own sub-limit/trial check covers the
+    "allowance is out" case, including showing the honest remaining count."""
+    await callback.answer()
+    question = _last_user_question(callback.from_user.id)
+    if not question:
+        await callback.message.answer("Не вижу, что перерешать — задай вопрос сначала.")
+        return
+    lock = _get_user_lock(callback.from_user.id)
+    if lock.locked():
+        await callback.message.answer(BUSY_TEXT)
+        return
+    async with lock:
+        await _answer_text_query(
+            callback.message, state, question, callback.from_user.id,
+            callback.from_user.username, force_model=SMART_MODEL_ID, task_like=True,
+        )
+
+
 @router.callback_query(F.data.startswith("qa:"))
 async def cb_quick_action(callback: CallbackQuery, state: FSMContext) -> None:
     instruction = QUICK_ACTIONS.get(callback.data.split(":", 1)[1])
@@ -3425,9 +3655,15 @@ async def cb_quick_action(callback: CallbackQuery, state: FSMContext) -> None:
     if lock.locked():
         await callback.message.answer(BUSY_TEXT)
         return
+    # The follow-up's own wording says nothing about being a task, so carry
+    # the original question's task-likeness over — otherwise the task
+    # buttons would disappear the moment the user taps any of them once.
+    last_question = _last_user_question(callback.from_user.id)
     async with lock:
         await _answer_text_query(
-            callback.message, state, instruction, callback.from_user.id, callback.from_user.username
+            callback.message, state, instruction, callback.from_user.id,
+            callback.from_user.username,
+            task_like=_looks_like_task(last_question) if last_question else False,
         )
 
 
@@ -3617,7 +3853,13 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
             db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
 
             try:
-                await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
+                await _send_long(
+                    message,
+                    reply_text,
+                    reply_markup=quick_actions_keyboard(
+                        task_like=_looks_like_task(caption), answered_model=model
+                    ),
+                )
             except Exception:
                 _refund_all()
                 raise
@@ -3648,7 +3890,7 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
             )
 
             try:
-                reply_text, _, _ = await _ask_ai_with_fallback(
+                reply_text, _, answered_model = await _ask_ai_with_fallback(
                     history, prompt, model, user_id=user_id, is_paid=_is_paid_tier(status),
                     notes=notes, reasoning_effort=reasoning_effort,
                 )
@@ -3672,7 +3914,13 @@ async def handle_document_message(message: Message, state: FSMContext) -> None:
             db.append_dialog_turn(user_id, history_entry, reply_text, MAX_HISTORY_TURNS)
 
             try:
-                await _send_long(message, reply_text, reply_markup=quick_actions_keyboard())
+                await _send_long(
+                    message,
+                    reply_text,
+                    reply_markup=quick_actions_keyboard(
+                        task_like=_looks_like_task(caption), answered_model=answered_model
+                    ),
+                )
             except Exception:
                 _refund_all()
                 raise
@@ -3798,7 +4046,17 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
 
             elapsed = time.monotonic() - t0
             footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · {opt['label']}</i>"
-            await _send_long(message, reply_text + footer, reply_markup=quick_actions_keyboard())
+            await _send_long(
+                message,
+                reply_text + footer,
+                # A photo of homework is a task by default — the caption
+                # ("реши", or the default one) usually says so outright, and
+                # `model` here is the smart one, so no "solve with the smart
+                # model" button is offered on top of it.
+                reply_markup=quick_actions_keyboard(
+                    task_like=_looks_like_task(caption), answered_model=model
+                ),
+            )
         except Exception:
             _refund_all()
             raise
@@ -3865,7 +4123,7 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
         f"«Проверка» не нужен."
     )
     try:
-        reply_text, _, _ = await _ask_ai_with_fallback(
+        reply_text, _, answered_model = await _ask_ai_with_fallback(
             history, solve_prompt, PREMIUM_MODEL, user_id=user_id, is_paid=_is_paid_tier(status),
             notes=notes, reasoning_effort="high", max_tokens=6144,
         )
@@ -3894,7 +4152,15 @@ async def _handle_photo_message_locked(message: Message, state: FSMContext) -> N
         has_check = "✅ Проверка" in reply_text or "Проверка:" in reply_text
         stage_label = "распознано → решено → проверено" if has_check else "распознано → решено"
         footer = f"\n\n⚡ <i>Ответ за {elapsed:.1f} сек · 🔬 {stage_label}</i>"
-        await _send_long(message, reply_text + footer, reply_markup=quick_actions_keyboard())
+        await _send_long(
+            message,
+            reply_text + footer,
+            # Solved by the Groq two-stage pipeline, not the smart model —
+            # so "Решить умной моделью" is genuinely worth offering here.
+            reply_markup=quick_actions_keyboard(
+                task_like=_looks_like_task(caption), answered_model=answered_model
+            ),
+        )
     except Exception:
         # Both AI stages already succeeded at this point, but the reply
         # never actually reached the user — still a wasted request from
