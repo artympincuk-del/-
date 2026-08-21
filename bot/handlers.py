@@ -895,6 +895,15 @@ def _remaining(used: int, cap: int) -> str:
     return f"осталось {max(0, cap - used)} из {cap}"
 
 
+def _used_of(used: int, cap: int) -> str:
+    """The admin-side counterpart of _remaining (Правка 3.2/3.3): the owner
+    wants to see SPEND, not what's left, but "0/10" is just as ambiguous on
+    an admin screen as on a user one — so the two sides get two different
+    wordings, both spelled out. User screens: "осталось X из Y". Admin
+    screens: "использовано X из Y"."""
+    return f"{used} из {cap}"
+
+
 def quota_denied_text(status: dict) -> str:
     tz_abbr = datetime.datetime.now(_QUOTA_TZINFO).strftime("%Z")
     if status.get("limit_source") == "promo":
@@ -981,8 +990,8 @@ def _trial_denied_text(model: str, trial_total: int, used_total: int) -> str:
     separate line."""
     label = _label_for_model_id(model)
     return (
-        f"Пробные запросы к «{label}» закончились ({used_total}/{trial_total} — это разово, "
-        "не сбрасывается по дням). Остальные модели работают без ограничений сверх "
+        f"Пробные запросы к «{label}» закончились ({_remaining(used_total, trial_total)} — "
+        "это разово, не сбрасывается по дням). Остальные модели работают без ограничений сверх "
         f"обычного дневного лимита — переключитесь в «{BTN_MODEL}».\n\n"
         f"Чтобы снова пользоваться «{label}»: подписка или пакет сообщений дают отдельный "
         "дневной лимит на неё, а не разовый — /buy"
@@ -2116,7 +2125,49 @@ IMAGE_INTRO_TEXT = (
     f"{PREMIUM_CREDIT_COST} докупленных сообщений за картинку. Пополнить — кнопка «Баланс»."
 )
 
-IMAGE_PREFIXES = ("нарисуй:", "нарисуй,", "нарисуй ", "сгенерируй картинку", "сгенерируй изображение")
+# Правка 1: people write "нарисуй кота" as an ordinary message instead of
+# finding the «Картинка» button — the logs show plenty of them. That used
+# to fall through to the TEXT model, so they got a written description of a
+# cat instead of a picture of one.
+#
+# Matched only at the START of the message (the mention is already stripped
+# by the caller): "нарисуй кота" is a generation request, "объясни, как
+# художники рисуют перспективу" is not. Polite -те forms are covered, and
+# a filler noun right after the verb ("сгенерируй картинку кота") is eaten
+# by the pattern so it doesn't end up inside the prompt.
+#
+# Extend this list as new phrasings show up in the logs.
+IMAGE_INTENT_PATTERNS = (
+    r"нарисуй(?:те)?(?:\s+(?:картинку|картинка|изображение|фото|рисунок))?",
+    r"сгенерируй(?:те)?(?:\s+(?:картинку|картинка|изображение|фото|рисунок))?",
+    r"изобрази(?:те)?",
+    r"сделай(?:те)?\s+(?:картинку|изображение|фото|рисунок)",
+    r"покажи(?:те)?\s+картинку",
+)
+_IMAGE_INTENT_RE = re.compile(
+    r"^\s*(?:" + "|".join(IMAGE_INTENT_PATTERNS) + r")\b",
+    re.IGNORECASE,
+)
+# Leftovers between the command word and the actual subject — "нарисуй: кота",
+# "нарисуй мне кота", "нарисуй, пожалуйста, кота".
+_IMAGE_PROMPT_LEADIN_RE = re.compile(
+    r"^[\s:,\-—]*(?:пожалуйста[\s:,\-—]*)?(?:мне|нам)?[\s:,\-—]*(?:пожалуйста[\s:,\-—]*)?",
+    re.IGNORECASE,
+)
+
+
+def extract_image_intent(text: str) -> str | None:
+    """Returns the generation prompt with the command word removed
+    ("нарисуй кота в шляпе" -> "кот в шляпе" as written by the user, i.e.
+    "кота в шляпе"), or None if this isn't a generation request at all.
+    Returns None for a bare command with nothing after it too — there's no
+    prompt to generate from, so it's better handled as ordinary text."""
+    m = _IMAGE_INTENT_RE.match(text or "")
+    if not m:
+        return None
+    remainder = text[m.end():]
+    prompt = _IMAGE_PROMPT_LEADIN_RE.sub("", remainder).strip()
+    return prompt or None
 
 
 def image_actions_keyboard() -> InlineKeyboardMarkup:
@@ -2301,6 +2352,66 @@ async def _process_image_edit_request(
     except Exception:
         db.refund_consumed_message(user_id, status["consumed"])
         raise
+
+
+BTN_GENERATE_NOW = "🎨 Сгенерировать"
+
+
+def generate_offer_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=BTN_GENERATE_NOW, callback_data="img:gen")]
+        ]
+    )
+
+
+async def _offer_image_generation(message: Message, state: FSMContext, prompt: str) -> None:
+    """Правка 1.3: a text message that reads as "draw me X" gets an offer,
+    never an automatic generation — the picture costs one of the user's
+    daily images, and they didn't ask for that by typing a sentence. Costs
+    nothing to show: no model call, no quota spent (Правка 1.3 again), the
+    text model isn't consulted at all.
+
+    Правка 1.5: the prompt goes through the same content filter as the
+    button-driven path FIRST — a blocked request gets the ordinary refusal
+    and no button, so the offer can never become a way around the filter."""
+    if ai.image_prompt_is_blocked(prompt):
+        await message.answer(_refuse_blocked_image(message.from_user.id))
+        return
+    # Правка 1.6: the offer is single-use — stored here, cleared the moment
+    # it's used OR the moment the user says anything else instead (see
+    # _process_text_query), so a stale button can't fire a generation the
+    # person has long moved on from.
+    await state.update_data(pending_image_prompt=prompt)
+    await message.answer(
+        f"Похоже, нужна картинка: «{_escape_html_text(prompt)}».\n\n"
+        f"Нажми «{BTN_GENERATE_NOW}» — нарисую "
+        f"(это потратит одну картинку из дневного лимита). Если нужен текстовый "
+        f"ответ, просто спроси другими словами.",
+        reply_markup=generate_offer_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "img:gen")
+async def cb_image_generate_offer(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    data = await state.get_data()
+    prompt = data.get("pending_image_prompt")
+    if not prompt:
+        await callback.message.answer(
+            "Это предложение уже неактуально — напиши, что нарисовать, ещё раз."
+        )
+        return
+    await state.update_data(pending_image_prompt=None)
+    lock = _get_user_lock(callback.from_user.id)
+    if lock.locked():
+        await callback.message.answer(BUSY_TEXT)
+        return
+    async with lock:
+        await _process_image_request(
+            callback.message, state, prompt,
+            callback.from_user.id, callback.from_user.username,
+        )
 
 
 @router.message(Command("image"))
@@ -2576,6 +2687,11 @@ ADMIN_HELP_CATEGORIES = {
         "label": "💳 Платежи",
         "text": (
             "💳 <b>Платежи</b>\n\n"
+            "<b>/payers</b>\n"
+            "Кто платил: сумма, число оплат, дата последней, активная подписка или "
+            "остаток сообщений. По убыванию суммы, постранично по 10. В шапке — "
+            "сколько всего платящих, общая сумма и сколько купили больше одного раза. "
+            "Без аргументов.\n\n"
             "<b>/refund</b> &lt;telegram_payment_charge_id&gt;\n"
             "Вернуть звёзды за платёж и списать то, что он дал (сообщения/подписку/"
             "безлимит). Тот же charge_id, что и у кнопки «Возврат» на карточке "
@@ -2628,6 +2744,7 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
             [InlineKeyboardButton(text="📈 Воронка покупок", callback_data="admin:funnel")],
             [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users:0")],
+            [InlineKeyboardButton(text="💳 Платившие", callback_data="admin:payers:0")],
             [InlineKeyboardButton(text="📖 Все команды", callback_data="admin:help")],
         ]
     )
@@ -2825,6 +2942,93 @@ async def cb_admin_users(callback: CallbackQuery) -> None:
     await _edit_or_send(callback, text, admin_users_keyboard(page, total, users))
 
 
+PAYERS_PAGE_SIZE = 10
+
+
+def _payers_text(page: int, summary: dict, payers: list[dict]) -> str:
+    """Правка 2.5: header first, and `repeat_payers` is deliberately last
+    and spelled out — total revenue is the number that feels important,
+    but "how many came back for a second purchase" is the one that says
+    whether this sells more than once."""
+    lines = [
+        f"💳 <b>Платившие</b> — стр. {page + 1}\n",
+        f"Всего платящих: <b>{summary['payers']}</b>",
+        f"Общая сумма: <b>{summary['revenue_stars']}⭐</b> (без учёта возвратов)",
+        f"Купили больше одного раза: <b>{summary['repeat_payers']}</b>\n",
+    ]
+    if not payers:
+        lines.append("Пока никто не платил.")
+        return "\n".join(lines)
+    for p in payers:
+        name = f"@{p['username']}" if p["username"] else str(p["user_id"])
+        extras = []
+        if p["subscription_until"]:
+            extras.append("подписка активна")
+        if p["bonus_credits"]:
+            extras.append(f"{p['bonus_credits']} сообщ. на балансе")
+        if p["has_refunds"]:
+            extras.append("были возвраты")
+        extras_str = f" · {' · '.join(extras)}" if extras else ""
+        lines.append(
+            f"{name} — <b>{p['total_stars']}⭐</b> за {p['payments_count']} "
+            f"{_ru_plural(p['payments_count'], 'оплату', 'оплаты', 'оплат')} · "
+            f"последняя {_format_local_time(p['last_paid_at'])}{extras_str}"
+        )
+    return "\n".join(lines)
+
+
+def _payers_keyboard(page: int, total: int, payers: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for p in payers:
+        name = f"@{p['username']}" if p["username"] else str(p["user_id"])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{name} · {p['total_stars']}⭐",
+                    # Правка 2.6: reuses the existing user card, so there's
+                    # one place that shows a person's full state.
+                    callback_data=f"admin:user:{p['user_id']}:0",
+                )
+            ]
+        )
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"admin:payers:{page - 1}"))
+    if (page + 1) * PAYERS_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"admin:payers:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="◀️ В меню", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("admin:payers:"))
+async def cb_admin_payers(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    page = int(callback.data.split(":")[2])
+    await callback.answer()
+    total = db.count_payers()
+    summary = db.get_payers_summary()
+    payers = db.list_payers(PAYERS_PAGE_SIZE, page * PAYERS_PAGE_SIZE)
+    await _edit_or_send(
+        callback, _payers_text(page, summary, payers), _payers_keyboard(page, total, payers)
+    )
+
+
+@router.message(Command("payers"))
+async def cmd_payers(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    total = db.count_payers()
+    summary = db.get_payers_summary()
+    payers = db.list_payers(PAYERS_PAGE_SIZE, 0)
+    await message.answer(
+        _payers_text(0, summary, payers), reply_markup=_payers_keyboard(0, total, payers)
+    )
+
+
 ADMIN_RECENT_PAYMENTS = 5
 
 
@@ -2833,8 +3037,12 @@ def _admin_user_text(p: dict, payments: list[tuple]) -> str:
     lines = [
         f"👤 <b>{name}</b> (id <code>{p['user_id']}</code>)\n",
         f"Тариф: {p['model_pref']} / {p['model_choice']}",
-        f"Бесплатно сегодня: {p['used_today']}/{DAILY_FREE_MESSAGES} + "
-        f"{p['premium_used_today']}/{DAILY_FREE_PREMIUM_MESSAGES} премиум",
+        # Правка 3.2: админу нужен РАСХОД, а не остаток (в отличие от
+        # пользовательских экранов, где _remaining показывает остаток) —
+        # но формулировка всё равно должна читаться однозначно, поэтому
+        # «использовано X из Y», а не голое «X/Y».
+        f"Использовано сегодня: {_used_of(p['used_today'], DAILY_FREE_MESSAGES)} + "
+        f"{_used_of(p['premium_used_today'], DAILY_FREE_PREMIUM_MESSAGES)} премиум",
         f"Докупленных сообщений: <b>{p['bonus_credits']}</b>",
     ]
     if p["unlimited_until"]:
@@ -3123,8 +3331,10 @@ async def cmd_users(message: Message) -> None:
         name = f"@{uname}" if uname else str(uid)
         lines.append(
             f"{name} (id {uid}) — {pref}, "
-            f"free {used}/{DAILY_FREE_MESSAGES}+{premium_used}/{DAILY_FREE_PREMIUM_MESSAGES}, "
-            f"bonus {bonus}, активен {last_active}"
+            # Тот же admin-side формат «использовано X из Y», что и в карточке.
+            f"использовано {_used_of(used, DAILY_FREE_MESSAGES)} + "
+            f"{_used_of(premium_used, DAILY_FREE_PREMIUM_MESSAGES)} премиум, "
+            f"докуплено {bonus}, активен {last_active}"
         )
     await message.answer("\n".join(lines))
 
@@ -3603,7 +3813,7 @@ async def _answer_text_query(
 
 
 async def _process_text_query(message: Message, state: FSMContext, text: str) -> None:
-    """Public entry point: checks remember/image prefixes first, then falls
+    """Public entry point: checks remember/image intent first, then falls
     through to the shared answering pipeline."""
     lowered = text.strip().lower()
 
@@ -3619,13 +3829,16 @@ async def _process_text_query(message: Message, state: FSMContext, text: str) ->
                 return
             break
 
-    for prefix in IMAGE_PREFIXES:
-        if lowered.startswith(prefix):
-            prompt = text.strip()[len(prefix):].strip()
-            await _process_image_request(
-                message, state, prompt, message.from_user.id, message.from_user.username
-            )
-            return
+    image_prompt = extract_image_intent(text.strip())
+    if image_prompt:
+        await _offer_image_generation(message, state, image_prompt)
+        return
+
+    # Правка 1.6: anything that ISN'T a generation request retires a
+    # pending offer — the user moved on, so the button shouldn't still be
+    # live behind them.
+    if (await state.get_data()).get("pending_image_prompt"):
+        await state.update_data(pending_image_prompt=None)
 
     await _answer_text_query(message, state, text, message.from_user.id, message.from_user.username)
 
