@@ -217,14 +217,22 @@ async def run():
     # literal asterisks reach the user.
     # ------------------------------------------------------------------
     msg_md = FakeMessage()
-    await handlers._send_long(msg_md, "Это **жирный** текст и *курсив* тоже, а тут `код`.")
+    await handlers._send_long(msg_md, "Это **жирный** текст и *курсив* тоже, а тут `print(x)`.")
     check("markdown: sent without raising", len(msg_md.sent) == 1 and msg_md.sent[0]["html"])
     md_text = msg_md.sent[0]["text"]
     check("markdown: **bold** became a real <b> tag", "<b>жирный</b>" in md_text)
     check("markdown: *italic* became a real <i> tag", "<i>курсив</i>" in md_text)
-    check("markdown: `code` became a real <code> tag", "<code>код</code>" in md_text)
+    check("markdown: `real code` became a real <code> tag", "<code>print(x)</code>" in md_text)
     check("markdown: no literal asterisks reach the user", "*" not in html_module.unescape(md_text))
     check("markdown: no literal backticks reach the user", "`" not in html_module.unescape(md_text))
+
+    # A backticked ORDINARY RUSSIAN WORD is deliberately not code — the tags
+    # come back off in _unwrap_plain_code, so the user reads a sentence
+    # instead of monospace speckle. (Covered in depth in run_code_tags_test.)
+    msg_word = FakeMessage()
+    await handlers._send_long(msg_word, "Нажми `кнопку` ещё раз.")
+    word_text = msg_word.sent[0]["text"]
+    check("markdown: a backticked plain Russian word ends up as plain text", word_text == "Нажми кнопку ещё раз.")
 
 
 asyncio.run(run())
