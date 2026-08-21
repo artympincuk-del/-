@@ -92,13 +92,16 @@ async def run():
     msg = FakeMessage(70001, "/start")
     state = FakeState()
     await handlers.cmd_start(msg, state)
-    check("/start: sends at least two messages (welcome + menu)", len(msg.sent) == 2)
+    # Three messages now: the shortened welcome, the menu, and the
+    # "Показать пример" prompt (Правка 4.5). The reply-keyboard removal has
+    # to ride on its own message — a message carries one reply_markup, so
+    # it can't both clear a reply keyboard and show an inline button.
+    check("/start: sends welcome + menu + example prompt", len(msg.sent) == 3)
     welcome_kwargs = msg.sent[0][1]
     check(
         "/start: welcome message clears any old reply-keyboard (ReplyKeyboardRemove)",
         isinstance(welcome_kwargs.get("reply_markup"), ReplyKeyboardRemove),
     )
-    check("/start: welcome text points to /menu, not a 'button below' that no longer exists", "/menu" in msg.sent[0][0])
     check("/start: welcome text no longer references the removed 'Кнопка «📋 Меню» внизу'", "внизу" not in msg.sent[0][0])
     menu_kwargs = msg.sent[1][1]
     check("/start: the menu message itself still uses the normal inline main menu", menu_kwargs.get("reply_markup") is not None)

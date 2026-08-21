@@ -1702,6 +1702,61 @@ def get_retention_stats() -> dict:
         }
 
 
+def get_activation_stats() -> dict:
+    """How many people who arrived today actually said anything — the
+    number that tells whether the first screen works at all. Measured live:
+    15 people followed a blogger's link, only 5 ever sent a message, and
+    nothing in the admin panel showed that.
+
+    "Wrote something" means a chat_log row with role='user' — the same
+    definition _promo_stats uses for its active_users count. Just opening
+    the bot writes a players row (via /start → _ensure_player) but no
+    chat_log row, which is exactly the gap this measures."""
+    with _lock:
+        today_start = _local_midnight_utc(0)
+
+        cur = _conn.execute(
+            "SELECT COUNT(*) FROM players WHERE first_seen_at >= ?", (today_start,)
+        )
+        (new_today,) = cur.fetchone()
+
+        cur = _conn.execute(
+            "SELECT COUNT(*) FROM players p WHERE p.first_seen_at >= ? AND EXISTS ("
+            "  SELECT 1 FROM chat_log cl WHERE cl.user_id = p.user_id AND cl.role = 'user'"
+            ")",
+            (today_start,),
+        )
+        (activated_today,) = cur.fetchone()
+
+        return {
+            "new_today": new_today,
+            "activated_today": activated_today,
+            "activated_today_pct": round(activated_today / new_today * 100) if new_today else 0,
+        }
+
+
+# Logged (via log_event) whenever the image content filter refuses a prompt
+# — deliberately NOT one of FUNNEL_EVENTS below: it isn't a purchase step,
+# it just reuses the same events table rather than adding a whole table for
+# one counter.
+BLOCKED_IMAGE_EVENT = "image_blocked"
+
+
+def get_blocked_image_stats() -> dict:
+    """Правка 1.4: how often the image content filter fired today, and how
+    many distinct people tripped it — one person testing the limits reads
+    very differently from twenty, and only the second is a real problem."""
+    with _lock:
+        today_start = _local_midnight_utc(0)
+        cur = _conn.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT user_id) FROM events "
+            "WHERE event = ? AND created_at >= ?",
+            (BLOCKED_IMAGE_EVENT, today_start),
+        )
+        total, users = cur.fetchone()
+        return {"blocked_today": total, "blocked_users_today": users}
+
+
 FUNNEL_EVENTS = ("buy_opened", "invoice_sent", "paid", "promo_join")
 
 
